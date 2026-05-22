@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Sequence
 
@@ -218,11 +220,49 @@ def cmd_ui(paths: Paths, port: int | None = None) -> int:
 def cmd_use(store: Store, name: str) -> int:
     paths = store.paths
     status = daemon_running(paths)
-    if status and status.get("active_requests"):
-        raise RuntimeError("proxy is busy; switch after active requests finish")
+    if status:
+        block_reason = status.get("switch_block_reason")
+        if isinstance(block_reason, str) and block_reason:
+            raise RuntimeError(f"proxy is busy; {block_reason}")
+        if status.get("active_requests"):
+            raise RuntimeError("proxy is busy; switch after active requests finish")
+        port = status.get("port")
+        if isinstance(port, int):
+            daemon_switch_profile(store, name, port)
+            print(f"active profile: {name}")
+            return 0
     store.set_active_profile(name)
     print(f"active profile: {name}")
     return 0
+
+
+def daemon_switch_profile(store: Store, name: str, port: int) -> None:
+    body = urllib.parse.urlencode(
+        {
+            "token": store.proxy_token(),
+            "profile": name,
+        }
+    )
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.request(
+            "POST",
+            "/api/switch",
+            body=body,
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+        response = conn.getresponse()
+        payload = response.read()
+    finally:
+        conn.close()
+    if response.status in (200, 303):
+        return
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        data = {}
+    error = data.get("error") if isinstance(data, dict) else None
+    raise RuntimeError(str(error or f"daemon switch failed with HTTP {response.status}"))
 
 
 def cmd_status(paths: Paths, store: Store) -> int:

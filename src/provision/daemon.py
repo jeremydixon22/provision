@@ -65,11 +65,12 @@ UPSTREAM_IDENTITY_HEADERS = {
     "x-openai-fedramp",
 }
 
-PROTOCOL_VERSION = 18
+PROTOCOL_VERSION = 19
 DEFAULT_DAEMON_PORT = 4888
 CHATGPT_USAGE_PATH = "/wham/usage"
 USAGE_CACHE_MIN_INTERVAL_SECONDS = 1.0
 USAGE_CACHE_WAIT_SECONDS = 5.0
+WEBSOCKET_SWITCH_IDLE_SECONDS = 5.0
 DEFAULT_PROFILE_CODEX_LIMIT_ID = "provision_default_codex"
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -452,7 +453,9 @@ class ProvisionServer(ThreadingHTTPServer):
         self.store = Store(paths)
         self.proxy_token = self.store.proxy_token()
         self.active_requests = 0
+        self.active_websockets: dict[int, dict[str, Any]] = {}
         self.active_lock = threading.Lock()
+        self.next_websocket_id = 0
         self.usage_cache: dict[str, dict[str, Any]] = {}
         self.usage_cache_lock = threading.Lock()
         self.usage_refresh_lock = threading.Lock()
@@ -464,11 +467,82 @@ class ProvisionServer(ThreadingHTTPServer):
 
     def end_request(self) -> None:
         with self.active_lock:
-            self.active_requests -= 1
+            self.active_requests = max(0, self.active_requests - 1)
 
     def request_count(self) -> int:
         with self.active_lock:
             return self.active_requests
+
+    def begin_websocket(self, profile: str, downstream: socket.socket) -> int:
+        with self.active_lock:
+            self.next_websocket_id += 1
+            tunnel_id = self.next_websocket_id
+            now = time.monotonic()
+            self.active_websockets[tunnel_id] = {
+                "profile": profile,
+                "downstream": downstream,
+                "upstream": None,
+                "started_monotonic": now,
+                "last_activity_monotonic": now,
+            }
+            return tunnel_id
+
+    def attach_websocket_upstream(self, tunnel_id: int, upstream: socket.socket) -> None:
+        with self.active_lock:
+            tunnel = self.active_websockets.get(tunnel_id)
+            if tunnel is not None:
+                tunnel["upstream"] = upstream
+
+    def touch_websocket(self, tunnel_id: int) -> None:
+        with self.active_lock:
+            tunnel = self.active_websockets.get(tunnel_id)
+            if tunnel is not None:
+                tunnel["last_activity_monotonic"] = time.monotonic()
+
+    def end_websocket(self, tunnel_id: int) -> None:
+        with self.active_lock:
+            self.active_websockets.pop(tunnel_id, None)
+
+    def websocket_count(self) -> int:
+        with self.active_lock:
+            return len(self.active_websockets)
+
+    def recent_websocket_activity_count(
+        self,
+        seconds: float = WEBSOCKET_SWITCH_IDLE_SECONDS,
+    ) -> int:
+        now = time.monotonic()
+        with self.active_lock:
+            return sum(
+                1
+                for tunnel in self.active_websockets.values()
+                if now - float(tunnel.get("last_activity_monotonic", now)) < seconds
+            )
+
+    def switch_block_reason(self) -> str | None:
+        active_requests = self.request_count()
+        if active_requests > 0:
+            return f"{active_requests} upstream request(s) are active"
+        recent_tunnels = self.recent_websocket_activity_count()
+        if recent_tunnels > 0:
+            return f"{recent_tunnels} Codex tunnel(s) had recent activity"
+        return None
+
+    def close_websocket_tunnels(self) -> int:
+        sockets: list[socket.socket] = []
+        with self.active_lock:
+            count = len(self.active_websockets)
+            for tunnel in self.active_websockets.values():
+                for key in ("downstream", "upstream"):
+                    value = tunnel.get(key)
+                    if isinstance(value, socket.socket):
+                        sockets.append(value)
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        return count
 
     def cached_usage_payload(
         self,
@@ -633,14 +707,16 @@ class Handler(BaseHTTPRequestHandler):
         if token != self.server.proxy_token:
             self.send_json({"error": "invalid switch token"}, status=401)
             return
-        if self.server.request_count() > 0:
-            self.send_json({"error": "proxy is busy; switch after active requests finish"}, status=409)
+        block_reason = self.server.switch_block_reason()
+        if block_reason:
+            self.send_json({"error": f"proxy is busy; {block_reason}"}, status=409)
             return
         try:
             self.server.store.set_active_profile(str(profile))
         except StoreError as exc:
             self.send_json({"error": str(exc)}, status=400)
             return
+        self.server.close_websocket_tunnels()
         self.redirect_ui()
 
     def handle_refresh_quota(self) -> None:
@@ -740,17 +816,18 @@ class Handler(BaseHTTPRequestHandler):
         profile = str(message.get("profile") or "")
         action = message.get("action")
         if action == "switch":
-            if self.server.request_count() > 0:
-                self.send_ui_state(
-                    message=f"Switch disabled while {self.server.request_count()} request(s) are active"
-                )
+            block_reason = self.server.switch_block_reason()
+            if block_reason:
+                self.send_ui_state(message=f"Switch disabled: {block_reason}")
                 return
             try:
                 self.server.store.set_active_profile(profile)
             except StoreError as exc:
                 self.send_ui_state(message=str(exc))
                 return
-            self.send_ui_state(message=f"Using {profile}")
+            closed = self.server.close_websocket_tunnels()
+            suffix = " and reconnecting Codex tunnels" if closed else ""
+            self.send_ui_state(message=f"Using {profile}{suffix}")
             return
         if action == "refresh_quota":
             if not self.server.store.profile_exists(profile):
@@ -1001,17 +1078,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "invalid proxy bearer token"}, status=401)
             return
 
-        self.server.begin_request()
         self.close_connection = True
         upstream = None
+        tunnel_id: int | None = None
         try:
             profile = self.server.store.active_profile()
             assert profile is not None
+            tunnel_id = self.server.begin_websocket(profile, self.connection)
             auth_path = self.server.store.auth_path(profile)
             auth = ensure_fresh_chatgpt_auth(auth_path)
             upstream = self.open_upstream_websocket(parsed, auth)
+            self.server.attach_websocket_upstream(tunnel_id, upstream)
             self.log_message("websocket tunnel established for profile %s", profile)
-            self.relay_websocket(upstream)
+            self.relay_websocket(upstream, tunnel_id)
         except WebSocketHandshakeRejected:
             pass
         except AuthError as exc:
@@ -1029,7 +1108,8 @@ class Handler(BaseHTTPRequestHandler):
                     upstream.close()
                 except OSError:
                     pass
-            self.server.end_request()
+            if tunnel_id is not None:
+                self.server.end_websocket(tunnel_id)
 
     def is_chatgpt_backend_proxy_path(self, path: str) -> bool:
         prefixes = (backend_proxy_prefix(self.server.proxy_token), backend_proxy_prefix())
@@ -1227,7 +1307,7 @@ class Handler(BaseHTTPRequestHandler):
             raise OSError("upstream websocket handshake returned no response")
         return bytes(response)
 
-    def relay_websocket(self, upstream: socket.socket) -> None:
+    def relay_websocket(self, upstream: socket.socket, tunnel_id: int) -> None:
         downstream = self.connection
         upstream.settimeout(None)
         downstream.settimeout(None)
@@ -1247,6 +1327,7 @@ class Handler(BaseHTTPRequestHandler):
                     data = source.recv(65536)
                     if not data:
                         return
+                    self.server.touch_websocket(tunnel_id)
                     target.sendall(data)
             except OSError:
                 return
@@ -1317,6 +1398,9 @@ class Handler(BaseHTTPRequestHandler):
             "provision_protocol": PROTOCOL_VERSION,
             "active_profile": self.server.store.active_profile(required=False),
             "active_requests": self.server.request_count(),
+            "active_websockets": self.server.websocket_count(),
+            "recent_websocket_activity": self.server.recent_websocket_activity_count(),
+            "switch_block_reason": self.server.switch_block_reason(),
         }
         if include_profiles:
             profiles = []
@@ -1344,9 +1428,9 @@ class Handler(BaseHTTPRequestHandler):
     def switch_disabled_reason(self, profile: dict[str, Any], status: dict[str, Any]) -> str:
         if profile.get("active"):
             return "Current profile"
-        active_requests = status.get("active_requests")
-        if isinstance(active_requests, int) and active_requests > 0:
-            return f"Disabled until {active_requests} active request(s) finish"
+        block_reason = status.get("switch_block_reason")
+        if isinstance(block_reason, str) and block_reason:
+            return f"Disabled while {block_reason}"
         return ""
 
     def render_profile_rows(self, status: dict[str, Any]) -> str:
@@ -1402,7 +1486,9 @@ class Handler(BaseHTTPRequestHandler):
         rows = self.render_profile_rows(status)
         active_profile = html.escape(str(status.get("active_profile") or "none"))
         active_requests = int(status.get("active_requests") or 0)
-        busy = "busy" if active_requests else "idle"
+        active_websockets = int(status.get("active_websockets") or 0)
+        switch_block_reason = str(status.get("switch_block_reason") or "")
+        busy = "busy" if switch_block_reason else "idle"
         initial_json = json.dumps(
             {"type": "state", "status": status, "message": None},
             separators=(",", ":"),
@@ -1856,6 +1942,7 @@ class Handler(BaseHTTPRequestHandler):
 	      <div class="top-meta">
 	        <span class="pill">Active <strong id="activeProfile">__ACTIVE_PROFILE__</strong></span>
 	        <span class="pill">Requests <strong id="activeRequests">__ACTIVE_REQUESTS__</strong></span>
+	        <span class="pill">Tunnels <strong id="activeTunnels">__ACTIVE_WEBSOCKETS__</strong></span>
 	        <span class="pill"><span id="proxyDot" class="dot"></span><span id="connectionState">Live (__BUSY__)</span></span>
 	      </div>
 	      <div class="top-actions">
@@ -1980,16 +2067,19 @@ class Handler(BaseHTTPRequestHandler):
     function render(packet) {
       const status = packet.status || {};
       const activeRequests = Number(status.active_requests || 0);
+      const activeTunnels = Number(status.active_websockets || 0);
+      const switchBlockReason = String(status.switch_block_reason || "");
 	      document.getElementById("activeProfile").textContent = status.active_profile || "none";
 	      document.getElementById("activeRequests").textContent = String(activeRequests);
+	      document.getElementById("activeTunnels").textContent = String(activeTunnels);
 	      const connection = document.getElementById("connectionState");
 	      const isDisconnected = connection.textContent === "Disconnected";
 	      if (!isDisconnected) {
-	        connection.textContent = `Live (${activeRequests ? "busy" : "idle"})`;
-	        document.getElementById("proxyDot").className = "dot" + (activeRequests ? " busy" : "");
+	        connection.textContent = `Live (${switchBlockReason ? "busy" : "idle"})`;
+	        document.getElementById("proxyDot").className = "dot" + (switchBlockReason ? " busy" : "");
 	      }
-      document.getElementById("busyNotice").textContent = activeRequests
-        ? `Profile switching is disabled while ${activeRequests} upstream request(s) finish.`
+      document.getElementById("busyNotice").textContent = switchBlockReason
+        ? `Profile switching is disabled while ${switchBlockReason}.`
         : "";
       document.getElementById("profileRows").innerHTML = (status.profiles || [])
         .map((profile) => profileRow(profile, packet.pending_action, packet.pending_profile))
@@ -2066,6 +2156,8 @@ class Handler(BaseHTTPRequestHandler):
             "__BUSY__", busy
         ).replace(
             "__ACTIVE_REQUESTS__", str(active_requests)
+        ).replace(
+            "__ACTIVE_WEBSOCKETS__", str(active_websockets)
         ).replace(
             "__ROWS__", rows
         )

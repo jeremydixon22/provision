@@ -3,8 +3,10 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import socket
 import tempfile
 import threading
+import time
 import unittest
 from argparse import Namespace
 from contextlib import redirect_stdout
@@ -13,7 +15,7 @@ from io import StringIO
 from pathlib import Path
 
 from provision.auth import codex_client_id_from_bytes, decode_jwt_claims, extract_metadata
-from provision.cli import cmd_import_default
+from provision.cli import cmd_import_default, daemon_switch_profile
 from provision.daemon import backend_proxy_prefix
 from provision.daemon import backend_upstream_path
 from provision.daemon import label_usage_payload
@@ -23,6 +25,7 @@ from provision.daemon import redact_proxy_token
 from provision.daemon import render_quota_html
 from provision.daemon import should_forward_incoming_header
 from provision.daemon import usage_cache_summary
+from provision.daemon import WEBSOCKET_SWITCH_IDLE_SECONDS
 from provision.daemon import websocket_accept_key
 from provision.launcher import chatgpt_base_url_override
 from provision.launcher import configured_daemon_port
@@ -241,6 +244,35 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(payload, b"")
             self.assertEqual(store.active_profile(), "work")
 
+    def test_cli_daemon_switch_routes_through_running_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            auth = {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": fake_jwt({"email": "user@example.test"}),
+                    "access_token": fake_jwt({"exp": 9999999999}),
+                    "refresh_token": "rt_test",
+                },
+            }
+            source = root / "auth.json"
+            source.write_text(json.dumps(auth), encoding="utf-8")
+            paths = Paths(root / "home")
+            store = Store(paths)
+            store.import_auth_file("default", source)
+            store.import_auth_file("work", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                daemon_switch_profile(store, "work", server.server_address[1])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+            self.assertEqual(store.active_profile(), "work")
+
     def test_usage_payload_labels_active_and_default_profile_limits(self) -> None:
         active = {
             "rate_limit": {
@@ -378,6 +410,35 @@ class StoreTests(unittest.TestCase):
         self.assertIn("5h 75% left", summary)
         self.assertIn("weekly 12 remaining", summary)
         self.assertIn("1 extra bucket", summary)
+
+    def test_idle_websocket_tunnels_do_not_block_switching_forever(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.active_requests = 0
+        server.active_websockets = {}
+        server.active_lock = threading.Lock()
+        server.next_websocket_id = 0
+
+        left, right = socket.socketpair()
+        tunnel_id = server.begin_websocket("default", left)
+        try:
+            self.assertEqual(server.request_count(), 0)
+            self.assertEqual(server.websocket_count(), 1)
+            self.assertIn("Codex tunnel", server.switch_block_reason() or "")
+
+            with server.active_lock:
+                server.active_websockets[tunnel_id][
+                    "last_activity_monotonic"
+                ] = time.monotonic() - WEBSOCKET_SWITCH_IDLE_SECONDS - 0.1
+
+            self.assertIsNone(server.switch_block_reason())
+
+            server.begin_request()
+            self.assertIn("upstream request", server.switch_block_reason() or "")
+            server.end_request()
+        finally:
+            server.end_websocket(tunnel_id)
+            left.close()
+            right.close()
 
     def test_configured_daemon_port_reads_environment(self) -> None:
         old = os.environ.get("PROVISION_PORT")
