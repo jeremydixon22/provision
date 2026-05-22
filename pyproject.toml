@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "provision"
+version = "0.1.0"
+description = "Local profile-switching proxy launcher for Codex"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+  { name = "Jeremy Dixon" },
+]
+keywords = [
+  "chatgpt",
+  "cli",
+  "codex",
+  "credentials",
+  "developer-tools",
+  "openai",
+  "profile-manager",
+  "proxy",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Software Development",
+  "Topic :: System :: Shells",
+]
+
+[project.scripts]
+provision = "provision.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/jeremydixon22/provision"
+Repository = "https://github.com/jeremydixon22/provision"
+Issues = "https://github.com/jeremydixon22/provision/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+provision = ["assets/*.png"]

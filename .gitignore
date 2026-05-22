@@ -1,0 +1,30 @@
+# Local credential and profile state
+.ai-cli-profiles/
+.provision/
+.codex/
+.gemini/
+.claude/
+
+# Environment files commonly used for API keys
+.env
+.env.*
+!.env.example
+
+# Known CLI credential/cache files
+auth.json
+oauth_creds.json
+gemini-credentials.json
+google_accounts.json
+mcp-oauth-tokens.json
+a2a-oauth-tokens.json
+.credentials.json
+credentials.json
+*.credentials.json
+
+# Local OS/editor noise
+.DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
