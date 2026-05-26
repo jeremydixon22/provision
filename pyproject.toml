@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=82.0.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "provision"
-version = "0.1.1"
-description = "Local profile-switching proxy launcher for Codex"
+version = "0.2.0"
+description = "Local profile-switching proxy and dashboard for Codex CLI"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -16,11 +16,14 @@ keywords = [
   "chatgpt",
   "cli",
   "codex",
+  "codex-cli",
   "credentials",
+  "dashboard",
   "developer-tools",
   "openai",
   "profile-manager",
   "proxy",
+  "quota",
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",

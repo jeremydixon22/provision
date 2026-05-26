@@ -39,7 +39,7 @@ COMMANDS = {
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="provision",
-        description="Run Codex through a local profile-switching proxy.",
+        description="Run Codex CLI through a local profile-switching proxy and dashboard.",
     )
     parser.add_argument("--version", action="store_true", help="show Provision version")
     subparsers = parser.add_subparsers(dest="command")
@@ -47,12 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("help", help="show Provision help")
     subparsers.add_parser("daemon", help="run the local proxy daemon").add_argument("--port", type=int, default=None)
 
-    import_default = subparsers.add_parser("import-default", help="import the current Codex auth.json as a profile")
+    import_default = subparsers.add_parser("import-default", help="import the current Codex CLI auth.json as a profile")
     import_default.add_argument("--name", default="default")
     import_default.add_argument("--source", type=Path, default=None)
     import_default.add_argument("--overwrite", action="store_true")
 
-    login = subparsers.add_parser("login", help="capture a new Codex login into a Provision profile")
+    login = subparsers.add_parser("login", help="capture a new Codex CLI login into a Provision profile")
     login.add_argument("name", metavar="profile_name")
     login.add_argument("--device-auth", action="store_true")
     login.add_argument("--overwrite", action="store_true")
@@ -224,7 +224,8 @@ def cmd_use(store: Store, name: str) -> int:
         block_reason = status.get("switch_block_reason")
         if isinstance(block_reason, str) and block_reason:
             raise RuntimeError(f"proxy is busy; {block_reason}")
-        if status.get("active_requests"):
+        blocking_requests = status.get("blocking_active_requests", status.get("active_requests"))
+        if blocking_requests:
             raise RuntimeError("proxy is busy; switch after active requests finish")
         port = status.get("port")
         if isinstance(port, int):

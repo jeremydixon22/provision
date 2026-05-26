@@ -33,6 +33,7 @@ class Paths:
         self.profiles = self.codex / "profiles"
         self.capture = self.codex / "capture"
         self.active_profile = self.codex / "active-profile"
+        self.session_pins = self.codex / "session-pins.json"
         self.state = self.home / "daemon.json"
         self.proxy_token = self.home / "proxy-token"
         self.log = self.home / "daemon.log"

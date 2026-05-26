@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import shutil
@@ -7,10 +8,17 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
-from .daemon import PROTOCOL_VERSION, daemon_running, health, wait_until_running
+from .daemon import (
+    PROTOCOL_VERSION,
+    daemon_running,
+    health,
+    project_session_sentinel,
+    wait_until_running,
+)
 from .paths import Paths, launcher_path, source_root
 from .store import Store
 
@@ -139,6 +147,28 @@ def stop_incompatible_daemon(status: dict[str, Any]) -> None:
         time.sleep(0.05)
 
 
+def register_session(port: int, proxy_token: str, cwd: str) -> None:
+    body = urllib.parse.urlencode(
+        {
+            "token": proxy_token,
+            "cwd": cwd,
+        }
+    )
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=0.5)
+    try:
+        conn.request(
+            "POST",
+            "/api/session",
+            body=body,
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+        conn.getresponse().read()
+    except OSError:
+        return
+    finally:
+        conn.close()
+
+
 def launch_codex(codex_args: list[str]) -> int:
     paths = Paths()
     store = Store(paths)
@@ -147,6 +177,8 @@ def launch_codex(codex_args: list[str]) -> int:
     status = ensure_daemon(paths, configured_daemon_port())
     port = int(status["port"])
     proxy_token = store.proxy_token()
+    cwd = os.getcwd()
+    register_session(port, proxy_token, cwd)
 
     provider_args = [
         "-c",
@@ -163,6 +195,6 @@ def launch_codex(codex_args: list[str]) -> int:
     else:
         argv = ["codex", *provider_args, *codex_args]
     env = os.environ.copy()
-    env["OPENAI_PROJECT"] = f"provision-{proxy_token}"
+    env["OPENAI_PROJECT"] = project_session_sentinel(proxy_token, cwd)
     os.execvpe("codex", argv, env)
     return 127
