@@ -2998,7 +2998,9 @@ class Handler(BaseHTTPRequestHandler):
             upstream_path += "?" + parsed.query
 
         raw = socket.create_connection((host, port), timeout=30)
-        upstream: ssl.SSLSocket | socket.socket = ssl.create_default_context().wrap_socket(
+        ssl_context = ssl.create_default_context()
+        ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        upstream: ssl.SSLSocket | socket.socket = ssl_context.wrap_socket(
             raw,
             server_hostname=host,
         )
