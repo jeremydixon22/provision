@@ -28,6 +28,27 @@ CODEX_CLIENT_ID_CONTEXT_TERMS = (
     b"refresh_token",
     b"access_token",
 )
+CODEX_CLIENT_ID_LOGIN_CONTEXT_TERMS = (
+    b"chatgpt login",
+    b"starting browser login flow",
+    b"starting device code login flow",
+    b"starting api key login flow",
+    b"logged in using chatgpt",
+    b"logged in using access token",
+    b"successfully logged in",
+)
+CODEX_CLIENT_ID_FALSE_CONTEXT_TERMS = (
+    b"remoteplugin",
+    b"apptemplate",
+    b"app_template",
+    b"app_templates",
+    b"app_ids",
+    b"asdk_app_",
+    b"connector_",
+    b"plugin_id",
+    b"marketplace",
+)
+CODEX_CLIENT_ID_PRECEDING_TOKEN_BYTES = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
 
 
 class AuthError(RuntimeError):
@@ -65,6 +86,26 @@ def write_secret_json(path: Path, data: dict[str, Any]) -> None:
     temp.chmod(0o600)
     temp.replace(path)
     path.chmod(0o600)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def remember_refresh_failure(auth_path: Path, auth: dict[str, Any], message: str) -> None:
+    auth["last_refresh_failed_at"] = utc_now_iso()
+    auth["last_refresh_error"] = message[:1000]
+    try:
+        write_secret_json(auth_path, auth)
+    except OSError:
+        return
+
+
+def remember_refresh_success(auth_path: Path, auth: dict[str, Any]) -> None:
+    auth["last_refresh"] = utc_now_iso()
+    auth.pop("last_refresh_failed_at", None)
+    auth.pop("last_refresh_error", None)
+    write_secret_json(auth_path, auth)
 
 
 def decode_jwt_claims(token: str | None) -> dict[str, Any]:
@@ -120,7 +161,7 @@ def extract_metadata(auth: dict[str, Any]) -> dict[str, Any]:
         "name": name,
         "account_id": account_id,
         "plan_type": plan,
-        "imported_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "imported_at": utc_now_iso(),
     }
 
 
@@ -135,16 +176,33 @@ def access_token_expired(auth: dict[str, Any], skew_seconds: int = 300) -> bool:
     return exp <= time.time() + skew_seconds
 
 
+def codex_client_id_match_score(data: bytes, match: re.Match[bytes]) -> int:
+    if match.start() > 0 and data[match.start() - 1 : match.start()] in CODEX_CLIENT_ID_PRECEDING_TOKEN_BYTES:
+        return 0
+    strict_start = max(0, match.start() - 256)
+    strict_end = min(len(data), match.end() + 256)
+    strict_context = data[strict_start:strict_end].lower()
+    start = max(0, match.start() - 512)
+    end = min(len(data), match.end() + 512)
+    context = data[start:end].lower()
+    if any(term in context for term in CODEX_CLIENT_ID_FALSE_CONTEXT_TERMS):
+        return 0
+    if all(term in strict_context for term in CODEX_CLIENT_ID_CONTEXT_TERMS):
+        return 100
+    login_context_matches = sum(1 for term in CODEX_CLIENT_ID_LOGIN_CONTEXT_TERMS if term in context)
+    if login_context_matches >= 2:
+        return 50 + login_context_matches
+    return 0
+
+
 def codex_client_id_from_bytes(data: bytes) -> str | None:
     candidates: dict[str, int] = {}
     for match in CODEX_CLIENT_ID_PATTERN.finditer(data):
-        start = max(0, match.start() - 256)
-        end = min(len(data), match.end() + 256)
-        context = data[start:end]
-        if not all(term in context for term in CODEX_CLIENT_ID_CONTEXT_TERMS):
+        score = codex_client_id_match_score(data, match)
+        if score <= 0:
             continue
         value = match.group(0).decode("ascii")
-        candidates[value] = candidates.get(value, 0) + 1
+        candidates[value] = candidates.get(value, 0) + score
     if not candidates:
         return None
     return max(candidates.items(), key=lambda item: item[1])[0]
@@ -222,27 +280,34 @@ def refresh_chatgpt_tokens(auth_path: Path, auth: dict[str, Any]) -> dict[str, A
     if not refresh_token:
         raise AuthError("profile does not contain a refresh token")
 
-    body = urllib.parse.urlencode(
-        {
-            "client_id": codex_client_id(),
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-        }
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        OAUTH_TOKEN_URL,
-        data=body,
-        headers={"content-type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
     try:
+        body = urllib.parse.urlencode(
+            {
+                "client_id": codex_client_id(),
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            OAUTH_TOKEN_URL,
+            data=body,
+            headers={"content-type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
         with urllib.request.urlopen(request, timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
+    except AuthError as exc:
+        remember_refresh_failure(auth_path, auth, str(exc))
+        raise
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise AuthError(f"token refresh failed with HTTP {exc.code}: {detail}") from exc
+        message = f"token refresh failed with HTTP {exc.code}: {detail}"
+        remember_refresh_failure(auth_path, auth, message)
+        raise AuthError(message) from exc
     except urllib.error.URLError as exc:
-        raise AuthError(f"token refresh failed: {exc}") from exc
+        message = f"token refresh failed: {exc}"
+        remember_refresh_failure(auth_path, auth, message)
+        raise AuthError(message) from exc
 
     for key in ("id_token", "access_token", "refresh_token"):
         value = payload.get(key)
@@ -255,8 +320,7 @@ def refresh_chatgpt_tokens(auth_path: Path, auth: dict[str, Any]) -> dict[str, A
             tokens["account_id"] = nested["chatgpt_account_id"]
 
     auth["tokens"] = tokens
-    auth["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    write_secret_json(auth_path, auth)
+    remember_refresh_success(auth_path, auth)
     return auth
 
 

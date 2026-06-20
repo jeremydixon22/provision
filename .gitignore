@@ -31,3 +31,8 @@ dist/
 
 # Local release review drafts
 docs/staging/
+
+# Local agent run artifacts
+.agent-artifacts/
+.agent-state/
+docs/dev_coordination/

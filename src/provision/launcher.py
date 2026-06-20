@@ -13,8 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from .daemon import (
+    DEFAULT_DAEMON_HOST,
     PROTOCOL_VERSION,
     daemon_running,
+    daemon_url_host,
     health,
     project_session_sentinel,
     wait_until_running,
@@ -28,9 +30,12 @@ CODEX_MODEL_COMMANDS = {"debug", "e", "exec", "fork", "resume", "review"}
 CODEX_PASSTHROUGH_COMMANDS = {
     "app-server",
     "apply",
+    "archive",
     "cloud",
     "completion",
+    "delete",
     "doctor",
+    "exec-server",
     "features",
     "help",
     "login",
@@ -40,6 +45,7 @@ CODEX_PASSTHROUGH_COMMANDS = {
     "plugin",
     "remote-control",
     "sandbox",
+    "unarchive",
     "update",
 }
 
@@ -48,9 +54,9 @@ def toml_string(value: str) -> str:
     return json.dumps(value)
 
 
-def provider_override(port: int) -> str:
+def provider_override(port: int, host: str | None = None) -> str:
     launcher = provision_command()
-    base_url = f"http://127.0.0.1:{port}/v1"
+    base_url = f"http://{daemon_url_host(host)}:{port}/v1"
     return (
         f"model_providers.{PROVIDER_ID}={{ "
         f"name = \"Provision\", "
@@ -62,12 +68,12 @@ def provider_override(port: int) -> str:
     )
 
 
-def openai_base_url_override(port: int) -> str:
-    return f"openai_base_url={toml_string(f'http://127.0.0.1:{port}/v1')}"
+def openai_base_url_override(port: int, host: str | None = None) -> str:
+    return f"openai_base_url={toml_string(f'http://{daemon_url_host(host)}:{port}/v1')}"
 
 
-def chatgpt_base_url_override(port: int, proxy_token: str) -> str:
-    base_url = f"http://127.0.0.1:{port}/backend-api/provision"
+def chatgpt_base_url_override(port: int, proxy_token: str, host: str | None = None) -> str:
+    base_url = f"http://{daemon_url_host(host)}:{port}/backend-api/provision"
     return f"chatgpt_base_url={toml_string(base_url)}"
 
 
@@ -97,13 +103,23 @@ def configured_daemon_port() -> int | None:
     return port
 
 
-def ensure_daemon(paths: Paths, port: int | None = None) -> dict[str, Any]:
+def configured_daemon_host() -> str | None:
+    raw = os.environ.get("PROVISION_HOST")
+    if raw is None or raw.strip() == "":
+        return None
+    return raw.strip()
+
+
+def ensure_daemon(paths: Paths, port: int | None = None, host: str | None = None) -> dict[str, Any]:
     status = daemon_running(paths)
     specific_port = port not in (None, 0)
+    requested_host = host or None
+    specific_host = requested_host is not None
     if (
         status
         and status.get("provision_protocol") == PROTOCOL_VERSION
         and (not specific_port or status.get("port") == port)
+        and (not specific_host or status.get("host") == requested_host)
     ):
         return status
     if status:
@@ -118,6 +134,8 @@ def ensure_daemon(paths: Paths, port: int | None = None) -> dict[str, Any]:
     argv = [sys.executable, "-m", "provision", "daemon"]
     if port is not None:
         argv.extend(["--port", str(port)])
+    if requested_host is not None:
+        argv.extend(["--host", requested_host])
     subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
@@ -140,21 +158,22 @@ def stop_incompatible_daemon(status: dict[str, Any]) -> None:
         return
     if not isinstance(port, int):
         return
+    host = str(status.get("host") or DEFAULT_DAEMON_HOST)
     deadline = time.time() + 2
     while time.time() < deadline:
-        if health(port, timeout=0.2) is None:
+        if health(port, timeout=0.2, host=host) is None:
             return
         time.sleep(0.05)
 
 
-def register_session(port: int, proxy_token: str, cwd: str) -> None:
+def register_session(port: int, proxy_token: str, cwd: str, host: str | None = None) -> None:
     body = urllib.parse.urlencode(
         {
             "token": proxy_token,
             "cwd": cwd,
         }
     )
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=0.5)
+    conn = http.client.HTTPConnection(daemon_url_host(host), port, timeout=0.5)
     try:
         conn.request(
             "POST",
@@ -174,17 +193,18 @@ def launch_codex(codex_args: list[str]) -> int:
     store = Store(paths)
     store.import_default_if_available()
     store.active_profile()
-    status = ensure_daemon(paths, configured_daemon_port())
+    status = ensure_daemon(paths, configured_daemon_port(), configured_daemon_host())
     port = int(status["port"])
+    host = str(status.get("host") or DEFAULT_DAEMON_HOST)
     proxy_token = store.proxy_token()
     cwd = os.getcwd()
-    register_session(port, proxy_token, cwd)
+    register_session(port, proxy_token, cwd, host)
 
     provider_args = [
         "-c",
-        openai_base_url_override(port),
+        openai_base_url_override(port, host),
         "-c",
-        chatgpt_base_url_override(port, proxy_token),
+        chatgpt_base_url_override(port, proxy_token, host),
         "-c",
         f"model_provider={toml_string('openai')}",
     ]

@@ -4,7 +4,6 @@ import argparse
 import http.client
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -13,13 +12,28 @@ from pathlib import Path
 from typing import Sequence
 
 from . import __version__
-from .daemon import daemon_running, serve
-from .launcher import configured_daemon_port, ensure_daemon, launch_codex
+from .daemon import (
+    CodexAppServerClient,
+    CodexAppServerError,
+    codex_app_server_schema_probe,
+    codex_compatibility_payload,
+    daemon_bind_address,
+    daemon_running,
+    daemon_url_host,
+    serve,
+    usage_payload_from_app_server_rate_limits_response,
+)
+from .launcher import configured_daemon_host, configured_daemon_port, ensure_daemon, launch_codex
 from .paths import Paths, default_codex_home
 from .store import Store, StoreError
 
 
+def ui_url(host: object | None, port: object) -> str:
+    return f"http://{daemon_url_host(str(host) if host else None)}:{port}/ui"
+
+
 COMMANDS = {
+    "app-server-probe",
     "daemon",
     "doctor",
     "help",
@@ -45,7 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser("help", help="show Provision help")
-    subparsers.add_parser("daemon", help="run the local proxy daemon").add_argument("--port", type=int, default=None)
+    app_server_probe = subparsers.add_parser("app-server-probe", help="inspect Codex CLI app-server capabilities")
+    app_server_probe.add_argument("--read-account", action="store_true", help="read current account usage and rate limits")
+
+    daemon = subparsers.add_parser("daemon", help="run the local proxy daemon")
+    daemon.add_argument("--port", type=int, default=None)
+    daemon.add_argument("--host", default=None)
 
     import_default = subparsers.add_parser("import-default", help="import the current Codex CLI auth.json as a profile")
     import_default.add_argument("--name", default="default")
@@ -61,8 +80,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("profiles", help="list enrolled profiles")
     start = subparsers.add_parser("start", help="start the local proxy daemon")
     start.add_argument("--port", type=int, default=None)
+    start.add_argument("--host", default=None)
     ui = subparsers.add_parser("ui", help="start the daemon and print the web UI URL")
     ui.add_argument("--port", type=int, default=None)
+    ui.add_argument("--host", default=None)
 
     use = subparsers.add_parser("use", help="switch the active profile when the proxy is idle")
     use.add_argument("name", metavar="profile_name")
@@ -102,8 +123,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     store = Store(paths)
     try:
         if args.command == "daemon":
-            serve(args.port)
+            serve(args.port, args.host if args.host is not None else configured_daemon_host())
             return 0
+        if args.command == "app-server-probe":
+            return cmd_app_server_probe(args)
         if args.command == "import-default":
             return cmd_import_default(store, args)
         if args.command == "login":
@@ -111,9 +134,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "profiles":
             return cmd_profiles(store)
         if args.command == "start":
-            return cmd_start(paths, args.port if args.port is not None else configured_daemon_port())
+            return cmd_start(
+                paths,
+                args.port if args.port is not None else configured_daemon_port(),
+                args.host if args.host is not None else configured_daemon_host(),
+            )
         if args.command == "ui":
-            return cmd_ui(paths, args.port if args.port is not None else configured_daemon_port())
+            return cmd_ui(
+                paths,
+                args.port if args.port is not None else configured_daemon_port(),
+                args.host if args.host is not None else configured_daemon_host(),
+            )
         if args.command == "use":
             return cmd_use(store, args.name)
         if args.command == "status":
@@ -205,15 +236,44 @@ def cmd_profiles(store: Store) -> int:
     return 0
 
 
-def cmd_start(paths: Paths, port: int | None = None) -> int:
-    status = ensure_daemon(paths, port)
-    print(f"daemon running: pid {status['pid']} on http://127.0.0.1:{status['port']}")
+def cmd_app_server_probe(args: argparse.Namespace) -> int:
+    payload: dict[str, object] = {
+        "schema": codex_app_server_schema_probe(),
+    }
+    exit_code = 0
+    if args.read_account:
+        try:
+            with CodexAppServerClient() as client:
+                rate_limits = client.read_account_rate_limits()
+                payload["account"] = {
+                    "ok": True,
+                    "rate_limits": rate_limits,
+                    "usage": client.read_account_usage(),
+                    "quota_payload": usage_payload_from_app_server_rate_limits_response(rate_limits),
+                }
+        except CodexAppServerError as exc:
+            payload["account"] = {"ok": False, "error": str(exc)}
+            exit_code = 1
+    print(json.dumps(payload, indent=2))
+    return exit_code
+
+
+def cmd_start(paths: Paths, port: int | None = None, host: str | None = None) -> int:
+    status = ensure_daemon(paths, port, host)
+    bind_host = status.get("host") or host
+    local_ui = ui_url(bind_host, status["port"])
+    local_address = local_ui.removesuffix("/ui").removeprefix("http://")
+    bind_address = daemon_bind_address(str(bind_host) if bind_host else None, status["port"])
+    if bind_address == local_address:
+        print(f"daemon running: pid {status['pid']} on {local_ui.removesuffix('/ui')}")
+    else:
+        print(f"daemon running: pid {status['pid']} bound to {bind_address}; local UI {local_ui}")
     return 0
 
 
-def cmd_ui(paths: Paths, port: int | None = None) -> int:
-    status = ensure_daemon(paths, port)
-    print(f"http://127.0.0.1:{status['port']}/ui")
+def cmd_ui(paths: Paths, port: int | None = None, host: str | None = None) -> int:
+    status = ensure_daemon(paths, port, host)
+    print(ui_url(status.get("host") or host, status["port"]))
     return 0
 
 
@@ -229,7 +289,7 @@ def cmd_use(store: Store, name: str) -> int:
             raise RuntimeError("proxy is busy; switch after active requests finish")
         port = status.get("port")
         if isinstance(port, int):
-            daemon_switch_profile(store, name, port)
+            daemon_switch_profile(store, name, port, str(status.get("host") or ""))
             print(f"active profile: {name}")
             return 0
     store.set_active_profile(name)
@@ -237,14 +297,14 @@ def cmd_use(store: Store, name: str) -> int:
     return 0
 
 
-def daemon_switch_profile(store: Store, name: str, port: int) -> None:
+def daemon_switch_profile(store: Store, name: str, port: int, host: str | None = None) -> None:
     body = urllib.parse.urlencode(
         {
             "token": store.proxy_token(),
             "profile": name,
         }
     )
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn = http.client.HTTPConnection(daemon_url_host(host), port, timeout=5)
     try:
         conn.request(
             "POST",
@@ -271,9 +331,10 @@ def cmd_status(paths: Paths, store: Store) -> int:
     payload = {
         "home": str(paths.home),
         "active_profile": store.active_profile(required=False),
+        "codex": codex_compatibility_payload(),
         "daemon": status or {"ok": False},
         "profiles": store.list_profiles(),
-        "ui": f"http://127.0.0.1:{status['port']}/ui" if status else None,
+        "ui": ui_url(status.get("host"), status["port"]) if status else None,
     }
     print(json.dumps(payload, indent=2))
     return 0
@@ -293,8 +354,23 @@ def cmd_stop(paths: Paths) -> int:
 
 
 def cmd_doctor(paths: Paths, store: Store) -> int:
+    codex = codex_compatibility_payload()
+    codex_cli = codex.get("cli") if isinstance(codex.get("cli"), dict) else {}
+    catalog = codex.get("model_catalog") if isinstance(codex.get("model_catalog"), dict) else {}
     checks = []
-    checks.append(("codex on PATH", shutil.which("codex") is not None))
+    codex_version = codex_cli.get("version")
+    codex_label = f"codex on PATH ({codex_version})" if codex_version else "codex on PATH"
+    checks.append((codex_label, bool(codex_cli.get("available"))))
+    catalog_source = catalog.get("source") or "unknown"
+    catalog_count = catalog.get("count") or 0
+    catalog_label = f"Codex model catalog readable ({catalog_count} models from {catalog_source})"
+    checks.append((catalog_label, catalog_source == "codex"))
+    app_server = codex.get("app_server") if isinstance(codex.get("app_server"), dict) else None
+    if app_server is not None:
+        methods = app_server.get("methods") if isinstance(app_server.get("methods"), dict) else {}
+        reset_credit_ok = bool(methods.get("rate_limit_reset_credit_consume"))
+        app_server_label = "Codex app-server usage/reset-credit schema readable"
+        checks.append((app_server_label, bool(app_server.get("available")) and reset_credit_ok))
     checks.append(("Provision home writable", os.access(paths.home, os.W_OK)))
     checks.append(("proxy token present", bool(store.proxy_token())))
     checks.append(("active profile present", store.active_profile(required=False) is not None))
@@ -307,5 +383,5 @@ def cmd_doctor(paths: Paths, store: Store) -> int:
         print(f"{status:4} {label}")
         failed = failed or not ok
     if state:
-        print(f"ui   http://127.0.0.1:{state['port']}/ui")
+        print(f"ui   {ui_url(state.get('host'), state['port'])}")
     return 1 if failed else 0
