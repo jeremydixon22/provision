@@ -59,7 +59,10 @@ These pieces map cleanly to current Provision features:
 Provision now uses the app-server in a narrow, optional path:
 
 - `provision app-server-probe` generates the local app-server JSON schema and
-  reports whether the usage, rate-limit, and reset-credit methods are present.
+  reports whether usage, rate-limit, reset-credit, and control-plane methods are
+  present. The control-plane report is grouped into account, model, thread,
+  turn, token-usage, and remote-control readiness so downstream UI work can be
+  feature-gated.
 - `provision app-server-probe --read-account` starts a short-lived app-server
   against the current stock Codex CLI login and reads account usage/rate-limit
   data for diagnostics.
@@ -83,7 +86,9 @@ Provision now uses the app-server in a narrow, optional path:
 
 This keeps the existing proxy and launcher path authoritative for routing,
 resume compatibility, session pins, and switch safety. The dashboard does not
-require the app-server to render or route normal Codex CLI traffic.
+require the app-server to render or route normal Codex CLI traffic, and
+Provision does not yet use app-server methods to start, steer, or interrupt
+turns.
 
 ## Credential Injection Research
 
@@ -108,9 +113,11 @@ stable enough in practice.
    observed across accounts with and without credits.
 3. Mirror app-server thread/turn/token events into Provision's existing stats
    model without changing switching behavior.
-4. Use app-server quota/model metadata more broadly as an optional source and
+4. Add a read-only dashboard view for app-server thread state before adding any
+   user input path.
+5. Use app-server quota/model metadata more broadly as an optional source and
    keep the current proxy/debug fallbacks.
-5. Only after those steps, experiment with `chatgptAuthTokens` in an isolated
+6. Only after those steps, experiment with `chatgptAuthTokens` in an isolated
    profile and feature-flag any credential-injection path.
 
 ## Non-Goals For Now

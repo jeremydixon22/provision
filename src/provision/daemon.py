@@ -481,15 +481,133 @@ def codex_model_catalog_probe() -> dict[str, Any]:
 
 
 APP_SERVER_CAPABILITY_METHODS = {
+    "account_read": "account/read",
+    "account_updated": "account/updated",
+    "account_login_start": "account/login/start",
+    "account_login_completed": "account/login/completed",
+    "account_logout": "account/logout",
     "account_rate_limits": "account/rateLimits/read",
     "account_rate_limits_updated": "account/rateLimits/updated",
     "account_usage": "account/usage/read",
     "rate_limit_reset_credit_consume": "account/rateLimitResetCredit/consume",
+    "model_list": "model/list",
+    "model_rerouted": "model/rerouted",
+    "model_provider_capabilities_read": "modelProvider/capabilities/read",
+    "model_verification": "model/verification",
+    "thread_list": "thread/list",
+    "thread_read": "thread/read",
+    "thread_resume": "thread/resume",
+    "thread_settings_update": "thread/settings/update",
+    "thread_settings_updated": "thread/settings/updated",
+    "thread_status_changed": "thread/status/changed",
+    "thread_token_usage_updated": "thread/tokenUsage/updated",
+    "turn_start": "turn/start",
+    "turn_started": "turn/started",
+    "turn_completed": "turn/completed",
+    "turn_interrupt": "turn/interrupt",
+    "turn_steer": "turn/steer",
+    "remote_control_status_read": "remoteControl/status/read",
+    "remote_control_enable": "remoteControl/enable",
+    "remote_control_disable": "remoteControl/disable",
+    "remote_control_pairing_start": "remoteControl/pairing/start",
 }
+
+APP_SERVER_CAPABILITY_GROUPS = {
+    "account": (
+        "account_read",
+        "account_updated",
+        "account_login_start",
+        "account_login_completed",
+        "account_logout",
+    ),
+    "usage": (
+        "account_rate_limits",
+        "account_rate_limits_updated",
+        "account_usage",
+        "rate_limit_reset_credit_consume",
+    ),
+    "model": (
+        "model_list",
+        "model_rerouted",
+        "model_provider_capabilities_read",
+        "model_verification",
+    ),
+    "thread": (
+        "thread_list",
+        "thread_read",
+        "thread_resume",
+        "thread_settings_update",
+        "thread_settings_updated",
+        "thread_status_changed",
+    ),
+    "token_usage": ("thread_token_usage_updated",),
+    "turn": (
+        "turn_start",
+        "turn_started",
+        "turn_completed",
+        "turn_interrupt",
+        "turn_steer",
+    ),
+    "remote_control": (
+        "remote_control_status_read",
+        "remote_control_enable",
+        "remote_control_disable",
+        "remote_control_pairing_start",
+    ),
+}
+
+
+def app_server_capability_groups(methods: dict[str, bool]) -> dict[str, dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for group, method_names in APP_SERVER_CAPABILITY_GROUPS.items():
+        missing = [name for name in method_names if not methods.get(name)]
+        groups[group] = {
+            "available": not missing,
+            "count": len(method_names) - len(missing),
+            "total": len(method_names),
+            "missing": missing,
+        }
+    return groups
+
+
+def app_server_control_plane_status(methods: dict[str, bool]) -> dict[str, Any]:
+    read_only_methods = (
+        "thread_list",
+        "thread_read",
+        "thread_status_changed",
+        "thread_token_usage_updated",
+    )
+    interactive_methods = (
+        "thread_resume",
+        "turn_start",
+        "turn_interrupt",
+        "turn_steer",
+    )
+    remote_methods = (
+        "remote_control_status_read",
+        "remote_control_enable",
+        "remote_control_disable",
+        "remote_control_pairing_start",
+    )
+    read_only_missing = [name for name in read_only_methods if not methods.get(name)]
+    interactive_missing = [name for name in interactive_methods if not methods.get(name)]
+    remote_missing = [name for name in remote_methods if not methods.get(name)]
+    return {
+        "available": not read_only_missing,
+        "read_only": not read_only_missing,
+        "interactive": not interactive_missing,
+        "remote_control": not remote_missing,
+        "missing": {
+            "read_only": read_only_missing,
+            "interactive": interactive_missing,
+            "remote_control": remote_missing,
+        },
+    }
 
 
 @functools.lru_cache(maxsize=1)
 def codex_app_server_schema_probe() -> dict[str, Any]:
+    unavailable_methods = {name: False for name in APP_SERVER_CAPABILITY_METHODS}
     try:
         with tempfile.TemporaryDirectory(prefix="provision-codex-app-server-") as temp:
             out_dir = Path(temp)
@@ -525,7 +643,9 @@ def codex_app_server_schema_probe() -> dict[str, Any]:
         return {
             "available": False,
             "source": "unavailable",
-            "methods": {name: False for name in APP_SERVER_CAPABILITY_METHODS},
+            "methods": unavailable_methods,
+            "capability_groups": app_server_capability_groups(unavailable_methods),
+            "control_plane": app_server_control_plane_status(unavailable_methods),
             "response_types": {},
             "schema_count": 0,
             "error": subprocess_error_message(exc),
@@ -548,6 +668,8 @@ def codex_app_server_schema_probe() -> dict[str, Any]:
         "available": available,
         "source": "codex",
         "methods": methods,
+        "capability_groups": app_server_capability_groups(methods),
+        "control_plane": app_server_control_plane_status(methods),
         "response_types": response_types,
         "schema_count": len(schema_files),
         "stdout": result.stdout.strip(),

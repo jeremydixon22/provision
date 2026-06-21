@@ -371,6 +371,13 @@ def cmd_doctor(paths: Paths, store: Store) -> int:
         reset_credit_ok = bool(methods.get("rate_limit_reset_credit_consume"))
         app_server_label = "Codex app-server usage/reset-credit schema readable"
         checks.append((app_server_label, bool(app_server.get("available")) and reset_credit_ok))
+        control_plane = app_server.get("control_plane") if isinstance(app_server.get("control_plane"), dict) else {}
+        checks.append(
+            (
+                "Codex app-server read-only control-plane schema readable",
+                bool(control_plane.get("read_only")),
+            )
+        )
     checks.append(("Provision home writable", os.access(paths.home, os.W_OK)))
     checks.append(("proxy token present", bool(store.proxy_token())))
     checks.append(("active profile present", store.active_profile(required=False) is not None))

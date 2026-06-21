@@ -93,6 +93,9 @@ provision login --help
 - Codex CLI compatibility reporting in `provision status`, `provision doctor`,
   and the dashboard header, including the installed Codex CLI version and
   bundled model catalog source.
+- Read-only Codex CLI app-server control-plane readiness reporting, so future
+  thread/turn/token-usage integration can be gated on discovered local
+  capabilities instead of assumed Codex internals.
 - Resume-compatible launching that keeps Codex CLI's native transcript history
   and `model_provider=openai` session identity intact.
 
@@ -282,7 +285,7 @@ These files include credentials. Do not commit or sync them casually.
 | `provision use <profile_name>` | Switch the active profile when unpinned proxy work is idle. |
 | `provision ui [--port <port>]` | Start the daemon if needed and print the localhost dashboard URL. |
 | `provision status` | Print JSON status for Provision home, Codex CLI compatibility, daemon, active profile, profiles, and dashboard URL. |
-| `provision app-server-probe [--read-account]` | Inspect the installed Codex CLI app-server schema; with `--read-account`, start a short-lived Codex app-server and read account usage/rate-limit data for the current Codex CLI login. |
+| `provision app-server-probe [--read-account]` | Inspect the installed Codex CLI app-server schema, including usage, reset-credit, and control-plane readiness; with `--read-account`, start a short-lived Codex app-server and read account usage/rate-limit data for the current Codex CLI login. |
 | `provision start [--port <port>]` | Start the local proxy daemon without launching Codex CLI. |
 | `provision stop` | Stop the running daemon. |
 | `provision doctor` | Run local environment and Codex CLI compatibility checks. |
@@ -349,9 +352,10 @@ isolation issues. See [SECURITY.md](SECURITY.md).
 - Quota sections are shaped from upstream usage payloads. If a profile or plan
   does not report a bucket, Provision does not invent one.
 - Turn/activity tracking is still based on Provision's proxy observations and
-  recognized Codex CLI traffic shapes. Codex CLI's app-server protocol now
-  exposes richer thread, turn, and token-usage events, but Provision does not
-  yet depend on that experimental control-plane path.
+  recognized Codex CLI traffic shapes. Provision reports whether the installed
+  Codex CLI app-server exposes read-only thread, turn, and token-usage
+  control-plane surfaces, but it does not yet depend on that experimental path
+  or start/steer turns from the dashboard.
 - Codex CLI still applies its normal current-working-directory filter in the
   resume picker. Use `provision resume --all` when launching from a different
   directory than the sessions you want to see.

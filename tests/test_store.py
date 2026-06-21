@@ -559,7 +559,10 @@ class StoreTests(unittest.TestCase):
                 (out_dir / "v2").mkdir(parents=True, exist_ok=True)
                 (out_dir / "ClientRequest.json").write_text(
                     "account/rateLimits/read account/rateLimits/updated account/usage/read "
-                    "account/rateLimitResetCredit/consume",
+                    "account/rateLimitResetCredit/consume "
+                    "thread/list thread/read thread/resume thread/status/changed thread/tokenUsage/updated "
+                    "turn/start turn/interrupt turn/steer "
+                    "remoteControl/status/read remoteControl/enable remoteControl/disable remoteControl/pairing/start",
                     encoding="utf-8",
                 )
                 (out_dir / "v2" / "GetAccountRateLimitsResponse.json").write_text("{}", encoding="utf-8")
@@ -586,6 +589,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(payload["model_catalog"]["count"], 1)
         self.assertTrue(payload["app_server"]["available"])
         self.assertTrue(payload["app_server"]["methods"]["rate_limit_reset_credit_consume"])
+        self.assertTrue(payload["app_server"]["control_plane"]["read_only"])
+        self.assertTrue(payload["app_server"]["control_plane"]["interactive"])
+        self.assertTrue(payload["app_server"]["control_plane"]["remote_control"])
 
     def test_codex_app_server_schema_probe_reads_usage_and_reset_credit_methods(self) -> None:
         original_run = daemon_module.subprocess.run
@@ -605,6 +611,26 @@ class StoreTests(unittest.TestCase):
                         "account/rateLimits/updated",
                         "account/usage/read",
                         "account/rateLimitResetCredit/consume",
+                        "model/list",
+                        "model/rerouted",
+                        "modelProvider/capabilities/read",
+                        "model/verification",
+                        "thread/list",
+                        "thread/read",
+                        "thread/resume",
+                        "thread/settings/update",
+                        "thread/settings/updated",
+                        "thread/status/changed",
+                        "thread/tokenUsage/updated",
+                        "turn/start",
+                        "turn/started",
+                        "turn/completed",
+                        "turn/interrupt",
+                        "turn/steer",
+                        "remoteControl/status/read",
+                        "remoteControl/enable",
+                        "remoteControl/disable",
+                        "remoteControl/pairing/start",
                     ]
                 ),
                 encoding="utf-8",
@@ -630,7 +656,34 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(payload["methods"]["account_rate_limits"])
         self.assertTrue(payload["methods"]["account_usage"])
         self.assertTrue(payload["methods"]["rate_limit_reset_credit_consume"])
+        self.assertTrue(payload["methods"]["thread_list"])
+        self.assertTrue(payload["methods"]["turn_start"])
+        self.assertTrue(payload["methods"]["remote_control_status_read"])
+        self.assertTrue(payload["capability_groups"]["thread"]["available"])
+        self.assertTrue(payload["capability_groups"]["token_usage"]["available"])
+        self.assertTrue(payload["capability_groups"]["turn"]["available"])
+        self.assertTrue(payload["capability_groups"]["remote_control"]["available"])
+        self.assertTrue(payload["control_plane"]["read_only"])
+        self.assertTrue(payload["control_plane"]["interactive"])
+        self.assertTrue(payload["control_plane"]["remote_control"])
         self.assertTrue(payload["response_types"]["reset_credit_summary"])
+
+    def test_app_server_control_plane_status_marks_missing_optional_layers(self) -> None:
+        methods = {name: False for name in daemon_module.APP_SERVER_CAPABILITY_METHODS}
+        methods["thread_list"] = True
+        methods["thread_read"] = True
+        methods["thread_status_changed"] = True
+        methods["thread_token_usage_updated"] = True
+
+        status = daemon_module.app_server_control_plane_status(methods)
+
+        self.assertTrue(status["read_only"])
+        self.assertFalse(status["interactive"])
+        self.assertFalse(status["remote_control"])
+        self.assertEqual(
+            status["missing"]["interactive"],
+            ["thread_resume", "turn_start", "turn_interrupt", "turn_steer"],
+        )
 
     def test_usage_payload_from_app_server_rate_limits_response_reads_reset_credits(self) -> None:
         payload = daemon_module.usage_payload_from_app_server_rate_limits_response(
@@ -2576,6 +2629,11 @@ class StoreTests(unittest.TestCase):
                 cli_module.codex_compatibility_payload = lambda: {
                     "cli": {"available": True, "version": "0.141.0"},
                     "model_catalog": {"source": "codex", "count": 5, "available": True},
+                    "app_server": {
+                        "available": True,
+                        "methods": {"rate_limit_reset_credit_consume": True},
+                        "control_plane": {"read_only": True},
+                    },
                 }
                 cli_module.daemon_running = lambda _paths: {"pid": 123, "host": "127.0.0.1", "port": 4888}
                 output = StringIO()
@@ -2588,6 +2646,7 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertIn("codex on PATH (0.141.0)", output.getvalue())
             self.assertIn("Codex model catalog readable (5 models from codex)", output.getvalue())
+            self.assertIn("Codex app-server read-only control-plane schema readable", output.getvalue())
 
     def test_codex_client_id_is_discovered_from_auth_context(self) -> None:
         payload = (
