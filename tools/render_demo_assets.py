@@ -140,6 +140,7 @@ class DemoServer:
                     weekly_remaining=82,
                     primary_reset_seconds=7_200,
                     weekly_reset_seconds=390_000,
+                    reset_credits=2,
                     additional=[
                         additional_limit(
                             "GPT-5.3-Codex-Spark",
@@ -230,9 +231,225 @@ class DemoServer:
     def session_snapshots(self) -> list[dict[str, Any]]:
         return [dict(session) for session in self.sessions]
 
+    def control_plane_sessions(self) -> dict[str, Any]:
+        sessions: list[dict[str, Any]] = []
+        for session in self.sessions:
+            key = str(session.get("key") or "")
+            transcript = [
+                {
+                    "ts": (datetime.now() - timedelta(minutes=12)).isoformat(),
+                    "updated_at": (datetime.now() - timedelta(minutes=12)).isoformat(),
+                    "role": "user",
+                    "text": "Tighten the release notes and verify the quota dashboard behavior.",
+                    "turn_id": "turn_demo",
+                    "profile": session.get("last_profile") or "work",
+                    "search_text": "user release notes quota dashboard",
+                },
+                {
+                    "ts": (datetime.now() - timedelta(minutes=10)).isoformat(),
+                    "updated_at": (datetime.now() - timedelta(minutes=10)).isoformat(),
+                    "role": "tool",
+                    "text": "Command: python3 tools/render_demo_assets.py (status completed, exit 0)\nStdout:\nRendered sanitized dashboard media.",
+                    "turn_id": "turn_demo",
+                    "profile": session.get("last_profile") or "work",
+                    "search_text": "tool render demo assets",
+                    "call_id": "call_demo",
+                },
+                {
+                    "ts": (datetime.now() - timedelta(minutes=8)).isoformat(),
+                    "updated_at": (datetime.now() - timedelta(minutes=8)).isoformat(),
+                    "role": "assistant",
+                    "text": "I updated the release copy, checked the dashboard layout, and confirmed the active session indicators remain visible.",
+                    "turn_id": "turn_demo",
+                    "profile": session.get("last_profile") or "work",
+                    "search_text": "assistant updated release copy dashboard active session indicators",
+                },
+            ]
+            for transcript_index, item in enumerate(transcript):
+                item["control_index"] = transcript_index
+            active_details = {
+                "requests": [
+                    {
+                        "profile": request.get("profile"),
+                        "age_seconds": 18.4,
+                    }
+                    for request in self.requests
+                    if request.get("session_key") == key
+                ],
+                "tunnels": [
+                    {
+                        "profile": tunnel.get("profile"),
+                        "pending_work": tunnel.get("pending_work"),
+                        "turn_id": "turn_demo" if tunnel.get("pending_work") else "",
+                        "service_tier": "priority" if tunnel.get("profile") == "work" else "default",
+                        "age_seconds": 94.2,
+                        "last_data_age_seconds": 3.0,
+                        "bytes_up": 12432,
+                        "bytes_down": 105884,
+                        "messages_up": 17,
+                        "messages_down": 42,
+                    }
+                    for tunnel in self.websockets
+                    if tunnel.get("session_key") == key
+                ],
+            }
+            turn = {
+                "key": "turn_demo",
+                "turn_id": "turn_demo",
+                "pending": bool(session.get("pending_websocket_work")),
+                "start_index": 0,
+                "end_index": len(transcript) - 1,
+                "timestamp": transcript[0]["ts"],
+                "updated_at": transcript[-1]["updated_at"],
+                "label": "Tighten the release notes and verify the quota dashboard behavior.",
+            }
+            sessions.append(
+                dict(
+                    session,
+                    title=session.get("title") or session.get("name"),
+                    active_details=active_details,
+                    transcript=transcript,
+                    turns=[turn],
+                    events=[
+                        {
+                            "ts": (datetime.now() - timedelta(minutes=9)).isoformat(),
+                            "type": "token_usage",
+                            "profile": session.get("last_profile") or "work",
+                            "fast": session.get("last_profile") == "work",
+                            "tokens": 43120,
+                            "summary": "Token usage: 43,120 total (39,400 in, 3,720 out)",
+                            "search_text": "token usage codex cli session",
+                        },
+                        {
+                            "ts": (datetime.now() - timedelta(minutes=2)).isoformat(),
+                            "type": "websocket_tunnel",
+                            "profile": session.get("last_profile") or "work",
+                            "fast": False,
+                            "bytes": 118316,
+                            "summary": "Tunnel closed: 118316 bytes, 59 messages",
+                            "search_text": "websocket tunnel closed",
+                        },
+                    ],
+                )
+            )
+        return {
+            "sessions": sessions,
+            "event_limit": 32,
+            "updated_at": datetime.now().isoformat(),
+            "interaction": {
+                "available": False,
+                "reason": "Launch or resume a Codex CLI session with `provision` in an interactive terminal to enable live UI input.",
+            },
+        }
+
     def usage_cache_snapshot(self, profile: str) -> dict[str, Any] | None:
         entry = self.usage_cache.get(profile)
         return dict(entry) if entry else None
+
+    def reset_credit_status(self, profile: str) -> dict[str, Any]:
+        return {}
+
+    def profile_billing_required(self, profile: str) -> dict[str, Any]:
+        return {"required": False, "error": "", "error_at": ""}
+
+    def profile_fast_mode(self, profile: str) -> bool:
+        return profile == "work"
+
+    def profile_model_setting(self, profile: str) -> dict[str, Any]:
+        model = "gpt-5.5" if profile == "work" else "gpt-5.4"
+        reasoning = "high" if profile == "work" else "medium"
+        return {
+            "model": model,
+            "reasoning_effort": reasoning,
+            "label": f"{model} {reasoning}",
+            "display": model,
+            "source": "profile",
+            "note": "",
+        }
+
+    def profile_login_required(self, profile: str) -> dict[str, Any]:
+        return {"required": profile == "sandbox", "error": "Refresh login required.", "error_at": ""}
+
+    def profile_auth_health(self, profile: str) -> dict[str, Any]:
+        if profile == "sandbox":
+            return {
+                "status": "login_required",
+                "message": "Refresh login required.",
+                "error_at": "",
+                "last_refresh": "",
+                "last_refresh_failed_at": "",
+            }
+        return {
+            "status": "ok",
+            "message": "Auth refresh succeeded.",
+            "last_refresh": datetime.now().isoformat(),
+            "last_refresh_failed_at": "",
+        }
+
+    def login_status(self, profile: str) -> dict[str, Any] | None:
+        return None
+
+    def stats_summary(self) -> dict[str, Any]:
+        now = datetime.now()
+        return {
+            "profiles": [
+                {
+                    "profile": "work",
+                    "requests": 12,
+                    "tunnels": 8,
+                    "active_tunnels": 1,
+                    "bytes_up": 420_000,
+                    "bytes_down": 2_800_000,
+                    "input_tokens": 280_000,
+                    "cached_input_tokens": 31_000,
+                    "output_tokens": 44_000,
+                    "reasoning_output_tokens": 9_000,
+                    "total_tokens": 324_000,
+                    "fast_turns": 5,
+                    "fast_tokens": 112_000,
+                    "quota_updates": 4,
+                    "last_event_at": now.isoformat(),
+                    "last_quota": {},
+                },
+                {
+                    "profile": "research",
+                    "requests": 7,
+                    "tunnels": 5,
+                    "active_tunnels": 1,
+                    "bytes_up": 180_000,
+                    "bytes_down": 1_400_000,
+                    "input_tokens": 140_000,
+                    "cached_input_tokens": 18_000,
+                    "output_tokens": 22_000,
+                    "reasoning_output_tokens": 4_000,
+                    "total_tokens": 162_000,
+                    "fast_turns": 0,
+                    "fast_tokens": 0,
+                    "quota_updates": 3,
+                    "last_event_at": (now - timedelta(minutes=11)).isoformat(),
+                    "last_quota": {},
+                },
+            ],
+            "recent": [],
+            "series": [
+                {
+                    "ts": (now - timedelta(minutes=offset)).isoformat(),
+                    "profile": profile,
+                    "value": value,
+                    "tokens": value,
+                    "traffic": value * 4,
+                    "requests": 1,
+                    "quota_updates": 0,
+                }
+                for offset, profile, value in (
+                    (40, "work", 40_000),
+                    (30, "research", 22_000),
+                    (20, "work", 95_000),
+                    (10, "research", 62_000),
+                    (2, "work", 160_000),
+                )
+            ],
+        }
 
     def pinned_sessions_for_profile(self, profile: str) -> list[dict[str, Any]]:
         return [
@@ -267,6 +484,7 @@ def usage_payload(
     weekly_remaining: float,
     primary_reset_seconds: int,
     weekly_reset_seconds: int,
+    reset_credits: int = 0,
     additional: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload = {
@@ -275,6 +493,8 @@ def usage_payload(
             "secondary_window": quota_window(weekly_remaining, 604_800, weekly_reset_seconds),
         }
     }
+    if reset_credits:
+        payload["rate_limit_reset_credits"] = {"available_count": reset_credits}
     if additional:
         payload["additional_rate_limits"] = additional
     return payload
@@ -379,6 +599,15 @@ async function newPage(browser, viewport, isMobile = false) {
     path: path.join(outDir, "provision-dashboard-desktop-light.png"),
     fullPage: true
   });
+  await session.page.click("#sessionTabs .session-tab[data-session-key]");
+  await session.page.waitForSelector("#controlModal:not([hidden])");
+  await session.page.waitForTimeout(250);
+  await session.page.mouse.move(960, 520);
+  await session.page.waitForTimeout(150);
+  await session.page.screenshot({
+    path: path.join(outDir, "provision-control-plane-desktop-light.png"),
+    fullPage: true
+  });
   await session.context.close();
 
   session = await newPage(browser, { width: 390, height: 844 }, true);
@@ -467,6 +696,7 @@ def chromium_executable() -> str:
 def expected_capture_outputs_exist(output_dir: Path, frame_dir: Path) -> bool:
     required = [
         output_dir / "provision-dashboard-desktop-light.png",
+        output_dir / "provision-control-plane-desktop-light.png",
         output_dir / "provision-dashboard-mobile-light.png",
         output_dir / "provision-dashboard-desktop-dark.png",
     ]
@@ -507,7 +737,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     render_assets(args.output_dir.resolve())
-    for path in sorted(args.output_dir.glob("provision-dashboard-*")):
+    for path in sorted(args.output_dir.glob("provision-*")):
         print(path)
     return 0
 

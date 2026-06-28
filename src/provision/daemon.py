@@ -8,8 +8,11 @@ import html
 import importlib.resources as package_resources
 import json
 import os
+import pty
 import queue
 import re
+import signal
+import shlex
 import shutil
 import socket
 import ssl
@@ -37,7 +40,7 @@ from .auth import (
     upstream_base_url,
     upstream_chatgpt_backend_base_url,
 )
-from .paths import Paths, default_codex_home
+from .paths import Paths, default_codex_home, launcher_path
 from .store import Store, StoreError
 
 
@@ -73,8 +76,9 @@ UPSTREAM_IDENTITY_HEADERS = {
     "openai-project",
     "x-openai-fedramp",
 }
+DEFAULT_UPSTREAM_USER_AGENT = "OpenAI Codex CLI (Provision local proxy)"
 
-PROTOCOL_VERSION = 26
+PROTOCOL_VERSION = 28
 DEFAULT_DAEMON_HOST = "127.0.0.1"
 DEFAULT_DAEMON_PORT = 4888
 CHATGPT_USAGE_PATH = "/wham/usage"
@@ -86,6 +90,12 @@ USAGE_AUTO_REFRESH_POLL_SECONDS = 30.0
 USAGE_AUTO_REFRESH_ERROR_BACKOFF_SECONDS = 300.0
 USAGE_AUTO_REFRESH_BILLING_BACKOFF_SECONDS = 86400.0
 USAGE_RESET_REFRESH_DELAY_SECONDS = 60.0
+RESET_CREDIT_CONFIRMATION_DELTA_PERCENT = 5.0
+RESET_CREDIT_VERIFY_INITIAL_DELAY_SECONDS = 8.0
+RESET_CREDIT_VERIFY_INTERVAL_SECONDS = 20.0
+RESET_CREDIT_VERIFY_TIMEOUT_SECONDS = 600.0
+RESET_CREDIT_ERROR_GUARD_SECONDS = 3600.0
+RESET_CREDIT_COOLDOWN_SECONDS = 86400.0
 WEBSOCKET_SWITCH_IDLE_SECONDS = 10.0
 WEBSOCKET_COMPLETION_FALLBACK_SECONDS = 180.0
 WEBSOCKET_TOOL_COMPLETION_FALLBACK_SECONDS = 600.0
@@ -124,6 +134,7 @@ WEBSOCKET_TOOL_OUTPUT_TYPES = {
     "custom_tool_call",
     "file_search_call",
     "function_call",
+    "function_call_output",
     "local_shell_call",
     "mcp_call",
     "shell_call",
@@ -143,9 +154,55 @@ FAST_SERVICE_TIER = "priority"
 STANDARD_SERVICE_TIER = "default"
 FAST_SERVICE_TIER_VALUES = {"fast", FAST_SERVICE_TIER}
 STATS_MAX_EVENTS = 2000
+CONTROL_PLANE_EVENT_LIMIT = 240
+CONTROL_PLANE_SESSION_EVENT_LIMIT = 32
+CONTROL_TRANSCRIPT_MAX_ITEMS = 120
+CONTROL_TRANSCRIPT_TEXT_LIMIT = 12000
+CONTROL_TRANSCRIPT_EVENT_TEXT_LIMIT = 4000
+CONTROL_CONTEXT_WINDOW_TOKENS = 256000
+RESUME_CANDIDATE_LIMIT = 12
+RESUME_CANDIDATE_SCAN_LIMIT = 800
+RESUME_CANDIDATE_CACHE_SECONDS = 10.0
+UI_LAUNCHER_PERMISSION_PRESETS = {
+    "read-only": ("--sandbox", "read-only", "--ask-for-approval", "on-request"),
+    "workspace-write": ("--sandbox", "workspace-write", "--ask-for-approval", "on-request"),
+    "full-access": ("--sandbox", "danger-full-access", "--ask-for-approval", "on-request"),
+    "bypass": ("--dangerously-bypass-approvals-and-sandbox",),
+}
+CODEX_HISTORY_BRIDGE_NAMES = (
+    "sessions",
+    "archived_sessions",
+    "shell_snapshots",
+    "history.jsonl",
+    "state_5.sqlite",
+    "state_5.sqlite-shm",
+    "state_5.sqlite-wal",
+    "goals_1.sqlite",
+    "goals_1.sqlite-shm",
+    "goals_1.sqlite-wal",
+    "logs_2.sqlite",
+    "logs_2.sqlite-shm",
+    "logs_2.sqlite-wal",
+    "memories_1.sqlite",
+    "memories_1.sqlite-shm",
+    "memories_1.sqlite-wal",
+    "memories",
+    "rules",
+    "skills",
+    "cache",
+    "import-state",
+    "generated_images",
+    "models_cache.json",
+    "installation_id",
+    "version.json",
+    ".personality_migration",
+)
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\a]*(?:\a|\x1b\\)")
+ENVIRONMENT_CONTEXT_RE = re.compile(r"\s*<environment_context>.*?</environment_context>\s*", re.DOTALL)
+CONTROL_TRANSCRIPT_EDGE_RE = re.compile(r"^[\s\ufeff\u200b\u200c\u200d]+|[\s\ufeff\u200b\u200c\u200d]+$")
 LOGIN_URL_RE = re.compile(r"https?://[^\s<>]+")
 DEVICE_CODE_RE = re.compile(r"\b[A-Z0-9]{4,}(?:-[A-Z0-9]{4,})+\b")
+CONTROL_TOOL_CALL_RE = re.compile(r"^ctc_[a-f0-9]{16,}$", re.IGNORECASE)
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 PROFILE_MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
 REASONING_LEVEL_PATTERN = re.compile(r"^[a-z0-9_-]{1,32}$")
@@ -156,6 +213,7 @@ CODEX_MODEL_CATALOG_TIMEOUT_SECONDS = 2.0
 CODEX_VERSION_TIMEOUT_SECONDS = 2.0
 CODEX_APP_SERVER_SCHEMA_TIMEOUT_SECONDS = 10.0
 CODEX_APP_SERVER_REQUEST_TIMEOUT_SECONDS = 10.0
+CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS = 3600.0
 APP_SERVER_RATE_LIMIT_CACHE_SECONDS = 300.0
 APP_SERVER_RATE_LIMIT_FAILURE_BACKOFF_SECONDS = 900.0
 DEFAULT_MODEL_CATALOG = [
@@ -236,6 +294,10 @@ class BillingRequiredError(AuthError):
     pass
 
 
+class ResetCreditGuardError(StoreError):
+    pass
+
+
 class WebSocketHandshakeRejected(RuntimeError):
     def __init__(self, response: bytes) -> None:
         self.response = response
@@ -254,6 +316,12 @@ class WebSocketClosed(RuntimeError):
 def should_forward_incoming_header(name: str) -> bool:
     lower = name.lower()
     return lower not in REQUEST_HOP_BY_HOP_HEADERS and lower not in UPSTREAM_IDENTITY_HEADERS
+
+
+def ensure_default_upstream_user_agent(headers: dict[str, str]) -> dict[str, str]:
+    if not any(key.lower() == "user-agent" for key in headers):
+        headers["User-Agent"] = DEFAULT_UPSTREAM_USER_AGENT
+    return headers
 
 
 def backend_proxy_prefix(proxy_token: str | None = None) -> str:
@@ -750,7 +818,7 @@ class CodexAppServerClient:
                 "clientInfo": {
                     "name": "provision",
                     "title": "Provision",
-                    "version": PROTOCOL_VERSION,
+                    "version": str(PROTOCOL_VERSION),
                 },
                 "capabilities": {"experimentalApi": True},
             },
@@ -788,6 +856,15 @@ class CodexAppServerClient:
             if isinstance(message_id, int):
                 self._pending[message_id] = message
 
+    def read_message(self, timeout: float) -> dict[str, Any] | None:
+        try:
+            message = self._messages.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        if message is None:
+            raise CodexAppServerError("codex app-server exited")
+        return message
+
     def _send(self, payload: dict[str, Any]) -> None:
         if self.process is None or self.process.stdin is None:
             raise CodexAppServerError("codex app-server is not running")
@@ -819,6 +896,293 @@ class CodexAppServerClient:
         if not isinstance(result, dict):
             raise CodexAppServerError("account/rateLimitResetCredit/consume returned a non-object result")
         return result
+
+    def list_threads(self, *, limit: int = 25) -> Any:
+        params: dict[str, Any] = {
+            "limit": limit,
+            "sortKey": "updated_at",
+        }
+        return self.request("thread/list", params)
+
+    def start_turn(
+        self,
+        *,
+        thread_id: str,
+        text: str,
+        cwd: str | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        service_tier: str | None = None,
+    ) -> Any:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": text}],
+        }
+        if cwd:
+            params["cwd"] = cwd
+        if model:
+            params["model"] = model
+        if effort:
+            params["effort"] = effort
+        if service_tier:
+            params["serviceTier"] = service_tier
+        return self.request("turn/start", params)
+
+    def resume_thread(self, *, thread_id: str, cwd: str | None = None) -> Any:
+        params: dict[str, Any] = {"threadId": thread_id}
+        if cwd:
+            params["cwd"] = cwd
+        return self.request("thread/resume", params)
+
+    def fork_thread(self, *, thread_id: str, cwd: str | None = None) -> Any:
+        params: dict[str, Any] = {"threadId": thread_id}
+        if cwd:
+            params["cwd"] = cwd
+        return self.request("thread/fork", params)
+
+
+def thread_id_from_app_server_value(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    for key in ("id", "threadId", "thread_id"):
+        thread_id = value.get(key)
+        if isinstance(thread_id, str) and thread_id:
+            return thread_id
+    thread = value.get("thread")
+    if isinstance(thread, dict):
+        return thread_id_from_app_server_value(thread)
+    return None
+
+
+def turn_id_from_app_server_value(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    for key in ("id", "turnId", "turn_id"):
+        turn_id = value.get(key)
+        if isinstance(turn_id, str) and turn_id:
+            return turn_id
+    turn = value.get("turn")
+    if isinstance(turn, dict):
+        return turn_id_from_app_server_value(turn)
+    return None
+
+
+def app_server_thread_rows(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if not isinstance(value, dict):
+        return []
+    for key in ("threads", "items", "data", "results"):
+        rows = value.get(key)
+        if isinstance(rows, list):
+            return [item for item in rows if isinstance(item, dict)]
+    thread = value.get("thread")
+    if isinstance(thread, dict):
+        return [thread]
+    return []
+
+
+def normalized_path_text(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        return str(Path(value).expanduser().resolve(strict=False))
+    except OSError:
+        return os.path.normpath(os.path.expanduser(value))
+
+
+def app_server_thread_row_matches_cwd(row: dict[str, Any], cwd: str) -> bool:
+    row_cwd = normalized_path_text(row.get("cwd"))
+    target_cwd = normalized_path_text(cwd)
+    return bool(row_cwd and target_cwd and row_cwd == target_cwd)
+
+
+def app_server_thread_row_is_cli(row: dict[str, Any]) -> bool:
+    source = row.get("source")
+    if not source:
+        return True
+    if isinstance(source, str):
+        return source.lower() == "cli"
+    if isinstance(source, dict):
+        for key in ("type", "kind", "source"):
+            value = source.get(key)
+            if isinstance(value, str):
+                return value.lower() == "cli"
+    return True
+
+
+def first_app_server_thread_id(value: Any, *, cwd: str | None = None) -> str | None:
+    rows = app_server_thread_rows(value)
+    if cwd:
+        for row in rows:
+            if app_server_thread_row_is_cli(row) and app_server_thread_row_matches_cwd(row, cwd):
+                thread_id = thread_id_from_app_server_value(row)
+                if thread_id:
+                    return thread_id
+        return None
+    for row in rows:
+        if not app_server_thread_row_is_cli(row):
+            continue
+        thread_id = thread_id_from_app_server_value(row)
+        if thread_id:
+            return thread_id
+    return thread_id_from_app_server_value(value)
+
+
+def bridge_codex_history_into_app_home(codex_home: Path, source_home: Path | None = None) -> None:
+    source = (source_home or default_codex_home()).expanduser()
+    if not source.exists() or source.resolve() == codex_home.resolve():
+        return
+    for name in CODEX_HISTORY_BRIDGE_NAMES:
+        source_path = source / name
+        target_path = codex_home / name
+        if not source_path.exists() or target_path.exists():
+            continue
+        try:
+            target_path.symlink_to(source_path, target_is_directory=source_path.is_dir())
+        except OSError:
+            try:
+                if source_path.is_dir():
+                    shutil.copytree(source_path, target_path, symlinks=True)
+                else:
+                    shutil.copy2(source_path, target_path)
+            except OSError:
+                continue
+
+
+RESUME_CANDIDATE_INSTRUCTION_PREFIXES = (
+    "# agents.md instructions",
+    "agents.md instructions",
+    "# project instructions",
+    "project instructions",
+)
+
+
+def resume_candidate_text_is_useful(text: str) -> bool:
+    identity = transcript_identity_text(text).lower()
+    if not identity:
+        return False
+    return not any(
+        identity.startswith(prefix)
+        for prefix in RESUME_CANDIDATE_INSTRUCTION_PREFIXES
+    )
+
+
+def resume_candidate_label_from_text(text: str) -> str:
+    entries = user_transcript_entries(text)
+    for role in ("user", "resume"):
+        for entry in entries:
+            candidate = str(entry.get("text") or "")
+            if entry.get("role") == role and resume_candidate_text_is_useful(candidate):
+                return candidate
+    cleaned = clean_transcript_text(ENVIRONMENT_CONTEXT_RE.sub("\n", text))
+    return cleaned if resume_candidate_text_is_useful(cleaned) else ""
+
+
+def observed_turn_label_from_text(text: str) -> str:
+    label = resume_candidate_label_from_text(text)
+    if not label:
+        label = clean_transcript_text(text)
+    return label[:160]
+
+
+def first_user_text_from_session_file(path: Path, *, max_lines: int = 240) -> str:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle):
+                if index >= max_lines:
+                    break
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                payload = row.get("payload")
+                if not isinstance(payload, dict) or str(payload.get("role") or "") != "user":
+                    continue
+                content = payload.get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    parts = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            value = item.get("text")
+                            if isinstance(value, str):
+                                parts.append(value)
+                    text = "\n".join(parts)
+                else:
+                    text = ""
+                text = resume_candidate_label_from_text(text)
+                if text:
+                    return text[:160]
+    except OSError:
+        return ""
+    return ""
+
+
+def codex_session_meta_from_file(path: Path) -> dict[str, Any] | None:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            first = handle.readline()
+    except OSError:
+        return None
+    try:
+        row = json.loads(first)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(row, dict) or row.get("type") != "session_meta":
+        return None
+    payload = row.get("payload")
+    return payload if isinstance(payload, dict) else None
+
+
+def codex_resume_candidates_for_cwd(
+    cwd: str,
+    *,
+    codex_home: Path | None = None,
+    limit: int = RESUME_CANDIDATE_LIMIT,
+) -> list[dict[str, str]]:
+    target = normalized_path_text(cwd)
+    if not target:
+        return []
+    root = (codex_home or default_codex_home()).expanduser() / "sessions"
+    if not root.exists():
+        return []
+    try:
+        files = sorted(
+            (path for path in root.rglob("rollout-*.jsonl") if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return []
+    candidates: list[dict[str, str]] = []
+    for path in files[:RESUME_CANDIDATE_SCAN_LIMIT]:
+        meta = codex_session_meta_from_file(path)
+        if not meta:
+            continue
+        session_cwd = str(meta.get("cwd") or "")
+        if normalized_path_text(session_cwd) != target:
+            continue
+        session_id = str(meta.get("id") or "")
+        if not session_id:
+            continue
+        title = first_user_text_from_session_file(path)
+        if not title:
+            title = path.stem.replace("rollout-", "")
+        candidates.append(
+            {
+                "id": session_id,
+                "cwd": session_cwd,
+                "timestamp": str(meta.get("timestamp") or ""),
+                "label": title,
+            }
+        )
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
 def codex_compatibility_payload() -> dict[str, Any]:
@@ -1018,8 +1382,16 @@ def project_sentinel(proxy_token: str) -> str:
     return f"provision-{proxy_token}"
 
 
-def project_session_sentinel(proxy_token: str, cwd: str) -> str:
-    payload = json.dumps({"cwd": cwd}, separators=(",", ":")).encode("utf-8")
+def project_session_sentinel(
+    proxy_token: str,
+    cwd: str,
+    *,
+    session_key: str | None = None,
+) -> str:
+    payload_value = {"cwd": cwd}
+    if session_key:
+        payload_value["key"] = session_key
+    payload = json.dumps(payload_value, separators=(",", ":")).encode("utf-8")
     encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
     return f"{project_sentinel(proxy_token)}.{encoded}"
 
@@ -1042,7 +1414,8 @@ def decode_project_session_sentinel(value: str, proxy_token: str) -> dict[str, s
     cwd = payload.get("cwd")
     if not isinstance(cwd, str) or not cwd:
         return {}
-    key = normalize_session_key(cwd)
+    raw_key = payload.get("key")
+    key = normalize_session_key(raw_key) if isinstance(raw_key, str) and raw_key else normalize_session_key(cwd)
     return {"key": key, "cwd": cwd} if key else {}
 
 
@@ -1424,12 +1797,30 @@ def websocket_message_turn_id(opcode: int, payload: bytes) -> str | None:
     return response_create_payload_turn_id(value)
 
 
+def websocket_message_thread_id(opcode: int, payload: bytes) -> str | None:
+    value = websocket_message_json(opcode, payload)
+    if value is None:
+        return None
+    return response_create_payload_thread_id(value)
+
+
 def response_create_payload_turn_id(value: Any) -> str | None:
     metadata = response_create_payload_metadata(value)
     if not metadata:
         return None
     turn_id = metadata.get("turn_id")
     return turn_id if isinstance(turn_id, str) and turn_id else None
+
+
+def response_create_payload_thread_id(value: Any) -> str | None:
+    metadata = response_create_payload_metadata(value)
+    if not metadata:
+        return None
+    for key in ("thread_id", "threadId"):
+        thread_id = metadata.get(key)
+        if isinstance(thread_id, str) and thread_id:
+            return thread_id
+    return None
 
 
 def response_create_payload_metadata(value: Any) -> dict[str, Any] | None:
@@ -1474,6 +1865,704 @@ def response_create_payload_session(value: Any) -> dict[str, str] | None:
                 session_key = normalize_session_key(cwd)
                 return {"key": session_key, "cwd": cwd} if session_key else None
     return None
+
+
+def clean_transcript_text(value: str, *, preserve_edges: bool = False) -> str:
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        return ""
+    if not preserve_edges:
+        text = text.strip()
+    return text
+
+
+def clean_control_user_text(value: str) -> str:
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    text = CONTROL_TRANSCRIPT_EDGE_RE.sub("", text)
+    if not text:
+        return ""
+    return text
+
+
+def transcript_identity_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def transcript_text_from_content(value: Any, *, preserve_edges: bool = False) -> str:
+    if isinstance(value, str):
+        return clean_transcript_text(value, preserve_edges=preserve_edges)
+    if isinstance(value, list):
+        pieces = [
+            transcript_text_from_content(item, preserve_edges=preserve_edges)
+            for item in value
+        ]
+        return "\n".join(piece for piece in pieces if piece)
+    if not isinstance(value, dict):
+        return ""
+
+    item_type = str(value.get("type") or "").lower()
+    if item_type in {"input_text", "output_text", "text"} and isinstance(value.get("text"), str):
+        return clean_transcript_text(value["text"], preserve_edges=preserve_edges)
+    if isinstance(value.get("text"), str) and item_type in {"message", "content"}:
+        return clean_transcript_text(value["text"], preserve_edges=preserve_edges)
+    for key in ("content", "parts"):
+        text = transcript_text_from_content(value.get(key), preserve_edges=preserve_edges)
+        if text:
+            return text
+    return ""
+
+
+def transcript_text_from_input(value: Any) -> str:
+    if isinstance(value, str):
+        return clean_transcript_text(value)
+    if isinstance(value, list):
+        pieces = [transcript_text_from_input(item) for item in value]
+        return "\n".join(piece for piece in pieces if piece)
+    if not isinstance(value, dict):
+        return ""
+
+    role = str(value.get("role") or "").lower()
+    if role and role not in {"user", "human"}:
+        return ""
+    text = transcript_text_from_content(value.get("content"))
+    if text:
+        return text
+    if isinstance(value.get("text"), str):
+        return clean_transcript_text(value["text"])
+    return ""
+
+
+def user_text_items_from_input(value: Any) -> list[str]:
+    if isinstance(value, str):
+        text = clean_transcript_text(value)
+        return [text] if text else []
+    if isinstance(value, list):
+        items: list[str] = []
+        for item in value:
+            items.extend(user_text_items_from_input(item))
+        return items
+    if not isinstance(value, dict):
+        return []
+
+    role = str(value.get("role") or "").lower()
+    if role and role not in {"user", "human"}:
+        return []
+    text = transcript_text_from_content(value.get("content"))
+    if text:
+        return [text]
+    if isinstance(value.get("text"), str):
+        text = clean_transcript_text(value["text"])
+        return [text] if text else []
+    return []
+
+
+def user_entries_from_text_items(text_items: list[str]) -> list[dict[str, str]]:
+    raw_entries: list[dict[str, str]] = []
+    for text in text_items:
+        raw_entries.extend(user_transcript_entries(text))
+    last_user_index = -1
+    for index, entry in enumerate(raw_entries):
+        if entry.get("role") == "user":
+            last_user_index = index
+    if last_user_index < 0:
+        return raw_entries
+    entries: list[dict[str, str]] = []
+    for index, entry in enumerate(raw_entries):
+        text = str(entry.get("text") or "")
+        if not text:
+            continue
+        role = "user" if index == last_user_index else "resume"
+        entries.append({"role": role, "text": text})
+    return entries
+
+
+def transcript_entries_from_input(value: Any) -> list[dict[str, str]]:
+    return user_entries_from_text_items(user_text_items_from_input(value))
+
+
+def response_create_payload_user_text(value: Any) -> str:
+    entries = response_create_payload_user_entries(value)
+    if entries:
+        return "\n".join(entry["text"] for entry in entries if entry.get("text"))
+    if isinstance(value, list):
+        pieces = [response_create_payload_user_text(item) for item in value]
+        return "\n".join(piece for piece in pieces if piece)
+    if not response_create_payload_starts_turn(value) or not isinstance(value, dict):
+        return ""
+    payloads = [value]
+    response = value.get("response")
+    if isinstance(response, dict):
+        payloads.append(response)
+    for payload in payloads:
+        text = transcript_text_from_input(payload.get("input"))
+        if text:
+            return text
+    return ""
+
+
+def response_create_payload_user_entries(value: Any) -> list[dict[str, str]]:
+    if isinstance(value, list):
+        entries: list[dict[str, str]] = []
+        for item in value:
+            entries.extend(response_create_payload_user_entries(item))
+        return entries
+    if not response_create_payload_starts_turn(value) or not isinstance(value, dict):
+        return []
+    payloads = [value]
+    response = value.get("response")
+    if isinstance(response, dict):
+        payloads.append(response)
+    for payload in payloads:
+        entries = transcript_entries_from_input(payload.get("input"))
+        if entries:
+            return entries
+    return []
+
+
+def websocket_message_user_text(opcode: int, payload: bytes) -> str:
+    value = websocket_message_json(opcode, payload)
+    return response_create_payload_user_text(value) if value is not None else ""
+
+
+def websocket_message_user_entries(opcode: int, payload: bytes) -> list[dict[str, str]]:
+    value = websocket_message_json(opcode, payload)
+    return response_create_payload_user_entries(value) if value is not None else []
+
+
+def user_transcript_entries(text: str) -> list[dict[str, str]]:
+    matches = list(ENVIRONMENT_CONTEXT_RE.finditer(text))
+    if not matches:
+        cleaned = clean_control_user_text(text)
+        return [{"role": "user", "text": cleaned}] if cleaned else []
+
+    history = ENVIRONMENT_CONTEXT_RE.sub("\n\n", text[: matches[-1].start()])
+    current = ENVIRONMENT_CONTEXT_RE.sub("\n\n", text[matches[-1].end() :])
+    entries = []
+    history = clean_control_user_text(history)
+    current = clean_control_user_text(current)
+    if history:
+        entries.append({"role": "resume", "text": history})
+    if current:
+        entries.append({"role": "user", "text": current})
+    if entries:
+        return entries
+    cleaned = clean_control_user_text(ENVIRONMENT_CONTEXT_RE.sub("\n\n", text))
+    return [{"role": "user", "text": cleaned}] if cleaned else []
+
+
+def split_user_entries_by_prompt_suffix(
+    entries: list[dict[str, str]],
+    prompt: str,
+) -> list[dict[str, str]]:
+    prompt = clean_control_user_text(prompt)
+    if not entries or not prompt:
+        return entries
+    result: list[dict[str, str]] = []
+    for entry in entries:
+        if entry.get("role") != "user":
+            result.append(entry)
+            continue
+        text = clean_control_user_text(str(entry.get("text") or ""))
+        if transcript_identity_text(text) == transcript_identity_text(prompt):
+            result.append({"role": "user", "text": prompt})
+            continue
+        index = text.rfind(prompt)
+        if index < 0 or text[index + len(prompt) :].strip():
+            result.append(entry)
+            continue
+        replay = clean_control_user_text(text[:index])
+        if replay:
+            result.append({"role": "resume", "text": replay})
+        result.append({"role": "user", "text": prompt})
+    return result
+
+
+def output_text_from_response(value: Any, *, preserve_edges: bool = False) -> str:
+    if isinstance(value, list):
+        pieces = [
+            output_text_from_response(item, preserve_edges=preserve_edges)
+            for item in value
+        ]
+        return "\n".join(piece for piece in pieces if piece)
+    if not isinstance(value, dict):
+        return ""
+    item_type = str(value.get("type") or "").lower()
+    role = str(value.get("role") or "").lower()
+    if item_type in {"output_text", "text"} and isinstance(value.get("text"), str):
+        return clean_transcript_text(value["text"], preserve_edges=preserve_edges)
+    if role == "assistant":
+        text = transcript_text_from_content(value.get("content"), preserve_edges=preserve_edges)
+        if text:
+            return text
+    for key in ("output", "content", "message", "response"):
+        text = output_text_from_response(value.get(key), preserve_edges=preserve_edges)
+        if text:
+            return text
+    return ""
+
+
+def websocket_message_assistant_entry(opcode: int, payload: bytes) -> dict[str, Any] | None:
+    value = websocket_message_json(opcode, payload)
+    if not isinstance(value, dict):
+        return None
+    event = json_value_event_type(value) or ""
+    delta = value.get("delta")
+    if isinstance(delta, str) and "output_text" in event:
+        text = clean_transcript_text(delta, preserve_edges=True)
+        return {"role": "assistant_progress", "text": text, "append": True} if text else None
+    if isinstance(delta, dict):
+        text = output_text_from_response(delta, preserve_edges=True)
+        if text:
+            return {"role": "assistant_progress", "text": text, "append": True}
+    if "completed" in event or event.endswith(".done"):
+        text = output_text_from_response(value.get("response") or value)
+        if text:
+            return {"role": "assistant", "text": text, "append": False}
+    return None
+
+
+def websocket_message_assistant_text(opcode: int, payload: bytes) -> tuple[str, bool]:
+    entry = websocket_message_assistant_entry(opcode, payload)
+    if not entry:
+        return "", False
+    return str(entry.get("text") or ""), bool(entry.get("append"))
+
+
+def compact_tool_detail(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        parsed = parse_jsonish_string(value)
+        if parsed is not None:
+            return compact_tool_detail(parsed)
+        return clean_transcript_text(value)
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, dict):
+        for key in ("patch", "input", "content", "arguments", "cmd", "command"):
+            item = value.get(key)
+            if isinstance(item, str) and "*** Begin Patch" in item:
+                return clean_transcript_text(item)
+        simple_lines = []
+        for key, item in value.items():
+            if item is None or isinstance(item, (str, int, float, bool)):
+                simple_lines.append(f"{key}: {'' if item is None else item}")
+            else:
+                simple_lines = []
+                break
+        if simple_lines:
+            return clean_transcript_text("\n".join(simple_lines))
+        try:
+            return clean_transcript_text(json.dumps(value, ensure_ascii=False, indent=2))
+        except (TypeError, ValueError):
+            return clean_transcript_text(str(value))
+    if isinstance(value, list):
+        if all(item is None or isinstance(item, (str, int, float, bool)) for item in value):
+            return clean_transcript_text("\n".join(str(item) for item in value if item is not None))
+        try:
+            return clean_transcript_text(json.dumps(value, ensure_ascii=False, indent=2))
+        except (TypeError, ValueError):
+            return clean_transcript_text(str(value))
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        encoded = str(value)
+    return clean_transcript_text(encoded)
+
+
+def parse_jsonish_string(value: str) -> Any | None:
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{\"":
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+
+def shell_join(value: list[Any]) -> str:
+    parts = [str(item) for item in value if item is not None]
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def first_string_value(value: Any, keys: tuple[str, ...]) -> str:
+    if not isinstance(value, dict):
+        return ""
+    for key in keys:
+        item = value.get(key)
+        if isinstance(item, str) and item.strip():
+            return item.strip()
+        if isinstance(item, (int, float, bool)):
+            return str(item)
+    return ""
+
+
+def nested_command_value(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    command = first_string_value(value, ("command", "cmd", "shell_command", "program"))
+    if "*** Begin Patch" in command:
+        command = ""
+    if command:
+        return command
+    for key in ("command", "cmd", "argv", "args"):
+        item = value.get(key)
+        if isinstance(item, list):
+            command = shell_join(item)
+            if command:
+                return command
+    for key in ("action", "input", "arguments"):
+        nested = value.get(key)
+        if isinstance(nested, str):
+            parsed = parse_jsonish_string(nested)
+            if isinstance(parsed, dict):
+                command = nested_command_value(parsed)
+                if command:
+                    return command
+        if isinstance(nested, dict):
+            command = nested_command_value(nested)
+            if command:
+                return command
+    return ""
+
+
+def tool_call_identifier(value: dict[str, Any]) -> str:
+    return first_string_value(
+        value,
+        ("call_id", "callId", "id", "item_id", "itemId", "tool_call_id", "toolCallId"),
+    )
+
+
+def tool_header_key(value: str) -> tuple[str, str] | None:
+    first_line = value.splitlines()[0].strip() if value.strip() else ""
+    for label in ("Command", "Tool"):
+        prefix = f"{label}: "
+        if first_line.startswith(prefix):
+            name = first_line[len(prefix) :].strip()
+            name = re.sub(r"\s+\([^)]*\)$", "", name).strip()
+            return label.lower(), name
+    return None
+
+
+def tool_transcript_sections(value: str) -> tuple[str, list[tuple[str, str]]]:
+    lines = value.splitlines()
+    header = lines[0].strip() if lines else ""
+    sections: list[tuple[str, str]] = []
+    current_label = ""
+    current_lines: list[str] = []
+
+    def push_section() -> None:
+        nonlocal current_label, current_lines
+        if not current_label:
+            return
+        text = "\n".join(current_lines).rstrip()
+        if text:
+            sections.append((current_label, text))
+        current_label = ""
+        current_lines = []
+
+    for raw_line in lines[1:]:
+        match = re.match(r"^([A-Za-z][A-Za-z0-9 _/-]{1,40}):\s*$", raw_line)
+        if match:
+            push_section()
+            current_label = match.group(1).strip()
+            current_lines = []
+            continue
+        if not current_label:
+            current_label = "Details"
+            current_lines = []
+        current_lines.append(raw_line)
+    push_section()
+    return header, sections
+
+
+def merge_tool_sections(existing: str, update: str) -> str:
+    update_header, update_sections = tool_transcript_sections(update)
+    existing_header, existing_sections = tool_transcript_sections(existing)
+    header = update_header or existing_header
+    section_map: dict[str, str] = {}
+    order: list[str] = []
+    for label, text in existing_sections:
+        if label not in section_map:
+            order.append(label)
+        section_map[label] = text
+    for label, text in update_sections:
+        if label not in section_map:
+            order.append(label)
+        section_map[label] = text
+    pieces = [header] if header else []
+    for label in order:
+        text = section_map.get(label)
+        if text:
+            pieces.append(f"{label}:\n{text}")
+    return "\n".join(pieces).strip()
+
+
+def merge_tool_transcript_text(existing: str, update: str) -> str:
+    existing = existing.rstrip()
+    update = update.strip()
+    if not existing:
+        return update
+    if not update or update == existing or update in existing:
+        return existing
+    if existing in update:
+        return update
+
+    existing_key = tool_header_key(existing)
+    update_key = tool_header_key(update)
+    if existing_key and existing_key == update_key:
+        return merge_tool_sections(existing, update)
+
+    lines = update.splitlines()
+    if existing_key and lines:
+        first = lines[0].strip()
+        if first.startswith("Tool: call_") or first.startswith("Tool: "):
+            remainder = "\n".join(lines[1:]).strip()
+            if remainder:
+                return merge_tool_sections(existing, f"{existing.splitlines()[0]}\n{remainder}")
+    return f"{existing}\n{update}"
+
+
+def is_control_tool_call_name(value: Any) -> bool:
+    return isinstance(value, str) and bool(CONTROL_TOOL_CALL_RE.match(value.strip()))
+
+
+def tool_activity_entry_from_value(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    item_type = value.get("type")
+    if not isinstance(item_type, str):
+        return None
+    normalized = item_type.lower()
+    if not (
+        normalized in WEBSOCKET_TOOL_OUTPUT_TYPES
+        or normalized.endswith("_call")
+        or "tool_call" in normalized
+    ):
+        return None
+
+    call_id = tool_call_identifier(value)
+    name = first_string_value(value, ("name", "tool_name", "server_label")) or call_id or normalized
+    if is_control_tool_call_name(name) or is_control_tool_call_name(call_id):
+        return None
+    status = first_string_value(value, ("status", "state"))
+    exit_code = first_string_value(value, ("exit_code", "exitCode", "returncode"))
+    command = nested_command_value(value)
+    detail_sections: list[tuple[str, str]] = []
+    seen_detail_text: set[tuple[str, str]] = set()
+    if "apply_patch" in name.lower() or normalized == "apply_patch_call":
+        for key in ("cmd", "command"):
+            text = compact_tool_detail(value.get(key))
+            if text and "*** Begin Patch" in text:
+                seen_detail_text.add(("Input", text))
+                detail_sections.append(("Input", text))
+    for key, label in (
+        ("arguments", "Arguments"),
+        ("input", "Input"),
+        ("patch", "Patch"),
+        ("content", "Content"),
+        ("params", "Parameters"),
+        ("output", "Output"),
+        ("stdout", "Stdout"),
+        ("stderr", "Stderr"),
+        ("result", "Result"),
+        ("message", "Message"),
+        ("summary", "Summary"),
+    ):
+        text = compact_tool_detail(value.get(key))
+        detail_key = (label, text)
+        if text and detail_key not in seen_detail_text:
+            seen_detail_text.add(detail_key)
+            detail_sections.append((label, text))
+    if normalized in {"local_shell_call", "shell_call"} or command:
+        header = f"Command: {command or name}"
+    else:
+        header = f"Tool: {name}"
+    details = [header]
+    suffixes = []
+    if status:
+        suffixes.append(f"status {status}")
+    if exit_code:
+        suffixes.append(f"exit {exit_code}")
+    if suffixes:
+        details[0] = f"{details[0]} ({', '.join(suffixes)})"
+
+    for output_label, output_text in detail_sections:
+        details.append(f"{output_label}:\n{output_text}")
+    return {
+        "role": "tool",
+        "text": clean_transcript_text("\n".join(details)),
+        "call_id": call_id,
+        "status": status,
+    }
+
+
+def tool_activity_entries_from_value(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        entries: list[dict[str, Any]] = []
+        for item in value:
+            entries.extend(tool_activity_entries_from_value(item))
+        return entries
+    if not isinstance(value, dict):
+        return []
+
+    entries = []
+    own = tool_activity_entry_from_value(value)
+    if own:
+        entries.append(own)
+    for nested in value.values():
+        entries.extend(tool_activity_entries_from_value(nested))
+
+    deduped = []
+    seen = set()
+    for entry in entries:
+        key = (entry.get("role"), entry.get("text"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+    return deduped
+
+
+def websocket_message_tool_entries(opcode: int, payload: bytes) -> list[dict[str, Any]]:
+    value = websocket_message_json(opcode, payload)
+    if value is None:
+        return []
+    return tool_activity_entries_from_value(value)
+
+
+def app_server_message_method(message: dict[str, Any]) -> str:
+    method = message.get("method")
+    return method if isinstance(method, str) else ""
+
+
+def app_server_message_params(message: dict[str, Any]) -> dict[str, Any]:
+    params = message.get("params")
+    return params if isinstance(params, dict) else {}
+
+
+def app_server_message_turn_id(message: dict[str, Any]) -> str:
+    params = app_server_message_params(message)
+    for key in ("turnId", "turn_id"):
+        value = params.get(key)
+        if isinstance(value, str) and value:
+            return value
+    turn = params.get("turn")
+    if isinstance(turn, dict):
+        turn_id = turn_id_from_app_server_value(turn)
+        return turn_id or ""
+    return ""
+
+
+def app_server_error_text(value: Any) -> str:
+    if isinstance(value, str):
+        return clean_transcript_text(value)
+    if isinstance(value, dict):
+        for key in ("message", "detail", "error", "reason"):
+            text = app_server_error_text(value.get(key))
+            if text:
+                return text
+        return compact_tool_detail(value)
+    return ""
+
+
+def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    item_type = str(item.get("type") or "")
+    call_id = first_string_value(item, ("id", "itemId", "item_id", "call_id", "callId"))
+    status = first_string_value(item, ("status", "state"))
+    if is_control_tool_call_name(call_id) or is_control_tool_call_name(first_string_value(item, ("name", "tool"))):
+        return None
+    if item_type == "commandExecution":
+        command = nested_command_value(item) or first_string_value(item, ("command",))
+        exit_code = first_string_value(item, ("exitCode", "exit_code"))
+        suffixes = []
+        if status:
+            suffixes.append(f"status {status}")
+        if exit_code:
+            suffixes.append(f"exit {exit_code}")
+        header = f"Command: {command or call_id or 'command'}"
+        if suffixes:
+            header = f"{header} ({', '.join(suffixes)})"
+        output = compact_tool_detail(item.get("aggregatedOutput") or item.get("output"))
+        text = header if not output else f"{header}\nOutput:\n{output}"
+        return {"role": "tool", "text": text, "call_id": call_id, "status": status}
+    if item_type == "mcpToolCall":
+        server = first_string_value(item, ("server",))
+        tool = first_string_value(item, ("tool", "name"))
+        name = "/".join(part for part in (server, tool) if part) or call_id or "mcp tool"
+        suffix = f" (status {status})" if status else ""
+        details = [f"Tool: {name}{suffix}"]
+        arguments = compact_tool_detail(item.get("arguments"))
+        result = compact_tool_detail(item.get("result"))
+        error = compact_tool_detail(item.get("error"))
+        if arguments:
+            details.append(f"Arguments:\n{arguments}")
+        if result:
+            details.append(f"Result:\n{result}")
+        if error:
+            details.append(f"Error:\n{error}")
+        return {"role": "tool", "text": "\n".join(details), "call_id": call_id, "status": status}
+    if item_type == "fileChange":
+        changes = item.get("changes")
+        paths = []
+        if isinstance(changes, list):
+            for change in changes:
+                if isinstance(change, dict):
+                    path = first_string_value(change, ("path",))
+                    kind = first_string_value(change, ("kind",))
+                    paths.append(f"{kind}: {path}" if kind and path else path or kind)
+        suffix = f" (status {status})" if status else ""
+        detail = "\n".join(path for path in paths if path)
+        text = f"Tool: file changes{suffix}" if not detail else f"Tool: file changes{suffix}\n{detail}"
+        return {"role": "tool", "text": text, "call_id": call_id, "status": status}
+    if item_type in {"webSearch", "imageView", "collabToolCall"}:
+        label = {
+            "webSearch": "web search",
+            "imageView": "image view",
+            "collabToolCall": "collab tool",
+        }.get(item_type, item_type)
+        suffix = f" (status {status})" if status else ""
+        detail = compact_tool_detail(item)
+        text = f"Tool: {label}{suffix}" if not detail else f"Tool: {label}{suffix}\n{detail}"
+        return {"role": "tool", "text": text, "call_id": call_id, "status": status}
+    return None
+
+
+def app_server_transcript_entries_from_message(message: dict[str, Any]) -> list[dict[str, Any]]:
+    method = app_server_message_method(message)
+    params = app_server_message_params(message)
+    turn_id = app_server_message_turn_id(message)
+    if method == "item/agentMessage/delta":
+        delta = params.get("delta")
+        text = clean_transcript_text(delta, preserve_edges=True) if isinstance(delta, str) else ""
+        return [{"role": "assistant_progress", "text": text, "append": True, "turn_id": turn_id}] if text else []
+    if method == "item/completed":
+        item = params.get("item")
+        if not isinstance(item, dict):
+            return []
+        item_type = str(item.get("type") or "")
+        if item_type == "agentMessage":
+            text = clean_transcript_text(str(item.get("text") or ""))
+            return [{"role": "assistant", "text": text, "append": False, "turn_id": turn_id}] if text else []
+        tool_entry = app_server_tool_entry_from_item(item)
+        if tool_entry:
+            tool_entry["turn_id"] = turn_id
+            return [tool_entry]
+    if method == "item/started":
+        item = params.get("item")
+        if isinstance(item, dict):
+            tool_entry = app_server_tool_entry_from_item(item)
+            if tool_entry:
+                tool_entry["turn_id"] = turn_id
+                return [tool_entry]
+    if method in {"error", "turn/completed"}:
+        error = params.get("error")
+        if not error:
+            turn = params.get("turn")
+            error = turn.get("error") if isinstance(turn, dict) else None
+        text = app_server_error_text(error)
+        return [{"role": "error", "text": text, "append": False, "turn_id": turn_id}] if text else []
+    return []
 
 
 def request_body_session(body: bytes | None) -> dict[str, str] | None:
@@ -1707,6 +2796,26 @@ def normalize_token_usage(value: dict[str, Any]) -> dict[str, int] | None:
         "output_tokens": output_tokens,
         "reasoning_output_tokens": reasoning_output_tokens,
         "total_tokens": total_tokens,
+    }
+
+
+def context_summary_from_usage(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    input_tokens = int_value(value.get("input_tokens", value.get("prompt_tokens")))
+    total_tokens = int_value(value.get("total_tokens"))
+    if input_tokens <= 0 and total_tokens <= 0:
+        return {}
+    used_tokens = input_tokens if input_tokens > 0 else total_tokens
+    remaining_tokens = max(0, CONTROL_CONTEXT_WINDOW_TOKENS - used_tokens)
+    remaining_percent = round((remaining_tokens / CONTROL_CONTEXT_WINDOW_TOKENS) * 100)
+    return {
+        "window_tokens": CONTROL_CONTEXT_WINDOW_TOKENS,
+        "input_tokens": input_tokens,
+        "total_tokens": total_tokens,
+        "remaining_tokens": remaining_tokens,
+        "remaining_percent": remaining_percent,
+        "label": f"~{remaining_percent}% left",
     }
 
 
@@ -2666,7 +3775,19 @@ def quota_payload_reset_credit_count(payload: Any) -> int:
     return 0
 
 
-def render_reset_credit_control(payload: Any, profile: str | None, token: str | None) -> str:
+def render_reset_credit_control(
+    payload: Any,
+    profile: str | None,
+    token: str | None,
+    reset_credit: Any = None,
+) -> str:
+    if isinstance(reset_credit, dict) and reset_credit.get("blocks"):
+        label = str(reset_credit.get("label") or "Reset pending")
+        message = str(reset_credit.get("message") or "Reset-credit use is temporarily disabled.")
+        return (
+            '<span class="quota-reset-credit-pill disabled" '
+            f'title="{html.escape(message)}">{html.escape(label)}</span>'
+        )
     count = quota_payload_reset_credit_count(payload)
     if count <= 0 or not profile or not token:
         return ""
@@ -2721,6 +3842,35 @@ def quota_remaining_delta(
     return delta
 
 
+def utc_timestamp(value: datetime | None = None) -> str:
+    current = value or datetime.now(timezone.utc)
+    return current.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def reset_credit_confirmation_matches(before_payload: Any, current_payload: Any) -> bool:
+    if not isinstance(current_payload, dict):
+        return False
+    if isinstance(before_payload, dict):
+        before_count = quota_payload_reset_credit_count(before_payload)
+        current_count = quota_payload_reset_credit_count(current_payload)
+        if before_count > 0 and current_count < before_count:
+            return True
+    before_snapshot = quota_remaining_snapshot(before_payload)
+    current_snapshot = quota_remaining_snapshot(current_payload)
+    for name, current in current_snapshot.items():
+        previous = before_snapshot.get(name)
+        if not previous:
+            continue
+        for key in ("primary_remaining_percent", "weekly_remaining_percent"):
+            current_value = current.get(key)
+            previous_value = previous.get(key)
+            if not isinstance(current_value, (int, float)) or not isinstance(previous_value, (int, float)):
+                continue
+            if float(current_value) - float(previous_value) >= RESET_CREDIT_CONFIRMATION_DELTA_PERCENT:
+                return True
+    return False
+
+
 def compact_stats_event(event: dict[str, Any]) -> dict[str, Any]:
     event_type = str(event.get("type") or "")
     compact = {
@@ -2743,6 +3893,55 @@ def compact_stats_event(event: dict[str, Any]) -> dict[str, Any]:
     if event_type == "reset_credit":
         compact["outcome"] = event.get("outcome")
     return compact
+
+
+def compact_control_event(event: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(event.get("type") or "")
+    compact = compact_stats_event(event)
+    session_key = event.get("session_key")
+    if isinstance(session_key, str) and session_key:
+        compact["session_key"] = session_key
+    service_tier = event.get("service_tier")
+    if isinstance(service_tier, str) and service_tier:
+        compact["service_tier"] = service_tier
+
+    summary = control_event_summary(event)
+    compact["summary"] = summary
+    compact["search_text"] = " ".join(
+        str(value)
+        for value in (
+            compact.get("profile"),
+            event_type,
+            summary,
+            event.get("path"),
+            event.get("status"),
+            service_tier,
+        )
+        if value is not None
+    )
+    return compact
+
+
+def control_event_summary(event: dict[str, Any]) -> str:
+    event_type = str(event.get("type") or "")
+    if event_type == "token_usage" and isinstance(event.get("usage"), dict):
+        usage = event["usage"]
+        total = int_value(usage.get("total_tokens"))
+        input_tokens = int_value(usage.get("input_tokens"))
+        output_tokens = int_value(usage.get("output_tokens"))
+        suffix = " fast" if event.get("fast") else ""
+        return f"Token usage: {total} total ({input_tokens} in, {output_tokens} out){suffix}"
+    if event_type == "websocket_tunnel":
+        bytes_total = int_value(event.get("bytes_up")) + int_value(event.get("bytes_down"))
+        messages_total = int_value(event.get("messages_up")) + int_value(event.get("messages_down"))
+        return f"Tunnel closed: {bytes_total} bytes, {messages_total} messages"
+    if event_type == "http_request":
+        method = str(event.get("method") or "HTTP")
+        path = str(event.get("path") or "request")
+        status = event.get("status")
+        status_text = f" status {status}" if status else ""
+        return f"{method} {path}{status_text}"
+    return event_type.replace("_", " ") or "event"
 
 
 def usage_payload_reset_datetimes(
@@ -3083,6 +4282,140 @@ def render_quota_bucket(bucket: dict[str, Any]) -> str:
     """
 
 
+def quota_bucket_matches_model(bucket: dict[str, Any], model: str) -> bool:
+    model_text = model.strip().lower()
+    if not model_text:
+        return False
+    feature = str(bucket.get("metered_feature") or "").lower()
+    name = str(bucket.get("name") or "").lower()
+    if feature == "codex":
+        return model_text == "codex"
+    if feature and (feature == model_text or feature in model_text or model_text in feature):
+        return True
+    if "spark" in model_text and ("spark" in feature or "spark" in name):
+        return True
+    return False
+
+
+def quota_bucket_for_model_from_rows(rows: list[dict[str, Any]], model: str) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    for row in rows:
+        if quota_bucket_matches_model(row, model):
+            return row
+    for row in rows:
+        if str(row.get("metered_feature") or "") == "codex":
+            return row
+    return rows[0]
+
+
+def quota_bucket_for_model(payload: Any, model: str) -> dict[str, Any] | None:
+    return quota_bucket_for_model_from_rows(quota_bucket_rows(payload), model)
+
+
+def render_compact_quota_bucket_html(bucket: dict[str, Any], *, secondary: bool = False) -> str:
+    rate_limit = bucket.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        return ""
+    context = quota_stack_context(rate_limit)
+    name = str(bucket.get("name") or "Quota")
+    title = f"{name} quota"
+    if feature := str(bucket.get("metered_feature") or ""):
+        title = f"{title}: {feature}"
+    secondary_class = " secondary" if secondary else ""
+    if context.get("count_html"):
+        return f"""
+          <span class="control-compact-quota count{secondary_class}" title="{html.escape(title)}">
+            <span class="control-compact-quota-name">{html.escape(name)}</span>
+            <span class="control-compact-quota-text">available</span>
+          </span>
+        """
+    primary_style = float(context.get("primary_style") or 0.0)
+    weekly_style = float(context.get("weekly_style") or 0.0)
+    primary_text = str(context.get("primary_text") or "")
+    weekly_text = str(context.get("weekly_text") or "")
+    aria = str(context.get("aria") or title)
+    special = str(context.get("special") or "")
+    special_class = f" {html.escape(special)}" if special else ""
+    return f"""
+      <span class="control-compact-quota{special_class}{secondary_class}" title="{html.escape(title)}">
+        <span class="control-compact-quota-name">{html.escape(name)}</span>
+        <span class="control-compact-quota-primary">{html.escape(primary_text)}</span>
+        <span class="control-compact-quota-bar" role="img" aria-label="{html.escape(aria)}">
+          <span class="control-compact-quota-weekly-fill" style="width: {weekly_style:.2f}%"></span>
+          <span class="control-compact-quota-primary-fill" style="width: {primary_style:.2f}%"></span>
+        </span>
+        <span class="control-compact-quota-weekly">{html.escape(weekly_text)}</span>
+      </span>
+    """
+
+
+def compact_quota_bucket_key(bucket: dict[str, Any]) -> str:
+    feature = str(bucket.get("metered_feature") or "").strip()
+    if feature:
+        return f"feature:{normalize_rate_limit_id(feature)}"
+    name = transcript_identity_text(str(bucket.get("name") or "")).lower()
+    if name == "codex":
+        return "feature:codex"
+    return f"name:{name}"
+
+
+def compact_quota_buckets(payload: Any, model: str | None = None) -> list[dict[str, Any]]:
+    rows = quota_bucket_rows(payload)
+    if not rows:
+        return []
+    selected = quota_bucket_for_model_from_rows(rows, model or "")
+    buckets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def append_bucket(bucket: dict[str, Any] | None) -> None:
+        if not isinstance(bucket, dict):
+            return
+        key = compact_quota_bucket_key(bucket)
+        if key in seen:
+            return
+        seen.add(key)
+        buckets.append(bucket)
+
+    append_bucket(selected)
+    for row in rows:
+        append_bucket(row)
+    return buckets
+
+
+def render_compact_quota_html(entry: dict[str, Any] | None, model: str | None = None) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+        error = entry.get("error")
+        if error and (state := usage_payload_state(error)):
+            return (
+                '<span class="control-compact-quota state" title="'
+                + html.escape(state.get("message") or state.get("title") or "Quota unavailable")
+                + '">'
+                + html.escape(state.get("title") or "Quota unavailable")
+                + "</span>"
+            )
+        return ""
+    buckets = compact_quota_buckets(payload, model)
+    if not buckets:
+        if state := usage_payload_state(payload):
+            return (
+                '<span class="control-compact-quota state" title="'
+                + html.escape(state.get("message") or state.get("title") or "Quota unavailable")
+                + '">'
+                + html.escape(state.get("title") or "Quota unavailable")
+                + "</span>"
+            )
+        return ""
+    rendered = [
+        render_compact_quota_bucket_html(bucket, secondary=index > 0)
+        for index, bucket in enumerate(buckets)
+    ]
+    return "".join(item for item in rendered if item)
+
+
 def render_quota_state(state: dict[str, str]) -> str:
     level = state.get("level") if state.get("level") in {"warning", "error", "info"} else "warning"
     title = state.get("title") or "Quota unavailable"
@@ -3199,7 +4532,12 @@ def render_quota_html(
         updated_label or "",
         profile=profile,
         token=token,
-        reset_credits_html=render_reset_credit_control(payload, profile, token),
+        reset_credits_html=render_reset_credit_control(
+            payload,
+            profile,
+            token,
+            entry.get("reset_credit") if isinstance(entry, dict) else None,
+        ),
         credits_html=render_quota_credits_pill(payload),
         error_html=error_html,
     )
@@ -3322,9 +4660,15 @@ class ProvisionServer(ThreadingHTTPServer):
         self.next_request_id = 0
         self.next_websocket_id = 0
         self.observed_sessions: dict[str, dict[str, Any]] = {}
+        self.control_transcripts: dict[str, list[dict[str, Any]]] = {}
         self.profile_settings: dict[str, dict[str, Any]] = self.load_profile_settings()
         self.profile_settings_lock = threading.Lock()
         self.pinned_sessions: dict[str, str] = self.load_pinned_sessions()
+        self.session_tab_order: dict[str, int] = self.load_session_tab_order()
+        self.next_session_tab_order = (max(self.session_tab_order.values()) + 1) if self.session_tab_order else 0
+        self.reset_credit_state: dict[str, dict[str, Any]] = self.load_reset_credit_state()
+        self.reset_credit_state_lock = threading.Lock()
+        self.reset_credit_verify_threads: dict[str, threading.Thread] = {}
         self.usage_cache: dict[str, dict[str, Any]] = {}
         self.usage_cache_lock = threading.Lock()
         self.usage_refresh_lock = threading.Lock()
@@ -3337,6 +4681,10 @@ class ProvisionServer(ThreadingHTTPServer):
         self.app_server_rate_limit_cache: dict[str, dict[str, Any]] = {}
         self.app_server_rate_limit_lock = threading.Lock()
         self.stats_lock = threading.Lock()
+        self.ui_launchers: dict[int, dict[str, Any]] = {}
+        self.ui_launchers_lock = threading.Lock()
+        self.resume_candidates_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
+        self.resume_candidates_lock = threading.Lock()
 
     def log_message(self, format: str, *args: Any) -> None:
         message = format % args
@@ -3348,6 +4696,249 @@ class ProvisionServer(ThreadingHTTPServer):
                 message,
             )
         )
+
+    def ui_launcher_permission_args(self, permission: str) -> list[str]:
+        key = permission if permission in UI_LAUNCHER_PERMISSION_PRESETS else "workspace-write"
+        return list(UI_LAUNCHER_PERMISSION_PRESETS[key])
+
+    def build_ui_launcher_args(
+        self,
+        *,
+        cwd: str,
+        mode: str,
+        permission: str,
+        session_id: str = "",
+        prompt: str = "",
+    ) -> list[str]:
+        args = [str(launcher_path())]
+        permission_args = self.ui_launcher_permission_args(permission)
+        if mode == "resume-last":
+            args.append("resume")
+            args.extend(["--cd", cwd])
+            args.extend(permission_args)
+            args.append("--last")
+        elif mode == "resume-session":
+            if not session_id:
+                raise StoreError("resume-session requires a session id")
+            args.append("resume")
+            args.extend(["--cd", cwd])
+            args.extend(permission_args)
+            args.append(session_id)
+        elif mode == "fork-session":
+            if not session_id:
+                raise StoreError("fork-session requires a session id")
+            args.append("fork")
+            args.extend(["--cd", cwd])
+            args.extend(permission_args)
+            args.append(session_id)
+        else:
+            args.extend(["--cd", cwd])
+            args.extend(permission_args)
+        if prompt.strip():
+            args.append(prompt.strip())
+        return args
+
+    def drain_ui_launcher_pty(self, pid: int, master_fd: int, session_key: str) -> None:
+        captured = bytearray()
+        try:
+            while True:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                if len(captured) < CONTROL_TRANSCRIPT_EVENT_TEXT_LIMIT:
+                    captured.extend(chunk[: CONTROL_TRANSCRIPT_EVENT_TEXT_LIMIT - len(captured)])
+        finally:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            try:
+                _, status = os.waitpid(pid, 0)
+                exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status)
+            except OSError:
+                exit_code = 1
+            with self.ui_launchers_lock:
+                self.ui_launchers.pop(pid, None)
+            with self.active_lock:
+                record = self.observed_sessions.get(session_key)
+                if isinstance(record, dict):
+                    record["ui_launcher_exit_code"] = exit_code
+                    record["ui_launcher_exited_at"] = datetime.now().astimezone()
+                    record["last_seen_monotonic"] = time.monotonic()
+                    record["last_seen_at"] = datetime.now().astimezone()
+            self.log_message("UI-launched provision session %s exited with status %s", session_key, exit_code)
+
+    def launch_ui_session(
+        self,
+        *,
+        session_key: str,
+        mode: str,
+        permission: str,
+        profile: str | None = None,
+        session_id: str = "",
+        prompt: str = "",
+    ) -> dict[str, Any]:
+        key = normalize_session_key(session_key)
+        if not key:
+            raise StoreError("unknown session")
+        with self.active_lock:
+            record = self.observed_sessions.get(key)
+            if not isinstance(record, dict):
+                raise StoreError("unknown session")
+            cwd = str(record.get("cwd") or key)
+        cwd_path = Path(cwd).expanduser()
+        if not cwd_path.is_dir():
+            raise StoreError(f"working directory is not available: {cwd}")
+        resolved_cwd = str(cwd_path.resolve(strict=False))
+        launch_profile = profile if profile and self.store.profile_exists(profile) else self.control_profile_for_session(key)
+        launch_key = f"{normalize_session_key(resolved_cwd)}::ui::{uuid.uuid4().hex[:10]}"
+        with self.active_lock:
+            self.observe_session_locked(launch_key, resolved_cwd, launch_profile)
+            record = self.observed_sessions.get(launch_key)
+            if isinstance(record, dict):
+                record["parent_session_key"] = key
+                record["ui_launched"] = True
+                record["title"] = f"{session_display_name(resolved_cwd)} (UI launcher)"
+            if launch_profile:
+                self.pinned_sessions[launch_key] = launch_profile
+                if record is not None:
+                    record["pinned_profile"] = launch_profile
+                self.save_pinned_sessions_locked()
+        if launch_profile:
+            launch_profile = launch_profile
+        args = self.build_ui_launcher_args(
+            cwd=resolved_cwd,
+            mode=mode,
+            permission=permission,
+            session_id=session_id,
+            prompt=prompt,
+        )
+        child_pid, master_fd = pty.fork()
+        if child_pid == 0:
+            try:
+                os.chdir(resolved_cwd)
+                env = os.environ.copy()
+                env.setdefault("TERM", "xterm-256color")
+                env.pop("PROVISION_DISABLE_PTY", None)
+                env["PROVISION_SESSION_KEY"] = launch_key
+                os.execvpe(args[0], args, env)
+            except BaseException:
+                os._exit(127)
+        with self.ui_launchers_lock:
+            self.ui_launchers[child_pid] = {
+                "pid": child_pid,
+                "session_key": launch_key,
+                "parent_session_key": key,
+                "cwd": resolved_cwd,
+                "profile": launch_profile,
+                "mode": mode,
+                "permission": permission,
+                "started_at": datetime.now().astimezone(),
+            }
+        with self.active_lock:
+            record = self.observed_sessions.get(launch_key)
+            if isinstance(record, dict):
+                record["ui_launcher_pid"] = child_pid
+                record["ui_launcher_mode"] = mode
+                record["ui_launcher_permission"] = permission
+                record["last_profile"] = launch_profile
+                record["last_seen_monotonic"] = time.monotonic()
+                record["last_seen_at"] = datetime.now().astimezone()
+        thread = threading.Thread(
+            target=self.drain_ui_launcher_pty,
+            args=(child_pid, master_fd, launch_key),
+            name=f"provision-ui-launcher-{child_pid}",
+            daemon=True,
+        )
+        thread.start()
+        self.log_message(
+            "UI launched provision session %s profile=%s mode=%s permission=%s",
+            key,
+            launch_profile,
+            mode,
+            permission,
+        )
+        return {
+            "ok": True,
+            "pid": child_pid,
+            "session_key": launch_key,
+            "parent_session_key": key,
+            "cwd": resolved_cwd,
+            "profile": launch_profile,
+            "mode": mode,
+            "permission": permission,
+        }
+
+    def forget_session(self, session_key: str, *, force_live: bool = False) -> None:
+        key = normalize_session_key(session_key)
+        if not key:
+            raise StoreError("unknown session")
+        launcher_pids: list[int] = []
+        sockets: list[socket.socket] = []
+        control_paths_to_unlink: list[Path] = []
+        with self.ui_launchers_lock:
+            live_ui_launcher_pids = set(self.ui_launchers)
+        with self.active_lock:
+            self.expire_websocket_work_locked()
+            record = self.observed_sessions.get(key)
+            if not isinstance(record, dict):
+                raise StoreError("unknown session")
+            has_request = any(request.get("session_key") == key for request in self.active_requests.values())
+            has_tunnel = any(tunnel.get("session_key") == key for tunnel in self.active_websockets.values())
+            control_path = str(record.get("control_path") or "")
+            control_live = bool(control_path and Path(control_path).exists())
+            ui_pid = record.get("ui_launcher_pid")
+            ui_live = isinstance(ui_pid, int) and ui_pid in live_ui_launcher_pids
+            live = has_request or has_tunnel or control_live or ui_live
+            if live and not force_live:
+                raise StoreError("session still appears active; close it before forgetting")
+            if live:
+                if control_live:
+                    control_candidate = Path(control_path)
+                    try:
+                        control_candidate.resolve(strict=False).relative_to(
+                            self.paths.launchers.resolve(strict=False)
+                        )
+                        control_paths_to_unlink.append(control_candidate)
+                    except (OSError, ValueError):
+                        pass
+                launcher_pid = record.get("launcher_pid")
+                for pid in (ui_pid, launcher_pid):
+                    if isinstance(pid, int) and pid > 0 and pid not in launcher_pids:
+                        launcher_pids.append(pid)
+                for tunnel in self.active_websockets.values():
+                    if tunnel.get("session_key") != key:
+                        continue
+                    for socket_key in ("downstream", "upstream"):
+                        value = tunnel.get(socket_key)
+                        if isinstance(value, socket.socket):
+                            sockets.append(value)
+            self.observed_sessions.pop(key, None)
+            self.control_transcripts.pop(key, None)
+            changed_pin = self.pinned_sessions.pop(key, None) is not None
+            changed_tab_order = self.session_tab_order.pop(key, None) is not None
+            if changed_pin:
+                self.save_pinned_sessions_locked()
+            if changed_tab_order:
+                self.save_session_tab_order_locked()
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        for pid in launcher_pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        for path in control_paths_to_unlink:
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
     def load_profile_settings(self) -> dict[str, dict[str, Any]]:
         try:
@@ -3388,6 +4979,20 @@ class ProvisionServer(ThreadingHTTPServer):
                         profile_settings["billing_error_at"] = raw_settings["billing_error_at"]
                 settings[raw_profile] = profile_settings
         return settings
+
+    def resume_candidates_for_cwd(self, cwd: str) -> list[dict[str, str]]:
+        key = normalized_path_text(cwd)
+        if not key:
+            return []
+        now = time.monotonic()
+        with self.resume_candidates_lock:
+            cached = self.resume_candidates_cache.get(key)
+            if cached and now - cached[0] < RESUME_CANDIDATE_CACHE_SECONDS:
+                return [dict(item) for item in cached[1]]
+        candidates = codex_resume_candidates_for_cwd(cwd, limit=RESUME_CANDIDATE_LIMIT)
+        with self.resume_candidates_lock:
+            self.resume_candidates_cache[key] = (now, [dict(item) for item in candidates])
+        return candidates
 
     def save_profile_settings_locked(self) -> None:
         try:
@@ -3609,6 +5214,319 @@ class ProvisionServer(ThreadingHTTPServer):
         self.set_profile_fast_mode(profile, enabled)
         return enabled
 
+    def load_reset_credit_state(self) -> dict[str, dict[str, Any]]:
+        try:
+            with self.paths.reset_credit_state.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        states: dict[str, dict[str, Any]] = {}
+        for raw_profile, raw_state in payload.items():
+            if (
+                isinstance(raw_profile, str)
+                and isinstance(raw_state, dict)
+                and self.store.profile_exists(raw_profile)
+            ):
+                states[raw_profile] = dict(raw_state)
+        return states
+
+    def save_reset_credit_state_locked(self) -> None:
+        try:
+            self.paths.reset_credit_state.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.paths.reset_credit_state.with_suffix(
+                self.paths.reset_credit_state.suffix + ".tmp"
+            )
+            encoded = json.dumps(self.reset_credit_state, indent=2, sort_keys=True) + "\n"
+            with temp.open("w", encoding="utf-8") as handle:
+                handle.write(encoded)
+            temp.chmod(0o600)
+            temp.replace(self.paths.reset_credit_state)
+            self.paths.reset_credit_state.chmod(0o600)
+        except OSError as exc:
+            raise StoreError(f"failed to save reset-credit state: {exc}") from exc
+
+    def reset_credit_public_state_from_state(
+        self,
+        state: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        current = now.astimezone() if now else datetime.now().astimezone()
+        status = str(state.get("status") or "")
+        requested_at = parse_reset_datetime(state.get("requested_at"))
+        verified_at = parse_reset_datetime(state.get("verified_at"))
+        cooldown_until = parse_reset_datetime(state.get("cooldown_until"))
+        guard_until = parse_reset_datetime(state.get("guard_until"))
+        blocks = False
+        label = ""
+        title = ""
+
+        if status in {"pending", "verifying"}:
+            blocks = True
+            label = "Reset verifying"
+            title = (
+                "Reset credit was accepted. Provision is waiting for the normal usage "
+                "endpoint to confirm the refreshed quota before allowing another reset."
+            )
+        elif status == "unconfirmed":
+            blocks = bool(cooldown_until and cooldown_until > current)
+            label = "Reset unconfirmed"
+            title = (
+                "Reset credit was accepted, but the normal usage endpoint has not confirmed "
+                "the quota recovery yet. Another reset is blocked to protect remaining credits."
+            )
+        elif status == "verified":
+            blocks = bool(cooldown_until and cooldown_until > current)
+            label = "Reset used"
+            title = "Reset credit verified. Further reset-credit use is cooling down."
+        elif status:
+            blocks = bool(guard_until and guard_until > current)
+            label = "Reset guarded" if blocks else "Reset available"
+            title = str(state.get("error") or state.get("outcome") or "Previous reset-credit attempt did not complete.")
+
+        if cooldown_until and cooldown_until > current:
+            title = f"{title} Disabled until {format_status_updated_at(cooldown_until)}.".strip()
+        elif guard_until and guard_until > current:
+            title = f"{title} Retry after {format_status_updated_at(guard_until)}.".strip()
+        if requested_at:
+            title = f"{title} Requested {format_status_updated_at(requested_at)}.".strip()
+        if verified_at:
+            title = f"{title} Verified {format_status_updated_at(verified_at)}.".strip()
+
+        return {
+            "status": status,
+            "label": label,
+            "message": title,
+            "blocks": blocks,
+            "requested_at": utc_timestamp(requested_at) if requested_at else "",
+            "verified_at": utc_timestamp(verified_at) if verified_at else "",
+            "cooldown_until": utc_timestamp(cooldown_until) if cooldown_until else "",
+            "guard_until": utc_timestamp(guard_until) if guard_until else "",
+        }
+
+    def normalize_reset_credit_state_locked(
+        self,
+        profile: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        current = now.astimezone() if now else datetime.now().astimezone()
+        state = self.reset_credit_state.get(profile)
+        if not isinstance(state, dict):
+            return {}
+        changed = False
+        status = str(state.get("status") or "")
+        requested_at = parse_reset_datetime(state.get("requested_at"))
+        cooldown_until = parse_reset_datetime(state.get("cooldown_until"))
+        guard_until = parse_reset_datetime(state.get("guard_until"))
+        if status in {"pending", "verifying"} and requested_at:
+            if requested_at + timedelta(seconds=RESET_CREDIT_VERIFY_TIMEOUT_SECONDS) < current:
+                state["status"] = "unconfirmed"
+                state["last_error"] = "usage endpoint did not confirm the reset before the verification timeout"
+                changed = True
+        status = str(state.get("status") or "")
+        if status in {"verified", "unconfirmed"} and cooldown_until and cooldown_until <= current:
+            self.reset_credit_state.pop(profile, None)
+            self.reset_credit_verify_threads.pop(profile, None)
+            self.save_reset_credit_state_locked()
+            return {}
+        if status not in {"pending", "verifying", "verified", "unconfirmed"}:
+            if guard_until and guard_until <= current:
+                self.reset_credit_state.pop(profile, None)
+                self.reset_credit_verify_threads.pop(profile, None)
+                self.save_reset_credit_state_locked()
+                return {}
+        if changed:
+            self.save_reset_credit_state_locked()
+        return dict(state)
+
+    def reset_credit_status(self, profile: str) -> dict[str, Any]:
+        lock = getattr(self, "reset_credit_state_lock", None)
+        if lock is None:
+            return {}
+        with lock:
+            state = self.normalize_reset_credit_state_locked(profile)
+            if not state:
+                return {}
+            return self.reset_credit_public_state_from_state(state)
+
+    def reset_credit_awaiting_usage_confirmation(self, profile: str) -> bool:
+        lock = getattr(self, "reset_credit_state_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            state = self.normalize_reset_credit_state_locked(profile)
+            return str(state.get("status") or "") in {"pending", "verifying", "unconfirmed"}
+
+    def begin_reset_credit_attempt(self, profile: str, idempotency_key: str) -> None:
+        if not self.store.profile_exists(profile):
+            raise StoreError(f"unknown profile: {profile}")
+        snapshot = self.usage_cache_snapshot(profile) or {}
+        before_payload = snapshot.get("payload")
+        now = datetime.now(timezone.utc)
+        with self.reset_credit_state_lock:
+            existing = self.normalize_reset_credit_state_locked(profile, now=now)
+            public = self.reset_credit_public_state_from_state(existing, now=now) if existing else {}
+            if public.get("blocks"):
+                raise ResetCreditGuardError(
+                    str(public.get("message") or "Reset credit is already pending for this profile.")
+                )
+            state: dict[str, Any] = {
+                "status": "pending",
+                "idempotency_key": idempotency_key,
+                "requested_at": utc_timestamp(now),
+                "cooldown_until": utc_timestamp(now + timedelta(seconds=RESET_CREDIT_COOLDOWN_SECONDS)),
+            }
+            if isinstance(before_payload, dict):
+                state["before_payload"] = before_payload
+            self.reset_credit_state[profile] = state
+            self.save_reset_credit_state_locked()
+
+    def mark_reset_credit_attempt_error(
+        self,
+        profile: str,
+        idempotency_key: str,
+        error: BaseException | str,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        with self.reset_credit_state_lock:
+            state = self.reset_credit_state.setdefault(profile, {})
+            state["status"] = "consume_error"
+            state["idempotency_key"] = idempotency_key
+            state.setdefault("requested_at", utc_timestamp(now))
+            state["error"] = str(error)[:500]
+            state["guard_until"] = utc_timestamp(now + timedelta(seconds=RESET_CREDIT_ERROR_GUARD_SECONDS))
+            self.save_reset_credit_state_locked()
+
+    def mark_reset_credit_outcome(
+        self,
+        profile: str,
+        *,
+        idempotency_key: str,
+        outcome: str,
+        payload: dict[str, Any] | None,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        with self.reset_credit_state_lock:
+            state = self.reset_credit_state.setdefault(profile, {})
+            state["idempotency_key"] = idempotency_key
+            state["outcome"] = outcome
+            state["last_checked_at"] = utc_timestamp(now)
+            if outcome == "reset":
+                state["status"] = "verifying"
+                state.setdefault("requested_at", utc_timestamp(now))
+                state.setdefault(
+                    "cooldown_until",
+                    utc_timestamp(now + timedelta(seconds=RESET_CREDIT_COOLDOWN_SECONDS)),
+                )
+                if isinstance(payload, dict):
+                    state["app_server_payload"] = payload
+            else:
+                state["status"] = outcome or "unknown"
+                state["guard_until"] = utc_timestamp(now + timedelta(seconds=RESET_CREDIT_ERROR_GUARD_SECONDS))
+            self.save_reset_credit_state_locked()
+        if outcome == "reset":
+            self.schedule_reset_credit_verification(
+                profile,
+                initial_delay=RESET_CREDIT_VERIFY_INITIAL_DELAY_SECONDS,
+            )
+
+    def reconcile_reset_credit_verification(
+        self,
+        profile: str,
+        payload: dict[str, Any],
+        *,
+        source: str,
+    ) -> bool:
+        if source != "usage_fetch":
+            return False
+        lock = getattr(self, "reset_credit_state_lock", None)
+        if lock is None:
+            return False
+        now = datetime.now(timezone.utc)
+        verified = False
+        with lock:
+            state = self.normalize_reset_credit_state_locked(profile, now=now)
+            if str(state.get("status") or "") not in {"pending", "verifying", "unconfirmed"}:
+                return False
+            state["last_checked_at"] = utc_timestamp(now)
+            before_payload = state.get("before_payload")
+            if reset_credit_confirmation_matches(before_payload, payload):
+                state["status"] = "verified"
+                state["verified_at"] = utc_timestamp(now)
+                state["cooldown_until"] = utc_timestamp(
+                    now + timedelta(seconds=RESET_CREDIT_COOLDOWN_SECONDS)
+                )
+                verified = True
+            self.reset_credit_state[profile] = state
+            self.save_reset_credit_state_locked()
+        if verified:
+            event = {
+                "type": "reset_credit",
+                "profile": profile,
+                "outcome": "verified",
+                "idempotency_key": str(state.get("idempotency_key") or ""),
+            }
+            self.append_reset_credit_event(event)
+            self.append_stats_event(event)
+        return verified
+
+    def reset_credit_profiles_needing_verification(self) -> list[str]:
+        with self.reset_credit_state_lock:
+            return [
+                profile
+                for profile in list(self.reset_credit_state)
+                if str(self.normalize_reset_credit_state_locked(profile).get("status") or "")
+                in {"pending", "verifying", "unconfirmed"}
+            ]
+
+    def schedule_reset_credit_verification(
+        self,
+        profile: str,
+        *,
+        initial_delay: float = 0.0,
+    ) -> None:
+        with self.reset_credit_state_lock:
+            state = self.normalize_reset_credit_state_locked(profile)
+            if str(state.get("status") or "") not in {"pending", "verifying", "unconfirmed"}:
+                return
+            current = self.reset_credit_verify_threads.get(profile)
+            if current and current.is_alive():
+                return
+            thread = threading.Thread(
+                target=self.reset_credit_verification_loop,
+                args=(profile, max(0.0, float(initial_delay))),
+                daemon=True,
+            )
+            self.reset_credit_verify_threads[profile] = thread
+            thread.start()
+
+    def reset_credit_verification_loop(self, profile: str, initial_delay: float) -> None:
+        if initial_delay > 0:
+            self.usage_auto_refresh_stop.wait(initial_delay)
+        started = time.monotonic()
+        while not self.usage_auto_refresh_stop.is_set():
+            if not self.reset_credit_awaiting_usage_confirmation(profile):
+                return
+            try:
+                self.usage_payload_for_profile(profile, force=True)
+            except Exception as exc:
+                self.log_message("reset-credit verification refresh for profile %s failed: %s", profile, exc)
+            if not self.reset_credit_awaiting_usage_confirmation(profile):
+                return
+            if time.monotonic() - started >= RESET_CREDIT_VERIFY_TIMEOUT_SECONDS:
+                with self.reset_credit_state_lock:
+                    state = self.normalize_reset_credit_state_locked(profile)
+                    if str(state.get("status") or "") in {"pending", "verifying"}:
+                        state["status"] = "unconfirmed"
+                        state["last_error"] = "usage endpoint did not confirm the reset before the verification timeout"
+                        self.reset_credit_state[profile] = state
+                        self.save_reset_credit_state_locked()
+                return
+            self.usage_auto_refresh_stop.wait(RESET_CREDIT_VERIFY_INTERVAL_SECONDS)
+
     def load_pinned_sessions(self) -> dict[str, str]:
         try:
             with self.paths.session_pins.open("r", encoding="utf-8") as handle:
@@ -3639,16 +5557,146 @@ class ProvisionServer(ThreadingHTTPServer):
         except OSError as exc:
             raise StoreError(f"failed to save session pins: {exc}") from exc
 
-    def observe_session(self, cwd: str, profile: str | None = None) -> str:
+    def load_session_tab_order(self) -> dict[str, int]:
+        try:
+            with self.paths.session_tabs.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        result: dict[str, int] = {}
+        for key, value in payload.items():
+            normalized = normalize_session_key(str(key))
+            if not normalized or isinstance(value, bool):
+                continue
+            try:
+                result[normalized] = max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def ensure_session_tab_order_state(self) -> None:
+        if not hasattr(self, "session_tab_order"):
+            self.session_tab_order = {}
+        if not hasattr(self, "next_session_tab_order"):
+            self.next_session_tab_order = (
+                max(self.session_tab_order.values()) + 1 if self.session_tab_order else 0
+            )
+
+    def save_session_tab_order_locked(self) -> None:
+        self.ensure_session_tab_order_state()
+        if not hasattr(self, "paths"):
+            return
+        known = {
+            key: int(order)
+            for key, order in self.session_tab_order.items()
+            if key in self.observed_sessions
+        }
+        self.session_tab_order = known
+        if known:
+            self.next_session_tab_order = max(known.values()) + 1
+        try:
+            self.paths.session_tabs.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.paths.session_tabs.with_suffix(self.paths.session_tabs.suffix + ".tmp")
+            encoded = json.dumps(dict(sorted(known.items(), key=lambda item: item[1])), indent=2) + "\n"
+            with temp.open("w", encoding="utf-8") as handle:
+                handle.write(encoded)
+            temp.chmod(0o600)
+            temp.replace(self.paths.session_tabs)
+            self.paths.session_tabs.chmod(0o600)
+        except OSError as exc:
+            raise StoreError(f"failed to save session tab order: {exc}") from exc
+
+    def session_tab_order_for_key_locked(self, key: str) -> int:
+        self.ensure_session_tab_order_state()
+        existing = self.session_tab_order.get(key)
+        if existing is not None:
+            return int(existing)
+        order = self.next_session_tab_order
+        self.next_session_tab_order += 1
+        self.session_tab_order[key] = order
+        return order
+
+    def reorder_sessions(self, session_keys: list[str]) -> None:
+        self.ensure_session_tab_order_state()
+        normalized_keys: list[str] = []
+        seen: set[str] = set()
+        for key in session_keys:
+            normalized = normalize_session_key(str(key))
+            if not normalized or normalized in seen:
+                continue
+            normalized_keys.append(normalized)
+            seen.add(normalized)
+        with self.active_lock:
+            if not normalized_keys:
+                raise StoreError("no session order supplied")
+            observed_keys = set(self.observed_sessions)
+            if not any(key in observed_keys for key in normalized_keys):
+                raise StoreError("no known sessions supplied")
+            ordered = 0
+            for key in normalized_keys:
+                if key not in observed_keys:
+                    continue
+                self.session_tab_order[key] = ordered
+                record = self.observed_sessions.get(key)
+                if isinstance(record, dict):
+                    record["tab_order"] = ordered
+                ordered += 1
+            remaining = sorted(
+                (key for key in observed_keys if key not in self.session_tab_order or key not in normalized_keys),
+                key=lambda key: (
+                    int(self.session_tab_order.get(key, self.observed_sessions[key].get("tab_order", 0))),
+                    float(self.observed_sessions[key].get("first_seen_monotonic") or 0.0),
+                    key,
+                ),
+            )
+            for key in remaining:
+                self.session_tab_order[key] = ordered
+                self.observed_sessions[key]["tab_order"] = ordered
+                ordered += 1
+            self.next_session_tab_order = ordered
+            self.save_session_tab_order_locked()
+
+    def observe_session(
+        self,
+        cwd: str,
+        profile: str | None = None,
+        *,
+        control_path: str | None = None,
+        launcher_pid: int | None = None,
+        pty_managed: bool = False,
+        clear_control_path: bool = False,
+    ) -> str:
         key = normalize_session_key(cwd)
         if not key:
             return ""
         with self.active_lock:
-            self.observe_session_locked(key, cwd, profile)
+            self.observe_session_locked(
+                key,
+                cwd,
+                profile,
+                control_path=control_path,
+                launcher_pid=launcher_pid,
+                pty_managed=pty_managed,
+                clear_control_path=clear_control_path,
+            )
         return key
 
-    def observe_session_locked(self, key: str, cwd: str, profile: str | None = None) -> None:
+    def observe_session_locked(
+        self,
+        key: str,
+        cwd: str,
+        profile: str | None = None,
+        *,
+        control_path: str | None = None,
+        launcher_pid: int | None = None,
+        pty_managed: bool = False,
+        clear_control_path: bool = False,
+    ) -> None:
         now = time.monotonic()
+        self.ensure_session_tab_order_state()
+        new_tab_order = key not in self.session_tab_order
         record = self.observed_sessions.setdefault(
             key,
             {
@@ -3657,8 +5705,10 @@ class ProvisionServer(ThreadingHTTPServer):
                 "display": compact_session_path(cwd),
                 "name": session_display_name(cwd),
                 "first_seen_monotonic": now,
+                "tab_order": self.session_tab_order_for_key_locked(key),
             },
         )
+        record["tab_order"] = self.session_tab_order_for_key_locked(key)
         record["cwd"] = cwd
         record["display"] = compact_session_path(cwd)
         record["name"] = session_display_name(cwd)
@@ -3666,6 +5716,18 @@ class ProvisionServer(ThreadingHTTPServer):
         record["last_seen_at"] = datetime.now().astimezone()
         if profile:
             record["last_profile"] = profile
+        if control_path:
+            record["control_path"] = control_path
+            record["pty_managed"] = bool(pty_managed)
+        elif clear_control_path:
+            record.pop("control_path", None)
+            record["pty_managed"] = False
+        if launcher_pid is not None:
+            record["launcher_pid"] = launcher_pid
+        elif clear_control_path:
+            record.pop("launcher_pid", None)
+        if new_tab_order:
+            self.save_session_tab_order_locked()
 
     def session_pinned_locked(self, session_key: str | None) -> bool:
         return bool(session_key and session_key in self.pinned_sessions)
@@ -3775,6 +5837,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 "upstream": None,
                 "pending_work": 0,
                 "turn_id": None,
+                "thread_id": None,
                 "saw_tool_output": False,
                 "completion_deadline_monotonic": None,
                 "started_monotonic": now,
@@ -3806,6 +5869,22 @@ class ProvisionServer(ThreadingHTTPServer):
             tunnel = self.active_websockets.get(tunnel_id)
             if tunnel is not None:
                 tunnel["upstream"] = upstream
+
+    def remember_websocket_thread(self, tunnel_id: int, thread_id: str | None) -> None:
+        if not thread_id:
+            return
+        with self.active_lock:
+            tunnel = self.active_websockets.get(tunnel_id)
+            if tunnel is None:
+                return
+            tunnel["thread_id"] = thread_id
+            session_key = tunnel.get("session_key")
+            if isinstance(session_key, str) and session_key:
+                record = self.observed_sessions.get(session_key)
+                if isinstance(record, dict):
+                    record["thread_id"] = thread_id
+                    record["last_seen_monotonic"] = time.monotonic()
+                    record["last_seen_at"] = datetime.now().astimezone()
 
     def touch_websocket_data(self, tunnel_id: int) -> None:
         with self.active_lock:
@@ -3843,12 +5922,489 @@ class ProvisionServer(ThreadingHTTPServer):
             session_key = self.active_websockets.get(tunnel_id, {}).get("session_key")
         return session_key if isinstance(session_key, str) else None
 
-    def begin_websocket_work(self, tunnel_id: int, turn_id: str | None = None) -> None:
+    @staticmethod
+    def transcript_line_has_open_markdown_span(line: str) -> bool:
+        stripped = line.strip()
+        if not stripped:
+            return False
+        if re.match(r"^(?:[-*+]|\d+\.)\s*(?:\[[ xX]?\])?\s*(?:\*\*|__|`)?$", stripped):
+            return True
+        if stripped.endswith(("**", "__", "*", "_", "`")):
+            return True
+        if stripped.count("**") % 2:
+            return True
+        if stripped.count("__") % 2:
+            return True
+        if stripped.count("`") % 2:
+            return True
+        return False
+
+    @classmethod
+    def transcript_stream_separator(cls, existing: str, text: str) -> str:
+        if not existing or not text:
+            return ""
+        existing_line = existing.rsplit("\n", 1)[-1]
+        if existing.endswith(("\n", "\r")):
+            return ""
+        if (
+            re.match(r"\s*(?:[-*+]\s+|\d+\.\s+|#{1,6}\s+|>\s?|```)", text)
+            and not cls.transcript_line_has_open_markdown_span(existing_line)
+        ):
+            return "\n"
+        if existing[-1].isspace() or text[0].isspace():
+            return ""
+        if cls.transcript_line_has_open_markdown_span(existing_line):
+            return ""
+        if re.match(r"\s*(?:[-*+]|\d+\.)\s+", existing_line) and (
+            text[0].isupper() or text[0] in "\"'`("
+        ):
+            return "\n\n"
+        if existing[-1] in ".!?" and (text[0].isupper() or text[0] in "\"'`("):
+            return "\n"
+        if existing[-1].islower() and text[0].isdigit():
+            return " "
+        return ""
+
+    @staticmethod
+    def transcript_display_text(text: str) -> str:
+        if len(text) <= CONTROL_TRANSCRIPT_TEXT_LIMIT:
+            return text
+        return text[:CONTROL_TRANSCRIPT_TEXT_LIMIT].rstrip() + "\n...[truncated]"
+
+    @classmethod
+    def set_transcript_item_text(cls, item: dict[str, Any], role: str, full_text: str) -> None:
+        if role in {"user", "user_pending", "resume", "context_compaction"}:
+            full_text = clean_control_user_text(full_text)
+        display = cls.transcript_display_text(full_text)
+        item["text"] = display
+        if display != full_text:
+            item["full_text"] = full_text
+            item["truncated"] = True
+        else:
+            item.pop("full_text", None)
+            item.pop("truncated", None)
+        item["search_text"] = f"{role} {full_text}"
+
+    @staticmethod
+    def transcript_item_full_text(item: dict[str, Any]) -> str:
+        return str(item.get("full_text") or item.get("text") or "")
+
+    @classmethod
+    def transcript_item_matches(
+        cls,
+        item: dict[str, Any],
+        *,
+        role: str,
+        text: str,
+        turn_id: str,
+    ) -> bool:
+        if item.get("role") != role:
+            return False
+        existing_turn = str(item.get("turn_id") or "")
+        if existing_turn and not turn_id:
+            return False
+        if turn_id and existing_turn and existing_turn != turn_id:
+            return False
+        existing_text = transcript_identity_text(cls.transcript_item_full_text(item))
+        return existing_text == transcript_identity_text(text)
+
+    @classmethod
+    def transcript_text_matches(cls, item: dict[str, Any], text: str) -> bool:
+        existing_text = transcript_identity_text(cls.transcript_item_full_text(item))
+        return existing_text == transcript_identity_text(text)
+
+    def promote_pending_user_transcript(
+        self,
+        transcript: list[dict[str, Any]],
+        *,
+        text: str,
+        turn_id: str,
+        profile: str,
+        now: str,
+    ) -> bool:
+        for index in range(len(transcript) - 1, -1, -1):
+            existing = transcript[index]
+            if existing.get("role") != "user_pending":
+                continue
+            if not self.transcript_text_matches(existing, text):
+                continue
+            if turn_id:
+                existing["role"] = "user"
+                existing["turn_id"] = turn_id
+            existing["profile"] = profile or existing.get("profile") or ""
+            existing["updated_at"] = now
+            self.set_transcript_item_text(existing, str(existing.get("role") or "user_pending"), text)
+            replay_after_pending = any(
+                item.get("role") in {"resume", "context_compaction"}
+                for item in transcript[index + 1 :]
+            )
+            if replay_after_pending:
+                transcript.append(transcript.pop(index))
+            return True
+        return False
+
+    def recent_pending_user_prompt(self, session_key: str) -> str:
+        transcript = self.control_transcripts.get(session_key, [])
+        for existing in reversed(transcript[-12:]):
+            if existing.get("role") != "user_pending":
+                continue
+            text = self.transcript_item_full_text(existing)
+            if text.strip():
+                return text
+        return ""
+
+    def assign_recent_user_turn_id(
+        self,
+        *,
+        session_key: str,
+        turn_id: str,
+        profile: str,
+    ) -> None:
+        if not session_key or not turn_id:
+            return
+        transcript = getattr(self, "control_transcripts", {}).get(session_key)
+        if not transcript:
+            return
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        for existing in reversed(transcript[-12:]):
+            if existing.get("role") not in {"user_pending", "user"}:
+                continue
+            if str(existing.get("turn_id") or ""):
+                continue
+            existing["role"] = "user"
+            existing["turn_id"] = turn_id
+            existing["profile"] = profile or existing.get("profile") or ""
+            existing["updated_at"] = now
+            text = self.transcript_item_full_text(existing)
+            self.set_transcript_item_text(existing, "user", text)
+            return
+
+    def assign_recent_user_turn_id_in_transcript(
+        self,
+        transcript: list[dict[str, Any]],
+        *,
+        turn_id: str,
+        profile: str,
+        now: str,
+    ) -> None:
+        if not turn_id:
+            return
+        for existing in reversed(transcript[-12:]):
+            if existing.get("role") not in {"user_pending", "user"}:
+                continue
+            if str(existing.get("turn_id") or ""):
+                continue
+            existing["role"] = "user"
+            existing["turn_id"] = turn_id
+            existing["profile"] = profile or existing.get("profile") or ""
+            existing["updated_at"] = now
+            text = self.transcript_item_full_text(existing)
+            self.set_transcript_item_text(existing, "user", text)
+            return
+
+    def append_context_replay_marker(
+        self,
+        transcript: list[dict[str, Any]],
+        *,
+        turn_id: str,
+        profile: str,
+        now: str,
+    ) -> None:
+        text = (
+            "Context replay observed at a resume or compaction boundary; "
+            "duplicate resumed context was suppressed."
+        )
+        for existing in reversed(transcript[-12:]):
+            if existing.get("role") != "context_compaction":
+                continue
+            if str(existing.get("turn_id") or "") != turn_id:
+                continue
+            existing["updated_at"] = now
+            existing["profile"] = profile or existing.get("profile") or ""
+            return
+        item = {
+            "ts": now,
+            "updated_at": now,
+            "role": "context_compaction",
+            "turn_id": turn_id,
+            "profile": profile,
+        }
+        self.set_transcript_item_text(item, "context_compaction", text)
+        transcript.append(item)
+
+    @staticmethod
+    def transcript_has_activity_after(
+        transcript: list[dict[str, Any]],
+        index: int,
+        *,
+        turn_id: str,
+    ) -> bool:
+        for later in transcript[index + 1 :]:
+            later_turn = str(later.get("turn_id") or "")
+            if turn_id and later_turn and later_turn != turn_id:
+                continue
+            if later.get("role") in {"resume", "user", "context_compaction"}:
+                continue
+            return True
+        return False
+
+    def append_control_transcript(
+        self,
+        *,
+        session_key: str,
+        role: str,
+        text: str,
+        turn_id: str = "",
+        profile: str = "",
+        append: bool = False,
+        call_id: str = "",
+    ) -> None:
+        if role in {"user", "user_pending", "resume", "context_compaction"}:
+            text = clean_control_user_text(text)
+        if not session_key or not text:
+            return
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        transcript = self.control_transcripts.setdefault(session_key, [])
+        if role == "user" and not turn_id and not append:
+            for index in range(len(transcript) - 1, -1, -1):
+                existing = transcript[index]
+                if existing.get("role") != "user":
+                    continue
+                if not self.transcript_text_matches(existing, text):
+                    continue
+                replay_marker_seen = any(
+                    item.get("role") in {"resume", "context_compaction"}
+                    for item in transcript[index + 1 :]
+                )
+                if replay_marker_seen:
+                    existing["updated_at"] = now
+                    return
+                break
+        if role not in {"user", "user_pending", "resume", "context_compaction"} and turn_id:
+            self.assign_recent_user_turn_id_in_transcript(
+                transcript,
+                turn_id=turn_id,
+                profile=profile,
+                now=now,
+            )
+        if role == "user" and not append and self.promote_pending_user_transcript(
+            transcript,
+            text=text,
+            turn_id=turn_id,
+            profile=profile,
+            now=now,
+        ):
+            return
+        if role == "resume" and not append and transcript and transcript[-1].get("role") == "resume":
+            existing = transcript[-1]
+            existing_turn = str(existing.get("turn_id") or "")
+            if not turn_id or not existing_turn or existing_turn == turn_id:
+                existing_full = self.transcript_item_full_text(existing)
+                if transcript_identity_text(text) == transcript_identity_text(existing_full):
+                    merged = existing_full
+                elif transcript_identity_text(text) in transcript_identity_text(existing_full):
+                    merged = existing_full
+                elif transcript_identity_text(existing_full) in transcript_identity_text(text):
+                    merged = text
+                else:
+                    merged = f"{existing_full.rstrip()}\n\n{text.lstrip()}"
+                self.set_transcript_item_text(existing, "resume", merged)
+                existing["updated_at"] = now
+                existing["turn_id"] = turn_id or existing_turn or ""
+                existing["profile"] = profile or existing.get("profile") or ""
+                return
+        if role in {"resume", "user"} and not append:
+            for index in range(len(transcript) - 1, -1, -1):
+                existing = transcript[index]
+                if not self.transcript_item_matches(
+                    existing,
+                    role=role,
+                    text=text,
+                    turn_id=turn_id,
+                ):
+                    continue
+                existing_turn = str(existing.get("turn_id") or "")
+                if turn_id and not existing_turn:
+                    existing["turn_id"] = turn_id
+                existing["profile"] = profile or existing.get("profile") or ""
+                existing["updated_at"] = now
+                self.set_transcript_item_text(existing, role, text)
+                if role == "resume" and self.transcript_has_activity_after(
+                    transcript,
+                    index,
+                    turn_id=turn_id,
+                ):
+                    self.append_context_replay_marker(
+                        transcript,
+                        turn_id=turn_id,
+                        profile=profile,
+                        now=now,
+                    )
+                    if len(transcript) > CONTROL_TRANSCRIPT_MAX_ITEMS:
+                        del transcript[0 : len(transcript) - CONTROL_TRANSCRIPT_MAX_ITEMS]
+                return
+        if role == "assistant":
+            for existing in reversed(transcript):
+                existing_turn = existing.get("turn_id")
+                if existing.get("role") != "assistant_progress":
+                    continue
+                if turn_id and existing_turn and existing_turn != turn_id:
+                    continue
+                existing["role"] = "assistant"
+                self.set_transcript_item_text(existing, "assistant", text)
+                existing["updated_at"] = now
+                existing["turn_id"] = turn_id or existing_turn or ""
+                existing["profile"] = profile or existing.get("profile") or ""
+                return
+        if role == "tool" and call_id:
+            for existing in reversed(transcript):
+                if existing.get("role") != role or existing.get("call_id") != call_id:
+                    continue
+                existing_full = str(existing.get("full_text") or existing.get("text") or "")
+                merged = merge_tool_transcript_text(existing_full, text)
+                self.set_transcript_item_text(existing, role, merged)
+                existing["updated_at"] = now
+                existing["turn_id"] = turn_id or existing.get("turn_id") or ""
+                existing["profile"] = profile or existing.get("profile") or ""
+                return
+        if (
+            append
+            and transcript
+            and transcript[-1].get("role") == role
+            and transcript[-1].get("turn_id") == turn_id
+        ):
+            existing = str(transcript[-1].get("full_text") or transcript[-1].get("text") or "")
+            separator = self.transcript_stream_separator(existing, text)
+            merged = existing + separator + text
+            self.set_transcript_item_text(transcript[-1], role, merged)
+            transcript[-1]["updated_at"] = now
+            return
+        clipped = self.transcript_display_text(text)
+        for existing in transcript[-6:]:
+            if (
+                existing.get("role") == role
+                and existing.get("turn_id") == turn_id
+                and existing.get("text") == clipped
+            ):
+                return
+        item = {
+            "ts": now,
+            "updated_at": now,
+            "role": role,
+            "text": clipped,
+            "turn_id": turn_id,
+            "profile": profile,
+            "search_text": f"{role} {clipped}",
+        }
+        self.set_transcript_item_text(item, role, text)
+        if call_id:
+            item["call_id"] = call_id
+        transcript.append(item)
+        if len(transcript) > CONTROL_TRANSCRIPT_MAX_ITEMS:
+            del transcript[0 : len(transcript) - CONTROL_TRANSCRIPT_MAX_ITEMS]
+
+    def record_websocket_transcript_message(
+        self,
+        tunnel_id: int,
+        *,
+        role: str,
+        text: str,
+        append: bool = False,
+        call_id: str = "",
+    ) -> None:
+        if not text:
+            return
+        with self.active_lock:
+            tunnel = self.active_websockets.get(tunnel_id)
+            if tunnel is None:
+                return
+            session_key = tunnel.get("session_key")
+            if not isinstance(session_key, str) or not session_key:
+                return
+            turn_id = tunnel.get("turn_id") if isinstance(tunnel.get("turn_id"), str) else ""
+            profile = str(tunnel.get("profile") or "")
+            if role in {"user", "user_pending"} and int(tunnel.get("pending_work") or 0) <= 0:
+                turn_id = ""
+            self.append_control_transcript(
+                session_key=session_key,
+                role=role,
+                text=text,
+                turn_id=turn_id,
+                profile=profile,
+                append=append,
+                call_id=call_id,
+            )
+
+    def record_websocket_transcript(
+        self,
+        tunnel_id: int,
+        opcode: int,
+        payload: bytes,
+        *,
+        from_downstream: bool,
+    ) -> None:
+        if from_downstream:
+            session_key = ""
+            with self.active_lock:
+                tunnel = self.active_websockets.get(tunnel_id)
+                if isinstance(tunnel, dict) and isinstance(tunnel.get("session_key"), str):
+                    session_key = str(tunnel.get("session_key") or "")
+            pending_prompt = self.recent_pending_user_prompt(session_key) if session_key else ""
+            entries = split_user_entries_by_prompt_suffix(
+                websocket_message_user_entries(opcode, payload),
+                pending_prompt,
+            )
+            for entry in entries:
+                self.record_websocket_transcript_message(
+                    tunnel_id,
+                    role=entry["role"],
+                    text=entry["text"],
+                    append=False,
+                )
+            return
+        entry = websocket_message_assistant_entry(opcode, payload)
+        if entry:
+            self.record_websocket_transcript_message(
+                tunnel_id,
+                role=str(entry.get("role") or "assistant"),
+                text=str(entry.get("text") or ""),
+                append=bool(entry.get("append")),
+            )
+        for tool_entry in websocket_message_tool_entries(opcode, payload):
+            self.record_websocket_transcript_message(
+                tunnel_id,
+                role=tool_entry["role"],
+                text=tool_entry["text"],
+                append=False,
+                call_id=str(tool_entry.get("call_id") or ""),
+            )
+
+    def begin_websocket_work(
+        self,
+        tunnel_id: int,
+        turn_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> None:
         with self.active_lock:
             tunnel = self.active_websockets.get(tunnel_id)
             if tunnel is not None:
                 tunnel["pending_work"] = 1
                 tunnel["turn_id"] = turn_id
+                if thread_id:
+                    tunnel["thread_id"] = thread_id
+                    session_key = tunnel.get("session_key")
+                    if isinstance(session_key, str) and session_key:
+                        record = self.observed_sessions.get(session_key)
+                        if isinstance(record, dict):
+                            record["thread_id"] = thread_id
+                session_key = tunnel.get("session_key")
+                profile = str(tunnel.get("profile") or "")
+                if isinstance(session_key, str) and session_key and turn_id:
+                    self.assign_recent_user_turn_id(
+                        session_key=session_key,
+                        turn_id=turn_id,
+                        profile=profile,
+                    )
                 tunnel["saw_tool_output"] = False
                 tunnel["completion_deadline_monotonic"] = None
                 tunnel["last_data_activity_monotonic"] = time.monotonic()
@@ -4011,7 +6567,80 @@ class ProvisionServer(ThreadingHTTPServer):
                 pass
         return count
 
+    def control_transcript_snapshot(self, session_key: str) -> list[dict[str, Any]]:
+        rows = []
+        for index, item in enumerate(self.control_transcripts.get(session_key, [])[-CONTROL_TRANSCRIPT_MAX_ITEMS:]):
+            copied = dict(item)
+            copied["control_index"] = index
+            rows.append(copied)
+        return rows
+
+    def control_turns_from_transcript(self, transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        turns: list[dict[str, Any]] = []
+        current: dict[str, Any] | None = None
+        for index, item in enumerate(transcript):
+            role = str(item.get("role") or "")
+            turn_id = str(item.get("turn_id") or "")
+            if role in {"user", "user_pending"}:
+                if current is not None and turn_id and str(current.get("turn_id") or "") == turn_id:
+                    current["end_index"] = index
+                    current["updated_at"] = str(item.get("updated_at") or item.get("ts") or current.get("updated_at") or "")
+                    if role == "user_pending":
+                        current["pending"] = True
+                    continue
+                if current is not None:
+                    current["end_index"] = max(int(current.get("start_index") or 0), index - 1)
+                text = self.transcript_item_full_text(item)
+                label = observed_turn_label_from_text(text) or "Untitled turn"
+                key = turn_id or f"{role}-{index}"
+                current = {
+                    "key": key,
+                    "turn_id": turn_id,
+                    "pending": role == "user_pending",
+                    "start_index": index,
+                    "end_index": index,
+                    "timestamp": str(item.get("ts") or ""),
+                    "updated_at": str(item.get("updated_at") or item.get("ts") or ""),
+                    "label": label,
+                }
+                turns.append(current)
+                continue
+            if current is not None:
+                current["end_index"] = index
+                current["updated_at"] = str(item.get("updated_at") or item.get("ts") or current.get("updated_at") or "")
+                continue
+            if turn_id:
+                current = {
+                    "key": turn_id,
+                    "turn_id": turn_id,
+                    "pending": False,
+                    "start_index": index,
+                    "end_index": index,
+                    "timestamp": str(item.get("ts") or ""),
+                    "updated_at": str(item.get("updated_at") or item.get("ts") or ""),
+                    "label": f"Turn {turn_id}",
+                }
+                turns.append(current)
+        if not turns and transcript:
+            first = transcript[0]
+            last = transcript[-1]
+            turns.append(
+                {
+                    "key": "observed-activity",
+                    "turn_id": "",
+                    "pending": False,
+                    "start_index": 0,
+                    "end_index": len(transcript) - 1,
+                    "timestamp": str(first.get("ts") or ""),
+                    "updated_at": str(last.get("updated_at") or last.get("ts") or ""),
+                    "label": "Observed activity",
+                }
+            )
+        return turns
+
     def session_snapshots(self) -> list[dict[str, Any]]:
+        with self.ui_launchers_lock:
+            live_ui_launcher_pids = set(self.ui_launchers)
         with self.active_lock:
             self.expire_websocket_work_locked()
             now = time.monotonic()
@@ -4036,24 +6665,182 @@ class ProvisionServer(ThreadingHTTPServer):
                     < WEBSOCKET_SWITCH_IDLE_SECONDS
                 )
                 pinned_profile = self.pinned_sessions.get(key)
+                active_thread_ids = [
+                    str(tunnel.get("thread_id") or "")
+                    for tunnel in self.active_websockets.values()
+                    if tunnel.get("session_key") == key and tunnel.get("thread_id")
+                ]
+                thread_id = str(record.get("thread_id") or (active_thread_ids[0] if active_thread_ids else ""))
+                control_path = str(record.get("control_path") or "")
+                control_available = bool(control_path and Path(control_path).exists())
+                pty_managed = bool(record.get("pty_managed"))
+                ui_launcher_pid = record.get("ui_launcher_pid")
+                ui_launcher_running = isinstance(ui_launcher_pid, int) and ui_launcher_pid in live_ui_launcher_pids
+                associated_profile = str(pinned_profile or record.get("last_profile") or "")
                 snapshots.append(
                     {
                         "key": key,
                         "cwd": str(record.get("cwd") or key),
                         "display": str(record.get("display") or compact_session_path(key)),
                         "name": str(record.get("name") or session_display_name(key)),
+                        "title": str(record.get("title") or record.get("name") or session_display_name(key)),
+                        "tab_order": int(record.get("tab_order") or self.session_tab_order_for_key_locked(key)),
+                        "thread_id": thread_id,
                         "last_profile": record.get("last_profile"),
                         "pinned_profile": pinned_profile,
+                        "associated_profile": associated_profile,
+                        "parent_session_key": str(record.get("parent_session_key") or ""),
+                        "ui_launched": bool(record.get("ui_launched")),
                         "active_requests": active_requests,
                         "active_tunnels": active_tunnels,
                         "pending_websocket_work": pending_work,
                         "recent_websocket_activity": recent_activity,
-                        "active": active_requests > 0 or pending_work > 0 or recent_activity > 0,
+                        "pty_managed": pty_managed,
+                        "pty_control_available": control_available,
+                        "ui_launcher_pid": ui_launcher_pid if isinstance(ui_launcher_pid, int) else None,
+                        "ui_launcher_running": ui_launcher_running,
+                        "ui_launcher_mode": str(record.get("ui_launcher_mode") or ""),
+                        "ui_launcher_permission": str(record.get("ui_launcher_permission") or ""),
+                        "active": active_requests > 0 or pending_work > 0 or recent_activity > 0 or ui_launcher_running,
+                        "first_seen_monotonic": record.get("first_seen_monotonic") or 0.0,
                         "last_seen_monotonic": record.get("last_seen_monotonic") or 0.0,
+                        "interaction": {
+                            "available": control_available,
+                            "thread_id": thread_id,
+                            "mode": "pty" if control_available else "",
+                            "reason": "Ready to send input to the running Codex CLI terminal."
+                            if control_available
+                            else (
+                                "This PTY-managed launcher is no longer reachable. Restart the Codex CLI session with `provision`."
+                                if pty_managed
+                                else "Restart this session with `provision` in an interactive terminal to enable UI input."
+                            ),
+                        },
                     }
                 )
-        snapshots.sort(key=lambda item: float(item.get("last_seen_monotonic") or 0.0), reverse=True)
+        snapshots.sort(
+            key=lambda item: (
+                int(item.get("tab_order") or 0),
+                float(item.get("first_seen_monotonic") or 0.0),
+                str(item.get("key") or ""),
+            )
+        )
+        for snapshot in snapshots:
+            profile = str(snapshot.get("associated_profile") or "")
+            if not profile:
+                profile = str(self.store.active_profile(required=False) or "")
+            snapshot["associated_profile"] = profile
+            quota_snapshot = self.usage_cache_snapshot(profile) if profile else None
+            model_setting = self.profile_model_setting(profile) if profile else {}
+            snapshot["model_setting"] = model_setting
+            snapshot["quota_summary"] = usage_cache_summary(quota_snapshot)
+            snapshot["quota_html"] = render_quota_html(
+                quota_snapshot,
+                quota_updated_label(quota_snapshot),
+                profile or None,
+                self.proxy_token,
+            )
+            snapshot["quota_compact_html"] = render_compact_quota_html(
+                quota_snapshot,
+                str(model_setting.get("model") or ""),
+            )
+            snapshot["resume_candidates"] = self.resume_candidates_for_cwd(str(snapshot.get("cwd") or ""))
         return snapshots
+
+    def control_plane_sessions(self) -> dict[str, Any]:
+        sessions = self.session_snapshots()
+        by_key = {
+            str(session.get("key") or ""): dict(session, events=[], active_details={})
+            for session in sessions
+            if session.get("key")
+        }
+        now = time.monotonic()
+        with self.active_lock:
+            self.expire_websocket_work_locked()
+            for key, session in by_key.items():
+                request_rows = []
+                for request in self.active_requests.values():
+                    if request.get("session_key") != key:
+                        continue
+                    started = request.get("started_monotonic")
+                    request_rows.append(
+                        {
+                            "profile": str(request.get("profile") or ""),
+                            "age_seconds": round(now - float(started), 1)
+                            if isinstance(started, (int, float))
+                            else None,
+                        }
+                    )
+                tunnel_rows = []
+                for tunnel in self.active_websockets.values():
+                    if tunnel.get("session_key") != key:
+                        continue
+                    started = tunnel.get("started_monotonic")
+                    last_data = float(tunnel.get("last_data_activity_monotonic") or 0.0)
+                    tunnel_rows.append(
+                        {
+                            "profile": str(tunnel.get("profile") or ""),
+                            "pending_work": int(tunnel.get("pending_work") or 0),
+                            "turn_id": tunnel.get("turn_id") if isinstance(tunnel.get("turn_id"), str) else "",
+                            "thread_id": tunnel.get("thread_id")
+                            if isinstance(tunnel.get("thread_id"), str)
+                            else "",
+                            "service_tier": tunnel.get("service_tier")
+                            if isinstance(tunnel.get("service_tier"), str)
+                            else "",
+                            "age_seconds": round(now - float(started), 1)
+                            if isinstance(started, (int, float))
+                            else None,
+                            "last_data_age_seconds": round(now - last_data, 1) if last_data > 0 else None,
+                            "bytes_up": int(tunnel.get("bytes_up") or 0),
+                            "bytes_down": int(tunnel.get("bytes_down") or 0),
+                            "messages_up": int(tunnel.get("messages_up") or 0),
+                            "messages_down": int(tunnel.get("messages_down") or 0),
+                        }
+                    )
+                session["active_details"] = {
+                    "requests": request_rows,
+                    "tunnels": tunnel_rows,
+                }
+                transcript = self.control_transcript_snapshot(key)
+                session["transcript"] = transcript
+                session["turns"] = self.control_turns_from_transcript(transcript)
+
+        for event in self.stats_events(CONTROL_PLANE_EVENT_LIMIT):
+            session_key = event.get("session_key")
+            if not isinstance(session_key, str) or session_key not in by_key:
+                continue
+            events = by_key[session_key]["events"]
+            events.append(compact_control_event(event))
+            if len(events) > CONTROL_PLANE_SESSION_EVENT_LIMIT:
+                del events[0 : len(events) - CONTROL_PLANE_SESSION_EVENT_LIMIT]
+            if event.get("type") == "token_usage":
+                context = context_summary_from_usage(event.get("usage"))
+                if context:
+                    context["updated_at"] = str(event.get("ts") or "")
+                    by_key[session_key]["context"] = context
+
+        app_server = codex_app_server_schema_probe()
+        control_status = app_server.get("control_plane") if isinstance(app_server, dict) else {}
+        pty_available = any(
+            bool(session.get("interaction", {}).get("available"))
+            for session in sessions
+            if isinstance(session.get("interaction"), dict)
+        )
+        return {
+            "sessions": list(by_key.values()),
+            "event_limit": CONTROL_PLANE_SESSION_EVENT_LIMIT,
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "interaction": {
+                "available": pty_available,
+                "app_server_interactive": bool(
+                    isinstance(control_status, dict) and control_status.get("interactive")
+                ),
+                "reason": "PTY-managed Codex CLI input is available."
+                if pty_available
+                else "Launch or resume a Codex CLI session with `provision` in an interactive terminal to enable live UI input.",
+            },
+        }
 
     def pinned_sessions_for_profile(self, profile: str) -> list[dict[str, Any]]:
         return [
@@ -4173,6 +6960,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 "quota": quota_remaining_delta(previous_payload, payload),
             }
         )
+        self.reconcile_reset_credit_verification(profile, payload, source="usage_fetch")
         self.schedule_app_server_rate_limit_refresh(profile)
         return payload, fetched_at, "fresh"
 
@@ -4211,6 +6999,7 @@ class ProvisionServer(ThreadingHTTPServer):
                     "quota": quota_remaining_delta(previous_payload, current_payload),
                 }
             )
+            self.reconcile_reset_credit_verification(profile, current_payload, source=source)
         return True
 
     def update_usage_cache_from_rate_limit_headers(self, profile: str, headers: Any) -> bool:
@@ -4252,12 +7041,20 @@ class ProvisionServer(ThreadingHTTPServer):
             force=force,
         )
 
-    def run_app_server_for_profile(self, profile: str, callback: Callable[[CodexAppServerClient], Any]) -> Any:
+    def run_app_server_for_profile(
+        self,
+        profile: str,
+        callback: Callable[[CodexAppServerClient], Any],
+        *,
+        include_history: bool = False,
+    ) -> Any:
         if not self.store.profile_exists(profile):
             raise StoreError(f"unknown profile: {profile}")
         auth_source = self.store.auth_path(profile)
         with tempfile.TemporaryDirectory(prefix=f"provision-app-server-{profile}-") as temp:
             codex_home = Path(temp)
+            if include_history:
+                bridge_codex_history_into_app_home(codex_home)
             auth_target = codex_home / "auth.json"
             shutil.copy2(auth_source, auth_target)
             auth_target.chmod(0o600)
@@ -4272,6 +7069,243 @@ class ProvisionServer(ThreadingHTTPServer):
                 self.store.import_auth_file(profile, auth_target, overwrite=True, set_active=False)
             return result
 
+    def control_profile_for_session(self, session_key: str) -> str:
+        pinned = self.pinned_profile_for_session(session_key)
+        if pinned:
+            return pinned
+        with self.active_lock:
+            record = self.observed_sessions.get(session_key)
+            last_profile = str(record.get("last_profile") or "") if isinstance(record, dict) else ""
+        if last_profile and self.store.profile_exists(last_profile):
+            return last_profile
+        profile = self.store.active_profile()
+        assert profile is not None
+        return profile
+
+    def active_turn_for_session(self, session_key: str) -> tuple[str, str]:
+        with self.active_lock:
+            self.expire_websocket_work_locked()
+            for tunnel in self.active_websockets.values():
+                if tunnel.get("session_key") != session_key:
+                    continue
+                thread_id = tunnel.get("thread_id") if isinstance(tunnel.get("thread_id"), str) else ""
+                turn_id = tunnel.get("turn_id") if isinstance(tunnel.get("turn_id"), str) else ""
+                if int(tunnel.get("pending_work") or 0) > 0 and thread_id and turn_id:
+                    return thread_id, turn_id
+        return "", ""
+
+    def observed_thread_for_session(self, session_key: str) -> str:
+        with self.active_lock:
+            record = self.observed_sessions.get(session_key)
+            if isinstance(record, dict):
+                thread_id = record.get("thread_id")
+                if isinstance(thread_id, str) and thread_id:
+                    return thread_id
+            for tunnel in self.active_websockets.values():
+                if tunnel.get("session_key") != session_key:
+                    continue
+                thread_id = tunnel.get("thread_id")
+                if isinstance(thread_id, str) and thread_id:
+                    return thread_id
+        return ""
+
+    def resolve_app_server_thread_id(self, profile: str, cwd: str) -> str:
+        def list_threads(client: CodexAppServerClient) -> Any:
+            return client.list_threads(limit=50)
+
+        result = self.run_app_server_for_profile(profile, list_threads, include_history=True)
+        return first_app_server_thread_id(result, cwd=cwd) or ""
+
+    def control_path_for_session(self, session_key: str) -> str:
+        with self.active_lock:
+            record = self.observed_sessions.get(session_key)
+            if not isinstance(record, dict):
+                return ""
+            control_path = record.get("control_path")
+        return control_path if isinstance(control_path, str) else ""
+
+    def send_pty_control_payload(self, control_path: str, payload: dict[str, Any]) -> None:
+        if not control_path:
+            raise StoreError(
+                "This session was not launched under Provision PTY control. "
+                "Restart it with `provision` before using UI input."
+            )
+        path = Path(control_path)
+        if not path.exists():
+            raise StoreError(
+                "Provision's PTY control socket for this session is no longer available. "
+                "Restart the Codex CLI session with `provision`."
+            )
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(2.0)
+                client.connect(str(path))
+                client.sendall(encoded)
+                raw = client.recv(4096)
+        except OSError as exc:
+            raise StoreError(f"failed to send PTY control message: {exc}") from exc
+        try:
+            response = json.loads(raw.decode("utf-8")) if raw else {}
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise StoreError(f"invalid PTY control response: {exc}") from exc
+        if not isinstance(response, dict) or not response.get("ok"):
+            error = response.get("error") if isinstance(response, dict) else None
+            raise StoreError(str(error or "PTY control rejected the message"))
+
+    def send_prompt_to_pty_control(self, control_path: str, text: str) -> None:
+        self.send_pty_control_payload(control_path, {"action": "send_text", "text": text})
+
+    def send_escape_to_pty_control(self, control_path: str) -> None:
+        self.send_pty_control_payload(control_path, {"action": "send_escape"})
+
+    def send_session_prompt(self, session_key: str, text: str) -> dict[str, Any]:
+        prompt = clean_transcript_text(text)
+        if not prompt:
+            raise StoreError("prompt is empty")
+        with self.active_lock:
+            record = self.observed_sessions.get(session_key)
+            if not isinstance(record, dict):
+                raise StoreError("unknown session")
+            cwd = str(record.get("cwd") or session_key)
+            control_path = record.get("control_path") if isinstance(record.get("control_path"), str) else ""
+        profile = self.control_profile_for_session(session_key)
+        self.send_prompt_to_pty_control(str(control_path or ""), prompt)
+        active_turn_id = ""
+        with self.active_lock:
+            record = self.observed_sessions.get(session_key)
+            if isinstance(record, dict):
+                record["last_profile"] = profile
+                record["last_seen_monotonic"] = time.monotonic()
+                record["last_seen_at"] = datetime.now().astimezone()
+            for tunnel in self.active_websockets.values():
+                if tunnel.get("session_key") != session_key:
+                    continue
+                if int(tunnel.get("pending_work") or 0) <= 0:
+                    continue
+                tunnel_turn_id = tunnel.get("turn_id")
+                if isinstance(tunnel_turn_id, str) and tunnel_turn_id:
+                    active_turn_id = tunnel_turn_id
+                    break
+        self.append_control_transcript(
+            session_key=session_key,
+            role="user_pending",
+            text=prompt,
+            turn_id=active_turn_id,
+            profile=profile,
+        )
+        return {
+            "ok": True,
+            "profile": profile,
+            "cwd": cwd,
+            "mode": "pty",
+        }
+
+    def send_session_escape(self, session_key: str) -> dict[str, Any]:
+        with self.active_lock:
+            record = self.observed_sessions.get(session_key)
+            if not isinstance(record, dict):
+                raise StoreError("unknown session")
+            control_path = record.get("control_path") if isinstance(record.get("control_path"), str) else ""
+        self.send_escape_to_pty_control(str(control_path or ""))
+        return {
+            "ok": True,
+            "mode": "pty",
+        }
+
+    def run_session_prompt_turn(
+        self,
+        *,
+        session_key: str,
+        profile: str,
+        cwd: str,
+        thread_id: str,
+        prompt: str,
+        model: str,
+        effort: str,
+        service_tier: str | None,
+    ) -> None:
+        started_turn_id = ""
+
+        def send(client: CodexAppServerClient) -> Any:
+            nonlocal started_turn_id
+            fork = client.fork_thread(thread_id=thread_id, cwd=cwd)
+            forked_thread_id = thread_id_from_app_server_value(fork) or thread_id
+            result = client.start_turn(
+                thread_id=forked_thread_id,
+                text=prompt,
+                cwd=cwd,
+                model=model,
+                effort=effort,
+                service_tier=service_tier,
+            )
+            started_turn_id = turn_id_from_app_server_value(result) or ""
+            self.append_control_transcript(
+                session_key=session_key,
+                role="user",
+                text=prompt,
+                turn_id=started_turn_id,
+                profile=profile,
+            )
+            self.capture_app_server_turn(
+                client,
+                session_key=session_key,
+                profile=profile,
+                turn_id=started_turn_id,
+            )
+            return result
+
+        try:
+            self.run_app_server_for_profile(profile, send, include_history=True)
+        except (StoreError, CodexAppServerError, AuthError, OSError, json.JSONDecodeError) as exc:
+            self.log_message("session prompt background turn failed for %s: %s", session_key, exc)
+            self.append_control_transcript(
+                session_key=session_key,
+                role="error",
+                text=f"Session interaction failed: {exc}",
+                turn_id=started_turn_id,
+                profile=profile,
+            )
+
+    def capture_app_server_turn(
+        self,
+        client: CodexAppServerClient,
+        *,
+        session_key: str,
+        profile: str,
+        turn_id: str,
+    ) -> None:
+        deadline = time.monotonic() + CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.append_control_transcript(
+                    session_key=session_key,
+                    role="error",
+                    text="Session interaction timed out before Codex reported turn completion.",
+                    turn_id=turn_id,
+                    profile=profile,
+                )
+                return
+            message = client.read_message(min(1.0, remaining))
+            if message is None:
+                continue
+            for entry in app_server_transcript_entries_from_message(message):
+                self.append_control_transcript(
+                    session_key=session_key,
+                    role=str(entry.get("role") or "message"),
+                    text=str(entry.get("text") or ""),
+                    turn_id=str(entry.get("turn_id") or turn_id),
+                    profile=profile,
+                    append=bool(entry.get("append")),
+                    call_id=str(entry.get("call_id") or ""),
+                )
+            method = app_server_message_method(message)
+            if method == "turn/completed":
+                completed_turn_id = app_server_message_turn_id(message)
+                if not turn_id or not completed_turn_id or completed_turn_id == turn_id:
+                    return
+
     def consume_profile_rate_limit_reset_credit(
         self,
         profile: str,
@@ -4279,6 +7313,7 @@ class ProvisionServer(ThreadingHTTPServer):
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         key = idempotency_key or str(uuid.uuid4())
+        self.begin_reset_credit_attempt(profile, key)
 
         def consume(client: CodexAppServerClient) -> dict[str, Any]:
             return {
@@ -4286,13 +7321,21 @@ class ProvisionServer(ThreadingHTTPServer):
                 "rate_limits": client.read_account_rate_limits(),
             }
 
-        result = self.run_app_server_for_profile(profile, consume)
+        try:
+            result = self.run_app_server_for_profile(profile, consume)
+        except Exception as exc:
+            self.mark_reset_credit_attempt_error(profile, key, exc)
+            raise
         consume_result = result.get("consume") if isinstance(result, dict) else {}
         rate_limits = result.get("rate_limits") if isinstance(result, dict) else {}
         outcome = str(consume_result.get("outcome") or "unknown") if isinstance(consume_result, dict) else "unknown"
         payload = usage_payload_from_app_server_rate_limits_response(rate_limits)
-        if payload:
-            self.update_usage_cache_from_observation(profile, payload, source="app_server_rate_limits")
+        self.mark_reset_credit_outcome(
+            profile,
+            idempotency_key=key,
+            outcome=outcome,
+            payload=payload,
+        )
         event = {
             "type": "reset_credit",
             "profile": profile,
@@ -4305,6 +7348,7 @@ class ProvisionServer(ThreadingHTTPServer):
             "outcome": outcome,
             "idempotency_key": key,
             "payload": payload,
+            "reset_credit": self.reset_credit_status(profile),
         }
 
     def cached_app_server_rate_limit_payload(self, profile: str) -> dict[str, Any] | None:
@@ -4375,8 +7419,10 @@ class ProvisionServer(ThreadingHTTPServer):
                 entry["payload"] = dict(payload)
                 entry["fetched_monotonic"] = entry["checked_monotonic"]
                 entry["fetched_at"] = datetime.now().astimezone()
-        if isinstance(payload, dict):
+        if isinstance(payload, dict) and not self.reset_credit_awaiting_usage_confirmation(profile):
             self.update_usage_cache_from_observation(profile, payload, source="app_server_rate_limits")
+            return payload
+        if isinstance(payload, dict):
             return payload
         return None
 
@@ -4446,11 +7492,13 @@ class ProvisionServer(ThreadingHTTPServer):
         bytes_in: int,
         bytes_out: int,
         service_tier: str | None,
+        session_key: str | None = None,
     ) -> None:
         self.append_stats_event(
             {
                 "type": "http_request",
                 "profile": profile,
+                "session_key": session_key,
                 "route": route,
                 "path": path,
                 "method": method,
@@ -4606,8 +7654,9 @@ class ProvisionServer(ThreadingHTTPServer):
             elif event_type == "quota_update":
                 row["quota_updates"] += 1
                 row["last_quota"] = event.get("quota") if isinstance(event.get("quota"), dict) else {}
-            if event_type in {"http_request", "websocket_tunnel", "token_usage", "quota_update", "reset_credit"}:
+            if event_type in {"http_request", "websocket_tunnel", "token_usage", "reset_credit"}:
                 recent.append(compact_stats_event(event))
+            if event_type in {"http_request", "websocket_tunnel", "token_usage", "quota_update", "reset_credit"}:
                 traffic = int(row["bytes_up"]) + int(row["bytes_down"])
                 value = int(row["total_tokens"]) or traffic or int(row["requests"]) + int(row["tunnels"]) + int(row["quota_updates"])
                 series.append(
@@ -4898,7 +7947,7 @@ class ProvisionServer(ThreadingHTTPServer):
             raise
         if isinstance(payload, dict):
             app_server_payload = self.cached_app_server_rate_limit_payload(profile)
-            if app_server_payload:
+            if app_server_payload and not self.reset_credit_awaiting_usage_confirmation(profile):
                 payload = merge_usage_payload(payload, app_server_payload)
         self.clear_profile_login_required(profile)
         self.clear_profile_billing_required(profile)
@@ -4966,6 +8015,8 @@ class ProvisionServer(ThreadingHTTPServer):
         if self.usage_auto_refresh_thread and self.usage_auto_refresh_thread.is_alive():
             return
         self.usage_auto_refresh_stop.clear()
+        for profile in self.reset_credit_profiles_needing_verification():
+            self.schedule_reset_credit_verification(profile)
         self.usage_auto_refresh_thread = threading.Thread(
             target=self.usage_auto_refresh_loop,
             name="provision-usage-auto-refresh",
@@ -5212,12 +8263,40 @@ class Handler(BaseHTTPRequestHandler):
             return
         token = data.get("token")
         cwd = str(data.get("cwd") or "")
+        explicit_session_key = normalize_session_key(str(data.get("session_key") or ""))
+        control_path = str(data.get("control_path") or "")
+        launcher_pid_raw = str(data.get("launcher_pid") or "")
+        try:
+            launcher_pid = int(launcher_pid_raw) if launcher_pid_raw else None
+        except ValueError:
+            launcher_pid = None
+        pty_managed = str(data.get("pty_managed") or "").lower() in {"1", "true", "yes"}
         if token != self.server.proxy_token:
             self.send_json({"error": "invalid UI token"}, status=401)
             return
-        session_key = normalize_session_key(cwd)
+        session_key = explicit_session_key or normalize_session_key(cwd)
         profile = self.server.profile_for_session(session_key)
-        session_key = self.server.observe_session(cwd, profile)
+        if explicit_session_key:
+            with self.server.active_lock:
+                self.server.observe_session_locked(
+                    explicit_session_key,
+                    cwd,
+                    profile,
+                    control_path=control_path or None,
+                    launcher_pid=launcher_pid,
+                    pty_managed=pty_managed,
+                    clear_control_path=not bool(control_path),
+                )
+            session_key = explicit_session_key
+        else:
+            session_key = self.server.observe_session(
+                cwd,
+                profile,
+                control_path=control_path or None,
+                launcher_pid=launcher_pid,
+                pty_managed=pty_managed,
+                clear_control_path=not bool(control_path),
+            )
         self.send_json({"ok": True, "session_key": session_key})
 
     def handle_pin_session(self) -> None:
@@ -5419,6 +8498,68 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_ui_state()
             return
+        if action == "launch_session":
+            session_key = str(message.get("session_key") or "")
+            mode = str(message.get("mode") or "new")
+            permission = str(message.get("permission") or "workspace-write")
+            session_id = str(message.get("session_id") or "")
+            prompt = str(message.get("prompt") or "")
+            try:
+                self.server.launch_ui_session(
+                    session_key=session_key,
+                    mode=mode,
+                    permission=permission,
+                    profile=profile or None,
+                    session_id=session_id,
+                    prompt=prompt,
+                )
+            except (StoreError, OSError) as exc:
+                self.log_message("UI launcher failed for %s: %s", session_key, exc)
+                self.send_ui_state(message=f"Launch failed: {exc}")
+                return
+            self.send_ui_state()
+            return
+        if action == "forget_session":
+            session_key = str(message.get("session_key") or "")
+            force_live = bool(message.get("force_live"))
+            try:
+                self.server.forget_session(session_key, force_live=force_live)
+            except StoreError as exc:
+                self.send_ui_state(message=f"Forget failed: {exc}")
+                return
+            self.send_ui_state()
+            return
+        if action == "reorder_sessions":
+            raw_keys = message.get("session_keys")
+            session_keys = [str(key) for key in raw_keys] if isinstance(raw_keys, list) else []
+            try:
+                self.server.reorder_sessions(session_keys)
+            except StoreError as exc:
+                self.send_ui_state(message=f"Reorder failed: {exc}")
+                return
+            self.send_ui_state()
+            return
+        if action == "session_prompt":
+            session_key = str(message.get("session_key") or "")
+            prompt = str(message.get("prompt") or "")
+            try:
+                result = self.server.send_session_prompt(session_key, prompt)
+            except (StoreError, CodexAppServerError, AuthError, OSError, json.JSONDecodeError) as exc:
+                self.log_message("session prompt failed for %s: %s", session_key, exc)
+                self.send_ui_state(message=f"Session interaction failed: {exc}")
+                return
+            self.send_ui_state()
+            return
+        if action == "session_escape":
+            session_key = str(message.get("session_key") or "")
+            try:
+                self.server.send_session_escape(session_key)
+            except (StoreError, OSError, json.JSONDecodeError) as exc:
+                self.log_message("session escape failed for %s: %s", session_key, exc)
+                self.send_ui_state(message=f"Session escape failed: {exc}")
+                return
+            self.send_ui_state()
+            return
         self.send_ui_state(message=f"Unknown action: {action}")
 
     def send_ui_state(
@@ -5529,7 +8670,8 @@ class Handler(BaseHTTPRequestHandler):
         session_key = session.get("key") if session else None
         profile = self.server.profile_for_session(session_key)
         if session and session_key and session.get("cwd"):
-            self.server.observe_session(str(session["cwd"]), profile)
+            with self.server.active_lock:
+                self.server.observe_session_locked(str(session_key), str(session["cwd"]), profile)
         service_tier = None
         model_setting = self.server.profile_model_setting(profile)
         model = str(model_setting.get("model") or "")
@@ -5573,6 +8715,7 @@ class Handler(BaseHTTPRequestHandler):
             elapsed = time.monotonic() - started
             self.server.record_http_stats(
                 profile=profile,
+                session_key=session_key,
                 route=route,
                 path=parsed.path,
                 method=method,
@@ -5733,7 +8876,8 @@ class Handler(BaseHTTPRequestHandler):
             session_key = session.get("key") if session else None
             profile = self.server.profile_for_session(session_key)
             if session and session_key and session.get("cwd"):
-                self.server.observe_session(str(session["cwd"]), profile)
+                with self.server.active_lock:
+                    self.server.observe_session_locked(str(session_key), str(session["cwd"]), profile)
             tunnel_id = self.server.begin_websocket(profile, self.connection, session_key)
             auth_path = self.server.store.auth_path(profile)
             auth = ensure_fresh_chatgpt_auth(auth_path)
@@ -6098,11 +9242,21 @@ class Handler(BaseHTTPRequestHandler):
                                     str(session["key"]),
                                     str(session["cwd"]),
                                 )
+                            thread_id = websocket_message_thread_id(opcode, payload)
+                            if thread_id:
+                                self.server.remember_websocket_thread(tunnel_id, thread_id)
                             if websocket_message_starts_response(opcode, payload):
                                 self.server.begin_websocket_work(
                                     tunnel_id,
                                     websocket_message_turn_id(opcode, payload),
+                                    thread_id,
                                 )
+                            self.server.record_websocket_transcript(
+                                tunnel_id,
+                                opcode,
+                                payload,
+                                from_downstream=True,
+                            )
                     else:
                         for opcode, payload in messages:
                             if self.server.update_usage_cache_from_websocket_message(
@@ -6122,6 +9276,12 @@ class Handler(BaseHTTPRequestHandler):
                                     tunnel_id=tunnel_id,
                                     usage=usage,
                                 )
+                            self.server.record_websocket_transcript(
+                                tunnel_id,
+                                opcode,
+                                payload,
+                                from_downstream=False,
+                            )
                             saw_tool_output = websocket_message_has_tool_output(opcode, payload)
                             if saw_tool_output:
                                 self.server.mark_websocket_tool_output(tunnel_id)
@@ -6213,7 +9373,7 @@ class Handler(BaseHTTPRequestHandler):
             if not should_forward_incoming_header(key):
                 continue
             headers[key] = value
-        return headers
+        return ensure_default_upstream_user_agent(headers)
 
     def forward_response_headers(self, headers: Any) -> None:
         for key, value in headers.items():
@@ -6266,6 +9426,7 @@ class Handler(BaseHTTPRequestHandler):
         }
         if include_profiles:
             payload["sessions"] = self.server.session_snapshots()
+            payload["control_plane"] = self.server.control_plane_sessions()
             profiles = []
             for profile in self.server.store.list_profiles():
                 item = dict(profile)
@@ -6293,6 +9454,10 @@ class Handler(BaseHTTPRequestHandler):
                     "billing_required": True,
                 }
             payload = snapshot.get("payload") if isinstance(snapshot, dict) else None
+            reset_credit = self.server.reset_credit_status(name)
+            if isinstance(snapshot, dict) and reset_credit:
+                snapshot = dict(snapshot)
+                snapshot["reset_credit"] = reset_credit
             profile["fast_mode"] = self.server.profile_fast_mode(name)
             profile["model_setting"] = self.server.profile_model_setting(name)
             profile["login_required"] = self.server.profile_login_required(name)
@@ -6311,6 +9476,7 @@ class Handler(BaseHTTPRequestHandler):
             profile["quota_refresh_error"] = (
                 str(snapshot.get("error") or "") if isinstance(snapshot, dict) else ""
             )
+            profile["reset_credit"] = reset_credit
             profile["quota_html"] = render_quota_html(
                 snapshot,
                 profile["quota_updated"],
@@ -6643,7 +9809,7 @@ class Handler(BaseHTTPRequestHandler):
             separators=(",", ":"),
         ).replace("</", "<\\/")
         token_json = json.dumps(self.server.proxy_token)
-        return """
+        return r"""
 <!doctype html>
 <html>
 	<head>
@@ -6689,12 +9855,12 @@ class Handler(BaseHTTPRequestHandler):
 			      --red-hi: #eb5555;
 			      --red-low: #ad2929;
 			      --red-dark: #9f2424;
-			      --green: #198754;
-			      --green-hi: #22a66a;
-			      --green-low: #116d42;
-			      --blue: #2563eb;
-			      --blue-hi: #4c7ff4;
-			      --blue-low: #1e4fc2;
+			      --green: #35b779;
+			      --green-hi: #48d996;
+			      --green-low: #20915d;
+			      --blue: #60a5fa;
+			      --blue-hi: #7fb8ff;
+			      --blue-low: #3b82d6;
 			      --amber: #b7791f;
 			      --amber-hi: #d59b35;
 			      --amber-low: #8d5d14;
@@ -6770,12 +9936,12 @@ class Handler(BaseHTTPRequestHandler):
 		      --red-hi: #eb5555;
 		      --red-low: #ad2929;
 		      --red-dark: #9f2424;
-		      --green: #198754;
-		      --green-hi: #22a66a;
-		      --green-low: #116d42;
-		      --blue: #2563eb;
-		      --blue-hi: #4c7ff4;
-		      --blue-low: #1e4fc2;
+		      --green: #35b779;
+		      --green-hi: #48d996;
+		      --green-low: #20915d;
+		      --blue: #60a5fa;
+		      --blue-hi: #7fb8ff;
+		      --blue-low: #3b82d6;
 		      --amber: #b7791f;
 		      --amber-hi: #d59b35;
 		      --amber-low: #8d5d14;
@@ -6833,6 +9999,7 @@ class Handler(BaseHTTPRequestHandler):
     .shell {
       width: min(1240px, calc(100vw - 32px));
       margin: 24px auto 40px;
+      position: relative;
     }
 		    .topbar {
 		      display: flex;
@@ -6888,15 +10055,21 @@ class Handler(BaseHTTPRequestHandler):
 		      gap: 8px;
 		      justify-content: center;
 		    }
-		    .stats-toggle {
-		      width: 30px;
-		      min-height: 30px;
-		      padding: 0;
-		      display: inline-flex;
-		      align-items: center;
-		      justify-content: center;
-		      border-radius: 999px;
-		    }
+	    .stats-toggle {
+	      width: 30px;
+	      min-height: 30px;
+	      padding: 0;
+	      display: inline-flex;
+	      align-items: center;
+	      justify-content: center;
+	      border-radius: 999px;
+	    }
+	    .stats-toggle.active {
+	      color: #fff;
+	      border-color: var(--red);
+	      background: linear-gradient(180deg, var(--red-hi), var(--red-low));
+	      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.25);
+	    }
 		    .theme-toggle {
 		      width: 30px;
 		      min-height: 30px;
@@ -6933,25 +10106,94 @@ class Handler(BaseHTTPRequestHandler):
 	      color: var(--message-ink);
 	    }
     .message.visible { display: block; }
-    .modal-backdrop {
-      position: fixed;
-      inset: 0;
-      z-index: 80;
+	    .modal-backdrop {
+	      position: fixed;
+	      inset: 0;
+	      z-index: 80;
       display: grid;
       place-items: center;
       padding: 18px;
-      background: rgba(0, 0, 0, 0.42);
-    }
-    .modal-backdrop[hidden] { display: none; }
-    .stats-modal {
-      width: min(980px, calc(100vw - 36px));
-      max-height: calc(100vh - 36px);
-      overflow: auto;
-      background: var(--surface);
+	      background: rgba(0, 0, 0, 0.42);
+	    }
+	    .modal-backdrop[hidden] { display: none; }
+	    .stats-backdrop {
+	      place-items: start center;
+	      padding-top: var(--stats-modal-top, 18px);
+	      box-sizing: border-box;
+	      background: transparent;
+	    }
+    .confirm-modal {
+      width: min(440px, calc(100vw - 32px));
+      display: grid;
+      gap: 12px;
+      padding: 16px;
       border: 1px solid var(--line);
       border-radius: 8px;
+      background: var(--surface);
+      color: var(--ink);
       box-shadow: var(--shadow);
     }
+    .confirm-modal h2 {
+      margin: 0;
+      font-size: 15px;
+    }
+    .confirm-modal p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .confirm-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 2px;
+    }
+    .confirm-actions button {
+      width: auto;
+      min-height: 30px;
+      padding: 4px 11px;
+    }
+    .confirm-actions .danger {
+      color: #fff;
+      border-color: var(--red);
+      background: linear-gradient(180deg, var(--red-hi), var(--red-low));
+      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.25);
+    }
+    .ui-tooltip {
+      position: fixed;
+      z-index: 140;
+      max-width: min(340px, calc(100vw - 24px));
+      padding: 6px 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--ink);
+      box-shadow: var(--shadow);
+      font-size: 12px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+      pointer-events: none;
+    }
+    .ui-tooltip[hidden] {
+      display: none;
+    }
+	    .stats-modal {
+	      width: min(1240px, calc(100vw - 32px));
+	      height: calc(100vh - var(--stats-modal-top, 18px) - 18px);
+	      max-height: calc(100vh - var(--stats-modal-top, 18px) - 18px);
+	      min-height: 0;
+	      overflow: hidden;
+	      display: grid;
+	      grid-template-rows: auto minmax(0, 1fr);
+	      background: var(--surface);
+	      border: 1px solid var(--line);
+	      border-radius: 8px;
+	      box-shadow: var(--shadow);
+	      pointer-events: auto;
+	    }
     .stats-head {
       display: flex;
       align-items: center;
@@ -6973,12 +10215,22 @@ class Handler(BaseHTTPRequestHandler):
     }
     .stats-content {
       display: grid;
+      align-content: start;
       gap: 16px;
       padding: 14px;
+      box-sizing: border-box;
+      min-width: 0;
+      max-width: 100%;
+      min-height: 0;
+      height: 100%;
+      overflow-y: auto;
+      overflow-x: hidden;
     }
     .stats-graph-card {
       display: grid;
       gap: 10px;
+      min-width: 0;
+      max-width: 100%;
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 10px;
@@ -7010,14 +10262,18 @@ class Handler(BaseHTTPRequestHandler):
       flex-wrap: wrap;
       gap: 8px;
       justify-content: flex-end;
+      min-width: 0;
     }
     .stats-profile-toggle {
       display: inline-flex;
       align-items: center;
       gap: 6px;
+      min-width: 0;
+      max-width: 100%;
       font-size: 12px;
       color: var(--muted);
       cursor: pointer;
+      overflow-wrap: anywhere;
     }
     .stats-profile-toggle input { margin: 0; }
     .stats-profile-toggle span {
@@ -7027,49 +10283,140 @@ class Handler(BaseHTTPRequestHandler):
       background: var(--profile-color);
       display: inline-block;
     }
-    .stats-graph {
-      min-height: 190px;
-      overflow: hidden;
+	    .stats-graph {
+	      position: relative;
+	      min-width: 0;
+	      max-width: 100%;
+	      min-height: 230px;
+	      overflow: hidden;
+	      border: 1px solid var(--line);
+	      border-radius: 6px;
+	      background: linear-gradient(180deg, var(--surface), var(--subtle));
+	      color: var(--muted);
+	      touch-action: pan-y;
+	    }
+	    .stats-graph-svg {
+	      width: 100%;
+	      height: 230px;
+	      display: block;
+	    }
+    .stats-graph-grid {
+      stroke: currentColor;
+      opacity: 0.12;
+      stroke-width: 1;
+    }
+    .stats-graph-axis {
+      stroke: currentColor;
+      opacity: 0.32;
+      stroke-width: 1.2;
+    }
+    .stats-graph-reference {
+      stroke: var(--amber);
+      stroke-width: 1;
+      stroke-dasharray: 5 5;
+      opacity: 0.75;
+    }
+    .stats-graph-label {
+      fill: currentColor;
+      opacity: 0.78;
+      font: 11px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .stats-graph-marker {
+      stroke: var(--surface);
+      stroke-width: 2;
+    }
+    .stats-graph-cursor {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: 1px;
+      background: var(--red);
+      opacity: 0.72;
+      pointer-events: none;
+      transform: translateX(-0.5px);
+    }
+    .stats-graph-hover-dot {
+      position: absolute;
+      width: 10px;
+      height: 10px;
+      border: 2px solid var(--surface);
+      border-radius: 50%;
+      background: var(--red);
+      box-shadow: 0 0 0 2px rgba(216, 52, 52, 0.28);
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+    }
+    .stats-graph-tooltip {
+      position: absolute;
+      z-index: 2;
+      display: grid;
+      gap: 4px;
+      min-width: 210px;
+      max-width: min(320px, calc(100% - 16px));
+      padding: 8px 9px;
       border: 1px solid var(--line);
       border-radius: 6px;
       background: var(--surface);
+      color: var(--ink);
+      box-shadow: var(--shadow);
+      font-size: 12px;
+      pointer-events: none;
+    }
+    .stats-graph-tooltip[hidden],
+    .stats-graph-cursor[hidden],
+    .stats-graph-hover-dot[hidden] {
+      display: none;
+    }
+    .stats-graph-tooltip strong {
+      font-size: 12px;
+    }
+    .stats-graph-tooltip span {
       color: var(--muted);
+      overflow-wrap: anywhere;
     }
-    .stats-graph-svg {
-      width: 100%;
-      height: auto;
-      min-height: 190px;
-      display: block;
-    }
-    .stats-graph-empty {
-      min-height: 190px;
-      display: grid;
-      place-items: center;
+	    .stats-graph-empty {
+	      min-height: 230px;
+	      display: grid;
+	      place-items: center;
       color: var(--muted);
       font-weight: 650;
     }
-    .stats-table-wrap {
-      overflow-x: auto;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-    }
+	    .stats-table-wrap {
+	      overflow: auto;
+	      max-width: 100%;
+	      max-height: min(320px, 34vh);
+	      border: 1px solid var(--line);
+	      border-radius: 6px;
+	    }
     .stats-table {
-      table-layout: auto;
-      min-width: 760px;
+      width: 100%;
+      table-layout: fixed;
+      min-width: 0;
+      border-collapse: collapse;
     }
     .stats-table th,
     .stats-table td {
       padding: 8px 10px;
       border-bottom: 1px solid var(--line);
-      white-space: nowrap;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      vertical-align: top;
     }
     .stats-table tbody tr:last-child td { border-bottom: 0; }
     .stats-table td:first-child { font-weight: 700; color: var(--ink); }
-    .stats-recent {
-      display: grid;
-      gap: 7px;
-      max-height: 260px;
-      overflow: auto;
+    .stats-section {
+      min-width: 0;
+      max-width: 100%;
+      overflow: hidden;
+    }
+	    .stats-recent {
+	      display: grid;
+	      gap: 7px;
+	      min-width: 0;
+	      max-width: 100%;
+	      max-height: 320px;
+	      overflow: auto;
       border: 1px solid var(--line);
       border-radius: 6px;
       padding: 8px;
@@ -7077,12 +10424,988 @@ class Handler(BaseHTTPRequestHandler):
     }
     .stats-event {
       display: grid;
-      grid-template-columns: 116px 1fr;
+      grid-template-columns: minmax(84px, 116px) minmax(0, 1fr);
+      gap: 10px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .stats-event strong {
+      min-width: 0;
+      color: var(--ink);
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .session-tabs {
+      margin-top: 14px;
+      display: flex;
+      align-items: stretch;
+      gap: 8px;
+      overflow-x: auto;
+      padding: 2px 0 4px;
+      scrollbar-width: thin;
+    }
+	    .session-tab {
+	      position: relative;
+	      width: auto;
+	      min-width: 170px;
+	      max-width: 280px;
+	      min-height: 46px;
+	      justify-content: flex-start;
+      align-items: flex-start;
+      flex-direction: column;
+      gap: 2px;
+      padding: 7px 10px;
+      border-radius: 7px;
+      text-align: left;
+      color: var(--muted);
+	      background: linear-gradient(180deg, var(--surface), var(--subtle));
+	      flex: 0 0 auto;
+	    }
+	    .session-tab.dragging {
+	      opacity: 0.52;
+	    }
+	    .session-tab.drop-before {
+	      box-shadow: inset 3px 0 0 var(--red), inset 0 1px 0 rgba(255, 255, 255, 0.62);
+	    }
+	    .session-tab.drop-after {
+	      box-shadow: inset -3px 0 0 var(--red), inset 0 1px 0 rgba(255, 255, 255, 0.62);
+	    }
+	    .session-tab.active {
+	      border-color: var(--amber);
+	      color: var(--ink);
+	    }
+    .session-tab.selected {
+      border-color: var(--red);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.62), 0 0 0 2px rgba(216, 52, 52, 0.1);
+    }
+    :root[data-theme="dark"] .session-tab.selected {
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 0 0 2px rgba(240, 82, 82, 0.18);
+    }
+    .session-tab-title {
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-weight: 780;
+      color: var(--ink);
+    }
+	    .session-tab-meta {
+	      max-width: 100%;
+	      overflow: hidden;
+	      text-overflow: ellipsis;
+	      font-size: 11px;
+	      color: var(--muted);
+	      padding-right: 18px;
+	    }
+	    .session-tab-close {
+	      position: absolute;
+	      top: 4px;
+	      right: 4px;
+	      display: inline-flex;
+	      align-items: center;
+	      justify-content: center;
+	      width: 20px;
+	      min-height: 20px;
+	      padding: 0;
+	      border-radius: 999px;
+	      color: var(--muted);
+	      background: transparent;
+	      border-color: transparent;
+	      box-shadow: none;
+	      font-size: 14px;
+	      line-height: 1;
+	      cursor: pointer;
+	    }
+	    .session-tab-close:hover:not(:disabled) {
+	      color: #fff;
+	      border-color: var(--red);
+	      background: linear-gradient(180deg, var(--red-hi), var(--red-low));
+	    }
+	    .session-tab.launch-tab {
+	      min-width: 64px;
+	      max-width: 64px;
+	      align-items: center;
+      justify-content: center;
+      text-align: center;
+      color: var(--ink);
+    }
+    .session-tab.launch-tab .session-tab-title {
+      font-size: 22px;
+      line-height: 1;
+    }
+    .session-tab.launch-tab .session-tab-meta {
+      font-size: 10px;
+      padding-right: 0;
+    }
+    .session-tabs-empty {
+      color: var(--muted);
+      border: 1px dashed var(--line);
+      border-radius: 7px;
+      background: var(--subtle);
+      padding: 9px 11px;
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .launcher-dock {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: var(--control-dock-top, 0);
+      bottom: 0;
+      z-index: 66;
+      pointer-events: none;
+    }
+    .launcher-dock[hidden] {
+      display: none;
+    }
+    .launcher-modal {
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      pointer-events: auto;
+    }
+    .launcher-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--soft);
+    }
+    .launcher-head h2 {
+      margin: 0;
+      font-size: 12px;
+      color: var(--ink);
+    }
+    .launcher-grid {
+      align-self: start;
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) minmax(150px, 210px) minmax(150px, 210px) auto;
+      align-items: end;
+      gap: 9px;
+      padding: 10px 12px;
+      background: var(--surface);
+    }
+    .launcher-field {
+      display: grid;
+      gap: 3px;
+      min-width: 130px;
+      flex: 0 1 auto;
+    }
+    .launcher-field.workdir {
+      min-width: min(100%, 220px);
+    }
+    .launcher-field.resume-session {
+      grid-column: 1 / 4;
+    }
+    .launcher-field[hidden] {
+      display: none;
+    }
+    .launcher-field span {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .launcher-field select {
+      min-height: 32px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--subtle);
+      color: var(--ink);
+      padding: 5px 8px;
+      max-width: 100%;
+    }
+    .launcher-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .launcher-actions button {
+      width: auto;
+      min-height: 32px;
+      padding: 4px 10px;
+    }
+    .control-dock {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: var(--control-dock-top, 0);
+      bottom: 0;
+      z-index: 65;
+      pointer-events: none;
+    }
+    .control-dock[hidden] { display: none; }
+    .control-modal {
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+      position: relative;
+      display: grid;
+      grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+	      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      pointer-events: auto;
+    }
+    .control-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--soft);
+    }
+    .control-title-block {
+      min-width: 0;
+      display: grid;
+      gap: 2px;
+    }
+    .control-head h2 {
+      margin: 0;
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+    .control-close {
+      width: 30px;
+      min-height: 30px;
+      padding: 0;
+      border-radius: 999px;
+      flex: 0 0 auto;
+    }
+    .control-head-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 7px;
+      flex-wrap: wrap;
+      flex: 0 0 auto;
+    }
+	    .control-head-actions button {
+	      width: auto;
+	      min-height: 30px;
+	      padding: 3px 9px;
+	      border-radius: 999px;
+	    }
+	    #controlForget {
+	      display: none;
+	    }
+    .control-turn-select {
+      min-height: 30px;
+      max-width: min(42vw, 360px);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--ink);
+      padding: 4px 8px;
+    }
+    .control-toolbar {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .control-view-tabs {
+      display: inline-flex;
+      gap: 6px;
+      flex: 0 0 auto;
+    }
+    .control-view-button {
+      width: auto;
+      min-height: 30px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      color: var(--muted);
+      background: linear-gradient(180deg, var(--surface), var(--subtle));
+    }
+    .control-view-button.active {
+      color: #fff;
+      border-color: var(--red);
+      background: linear-gradient(180deg, var(--red-hi), var(--red-low));
+      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.28);
+    }
+    .control-search {
+      flex: 1 1 260px;
+      min-width: 160px;
+      min-height: 30px;
+      padding: 5px 9px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--subtle);
+      color: var(--ink);
+    }
+	    .control-status-pills {
+	      display: flex;
+	      flex-wrap: wrap;
+	      align-items: center;
+	      gap: 6px;
+	      padding: 8px 12px 6px;
+	      background: var(--surface);
+	    }
+    .control-compact-quota {
+      display: inline-grid;
+      grid-template-columns: auto auto minmax(76px, 112px) auto;
+      align-items: center;
+      gap: 6px;
+      min-height: 24px;
+      max-width: 100%;
+      padding: 2px 7px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: linear-gradient(180deg, var(--surface), var(--subtle));
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 780;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.38);
+    }
+    :root[data-theme="dark"] .control-compact-quota {
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07);
+    }
+    .control-compact-quota.state,
+    .control-compact-quota.count {
+      grid-template-columns: auto auto;
+    }
+    .control-compact-quota-name {
+      color: var(--ink);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 92px;
+    }
+    .control-compact-quota-primary {
+      color: var(--green);
+      min-width: 30px;
+      text-align: right;
+    }
+    .control-compact-quota-weekly {
+      color: var(--blue);
+      min-width: 30px;
+    }
+    .control-compact-quota-text {
+      color: var(--muted);
+    }
+    .control-compact-quota-bar {
+      position: relative;
+      display: block;
+      width: 100%;
+      min-width: 76px;
+      height: 12px;
+      border: 1px solid var(--line);
+      background: var(--soft);
+      overflow: hidden;
+    }
+    .control-compact-quota-weekly-fill,
+    .control-compact-quota-primary-fill {
+      position: absolute;
+      left: 0;
+      bottom: 0;
+      display: block;
+      max-width: 100%;
+      transition: width 160ms ease;
+    }
+    .control-compact-quota-weekly-fill {
+      height: 12px;
+      background: linear-gradient(180deg, var(--blue-hi), var(--blue-low));
+    }
+    .control-compact-quota-primary-fill {
+      height: 8px;
+      background: linear-gradient(180deg, var(--green-hi), var(--green-low));
+    }
+	    .control-compact-quota.unlimited .control-compact-quota-bar,
+	    .control-compact-quota.unknown .control-compact-quota-bar {
+	      background: linear-gradient(90deg, rgba(59, 130, 214, 0.18), rgba(25, 135, 84, 0.16));
+	    }
+	    .control-compact-quota.secondary {
+	      opacity: 0.9;
+	    }
+    .control-content {
+      min-width: 0;
+      min-height: 0;
+      overflow: auto;
+      padding: 10px 12px 14px;
+      display: grid;
+      gap: 12px;
+    }
+    .control-modal.details-view .control-search,
+    .control-modal.resume-view .control-search,
+    .control-modal.details-view .control-compose,
+    .control-modal.resume-view .control-compose {
+      display: none;
+    }
+    .control-resume-list {
+      display: grid;
+      gap: 8px;
+    }
+    .control-resume-item {
+      width: 100%;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
+      gap: 10px;
+      padding: 9px 10px;
+      text-align: left;
+      white-space: normal;
+      border-radius: 6px;
+      background: linear-gradient(180deg, var(--surface), var(--subtle));
+    }
+    .control-resume-item.selected {
+      border-color: var(--red);
+      box-shadow: inset 3px 0 0 var(--red);
+    }
+    .control-resume-main {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+    .control-resume-label {
+      color: var(--ink);
+      font-weight: 760;
+      overflow-wrap: anywhere;
+    }
+    .control-resume-meta {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .control-resume-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    .control-resume-actions button {
+      width: auto;
+      min-width: 96px;
+      border-radius: 999px;
+    }
+    .control-detail-section {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+      overflow: hidden;
+    }
+    .control-detail-section h3 {
+      margin: 0;
+      padding: 8px 10px;
+      font-size: 12px;
+      text-transform: uppercase;
+      color: var(--muted);
+      letter-spacing: 0;
+      font-weight: 800;
+      background: var(--subtle);
+      border-bottom: 1px solid var(--line);
+    }
+    .control-section-body {
+      padding: 8px;
+      display: grid;
+      gap: 8px;
+    }
+    .control-active-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+      gap: 8px;
+    }
+    .control-active-card,
+    .control-event {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--subtle);
+      padding: 8px;
+      min-width: 0;
+    }
+    .control-active-card strong,
+    .control-event strong {
+      color: var(--ink);
+    }
+    .control-active-card {
+      color: var(--muted);
+      font-size: 12px;
+      display: grid;
+      gap: 4px;
+    }
+    .control-events {
+      display: grid;
+      gap: 7px;
+    }
+	    .control-transcript {
+	      display: grid;
+	      gap: 8px;
+	      min-width: 0;
+	    }
+	    .control-scroll-badge-row {
+	      position: sticky;
+	      z-index: 6;
+	      display: flex;
+	      pointer-events: none;
+	      height: 0;
+	    }
+	    .control-scroll-badge-row.top {
+	      top: 0;
+	      justify-content: flex-start;
+	    }
+	    .control-scroll-badge-row.bottom {
+	      bottom: 0;
+	      justify-content: flex-end;
+	    }
+	    .control-scroll-badge {
+	      width: auto;
+	      min-height: 24px;
+	      padding: 2px 8px;
+	      border-radius: 999px;
+	      border: 1px solid var(--line);
+	      color: var(--muted);
+	      background: linear-gradient(180deg, var(--surface), var(--subtle));
+	      box-shadow: var(--shadow);
+	      font-size: 11px;
+	      font-weight: 780;
+	      pointer-events: auto;
+	    }
+	    .control-scroll-badge[hidden] {
+	      display: none;
+	    }
+	    .control-transcript-window-note {
+	      color: var(--muted);
+	      font-size: 11px;
+	      font-weight: 650;
+	      text-align: center;
+	    }
+	    .control-message {
+	      display: grid;
+	      gap: 4px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--subtle);
+      padding: 8px;
+      min-width: 0;
+    }
+    .control-message.user {
+      border-left: 3px solid var(--red);
+    }
+    .control-message.user_pending {
+      border-left: 3px solid var(--amber);
+      background: linear-gradient(180deg, rgba(242, 189, 67, 0.08), var(--subtle));
+    }
+    .control-message.assistant {
+      border-left: 3px solid var(--green);
+    }
+    .control-message.assistant_progress {
+      border-left: 3px solid var(--blue);
+      background: linear-gradient(180deg, var(--surface), var(--subtle));
+    }
+    .control-message.assistant_activity {
+      border-left-width: 4px;
+    }
+    .control-message.resume {
+      border-left: 3px solid var(--amber);
+    }
+    .control-message.context_compaction {
+      border-left: 3px solid var(--blue);
+      background: linear-gradient(180deg, rgba(59, 130, 214, 0.08), var(--subtle));
+    }
+    .control-message.tool {
+      border-left: 3px solid var(--amber);
+    }
+    .control-message-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 750;
+    }
+    .control-message-turn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .control-message-spinner {
+      width: 11px;
+      height: 11px;
+      border: 2px solid var(--bar-bg);
+      border-top-color: var(--amber);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      flex: 0 0 auto;
+    }
+    .control-message-text {
+      min-width: 0;
+      max-width: 100%;
+      color: var(--ink);
+      font-size: 13px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      word-break: normal;
+    }
+    .control-message-text.plain {
+      white-space: pre-wrap;
+    }
+    .control-message-text.markdown {
+      min-width: 0;
+      max-width: 100%;
+      white-space: normal;
+    }
+    .control-message-text.markdown > :first-child { margin-top: 0; }
+    .control-message-text.markdown > :last-child { margin-bottom: 0; }
+    .control-message-text.markdown p,
+    .control-message-text.markdown ul,
+    .control-message-text.markdown ol,
+    .control-message-text.markdown blockquote,
+    .control-message-text.markdown pre,
+    .control-message-text.markdown table {
+      min-width: 0;
+      max-width: 100%;
+      margin: 0 0 8px;
+      overflow-wrap: anywhere;
+    }
+    .control-message-text.markdown h1,
+    .control-message-text.markdown h2,
+    .control-message-text.markdown h3,
+    .control-message-text.markdown h4 {
+      margin: 10px 0 6px;
+      color: var(--ink);
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+    .control-message-text.markdown h1 { font-size: 17px; }
+    .control-message-text.markdown h2 { font-size: 16px; }
+    .control-message-text.markdown h3 { font-size: 15px; }
+    .control-message-text.markdown h4 { font-size: 14px; }
+    .control-message-text.markdown ul,
+    .control-message-text.markdown ol {
+      padding-left: 22px;
+      box-sizing: border-box;
+      width: 100%;
+      overflow: hidden;
+    }
+    .control-message-text.markdown li {
+      min-width: 0;
+      max-width: 100%;
+      margin: 3px 0;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      white-space: normal;
+    }
+    .control-message-text.markdown blockquote {
+      padding: 3px 0 3px 10px;
+      border-left: 3px solid var(--line);
+      color: var(--muted);
+    }
+    .control-message-text.markdown code,
+    .control-message-text.markdown a {
+      padding: 2px 5px;
+      border: 1px solid rgba(59, 130, 214, 0.35);
+      border-radius: 4px;
+      background: linear-gradient(180deg, rgba(96, 165, 250, 0.14), rgba(96, 165, 250, 0.07));
+      color: var(--blue-low);
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.48);
+      white-space: normal;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .control-message-text.markdown a {
+      text-decoration: none;
+      font-weight: 760;
+    }
+    .control-message-text.markdown a:hover {
+      border-color: rgba(59, 130, 214, 0.55);
+      background: linear-gradient(180deg, rgba(96, 165, 250, 0.2), rgba(96, 165, 250, 0.11));
+    }
+    :root[data-theme="dark"] .control-message-text.markdown code,
+    :root[data-theme="dark"] .control-message-text.markdown a {
+      border-color: rgba(127, 184, 255, 0.32);
+      background: linear-gradient(180deg, rgba(96, 165, 250, 0.16), rgba(96, 165, 250, 0.09));
+      color: var(--blue-hi);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07);
+    }
+    .control-message-text.markdown pre {
+      max-width: 100%;
+      overflow-x: hidden;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .control-message-text.markdown pre code {
+      display: block;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    .control-message-text.markdown table {
+      display: block;
+      width: max-content;
+      max-width: 100%;
+      overflow-x: auto;
+      border-collapse: collapse;
+      table-layout: auto;
+    }
+    .control-message-text.markdown th,
+    .control-message-text.markdown td {
+      padding: 5px 7px;
+      border: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+    }
+    .control-message-text.markdown th {
+      background: var(--surface);
+      color: var(--ink);
+      font-size: 12px;
+      text-transform: none;
+    }
+    .control-message.assistant_progress .control-message-text,
+    .control-message.tool .control-message-text {
+      padding-left: 8px;
+      border-left: 1px solid var(--line);
+    }
+    .control-show-more {
+      width: auto;
+      min-height: 26px;
+      justify-self: start;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      color: var(--muted);
+      background: var(--surface);
+    }
+    .control-show-more:hover {
+      color: var(--ink);
+      border-color: var(--red);
+    }
+    .control-activity-parts {
+      display: grid;
+      gap: 8px;
+    }
+	    .control-tool-block {
+	      display: grid;
+	      gap: 7px;
+	      margin-left: 14px;
+	      padding: 8px 9px;
+	      border: 1px solid var(--line);
+      border-left: 4px solid var(--amber);
+      background: linear-gradient(180deg, var(--surface), var(--subtle));
+      color: var(--ink);
+	      white-space: pre-wrap;
+	      overflow-wrap: anywhere;
+	    }
+	    .control-tool-summary {
+	      display: flex;
+	      align-items: center;
+	      justify-content: space-between;
+	      gap: 8px;
+	      min-width: 0;
+	    }
+	    .control-tool-title {
+	      display: inline-flex;
+	      align-items: center;
+	      gap: 6px;
+	      min-width: 0;
+	      font-weight: 800;
+	      color: var(--ink);
+	    }
+	    .control-tool-title code {
+	      max-width: min(100%, 48vw);
+	      overflow: hidden;
+	      text-overflow: ellipsis;
+	      border: 1px solid rgba(183, 121, 31, 0.35);
+	      border-radius: 4px;
+	      padding: 1px 5px;
+	      background: rgba(183, 121, 31, 0.1);
+	      color: var(--ink);
+	      font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+	    }
+	    .control-tool-status {
+	      flex: 0 0 auto;
+	      border: 1px solid var(--line);
+	      border-radius: 999px;
+	      padding: 1px 7px;
+	      color: var(--muted);
+	      background: var(--surface);
+	      font-size: 11px;
+	      font-weight: 780;
+	    }
+	    .control-tool-status.completed {
+	      border-color: rgba(25, 135, 84, 0.34);
+	      color: var(--green);
+	      background: rgba(25, 135, 84, 0.08);
+	    }
+	    .control-tool-status.in_progress {
+	      border-color: rgba(59, 130, 214, 0.34);
+	      color: var(--blue);
+	      background: rgba(59, 130, 214, 0.08);
+	    }
+	    .control-tool-command {
+	      min-width: 0;
+	      padding: 5px 7px;
+	      border: 1px solid var(--line);
+	      border-radius: 5px;
+	      background: var(--subtle);
+	      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+	      overflow-wrap: anywhere;
+	      white-space: pre-wrap;
+	    }
+	    .control-tool-sections {
+	      display: grid;
+	      gap: 6px;
+	    }
+	    .control-tool-section {
+	      display: grid;
+	      gap: 3px;
+	    }
+	    .control-tool-section-label {
+	      color: var(--muted);
+	      font-size: 11px;
+	      font-weight: 800;
+	      text-transform: uppercase;
+	    }
+	    .control-tool-section pre {
+	      margin: 0;
+	      min-width: 0;
+	      max-height: 220px;
+	      overflow: auto;
+	      padding: 6px 7px;
+	      border: 1px solid var(--line);
+	      border-radius: 5px;
+	      background: var(--surface);
+	      color: var(--ink);
+	      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+	      white-space: pre-wrap;
+	      overflow-wrap: anywhere;
+	      word-break: break-word;
+	    }
+	    .control-tool-block .control-message-text {
+	      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+	      font-size: 12px;
+      line-height: 1.45;
+    }
+    .control-tool-block.control-signal {
+      border-left-color: var(--line);
+      color: var(--muted);
+      opacity: 0.76;
+    }
+    .control-tool-block strong {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+    .control-tool-section.patch pre {
+      background: color-mix(in srgb, var(--surface) 88%, var(--blue) 12%);
+    }
+    .tool-patch-line {
+      display: block;
+      min-height: 1.35em;
+    }
+    .tool-patch-line.meta {
+      color: var(--muted);
+      font-weight: 800;
+    }
+    .tool-patch-line.add {
+      color: var(--green);
+      background: rgba(25, 135, 84, 0.08);
+    }
+    .tool-patch-line.delete {
+      color: var(--red);
+      background: rgba(204, 70, 70, 0.08);
+    }
+    .control-message.compact .control-message-text {
+      overflow: hidden;
+      max-height: 5.8em;
+    }
+    .control-message.compact .control-message-text.plain {
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      max-height: none;
+    }
+    .control-message.compact .control-message-text.expanded {
+      overflow: visible;
+      max-height: none;
+    }
+    .control-message.compact .control-message-text.expanded.plain {
+      white-space: pre-wrap;
+      text-overflow: clip;
+    }
+    @media (max-width: 640px) {
+      .control-tool-block {
+        margin-left: 8px;
+      }
+    }
+    .control-event {
+      display: grid;
+      grid-template-columns: 126px minmax(0, 1fr);
       gap: 10px;
       color: var(--muted);
       font-size: 12px;
     }
-    .stats-event strong { color: var(--ink); }
+    .control-event.compact {
+      grid-template-columns: 112px minmax(0, 1fr);
+      padding: 6px 8px;
+    }
+    .control-event-detail {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+    .control-event-detail span {
+      overflow-wrap: anywhere;
+    }
+    .control-empty {
+      color: var(--muted);
+      border: 1px dashed var(--line);
+      border-radius: 6px;
+      padding: 12px;
+      text-align: center;
+      font-weight: 650;
+    }
+	    .control-compose {
+	      border-top: 1px solid var(--line);
+	      padding: 8px 12px;
+	      display: grid;
+	      grid-template-columns: minmax(0, 1fr) auto;
+	      gap: 10px;
+	      background: var(--soft);
+	      position: sticky;
+	      bottom: 0;
+	      z-index: 2;
+	    }
+    .control-compose textarea {
+      min-height: 42px;
+      height: 54px;
+      max-height: min(180px, 28vh);
+      resize: vertical;
+      padding: 8px 9px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface);
+      color: var(--ink);
+      font: inherit;
+    }
+    .control-compose button {
+      width: auto;
+      min-width: 92px;
+      align-self: stretch;
+    }
     .profiles {
       margin-top: 18px;
       background: var(--surface);
@@ -7539,15 +11862,58 @@ class Handler(BaseHTTPRequestHandler):
 	      line-height: 1.15;
 	      white-space: nowrap;
 	    }
-	    .quota-reset-credit-pill:hover {
-	      border-color: #8f5c10;
-	      filter: brightness(0.98);
-	    }
-	    :root[data-theme="dark"] .quota-reset-credit-pill {
-	      color: #261901;
-	      background: linear-gradient(180deg, #f0ca58, #cf981f);
-	      border-color: #f0cf66;
-	    }
+		    .quota-reset-credit-pill:hover {
+		      border-color: #8f5c10;
+		      filter: brightness(0.98);
+		    }
+		    .quota-reset-credit-pill.disabled {
+		      display: inline-flex;
+		      align-items: center;
+		      border-color: var(--line);
+		      color: var(--muted);
+		      background: var(--button-disabled-bg);
+		      box-shadow: none;
+		      cursor: not-allowed;
+		    }
+		    .quota-reset-credit-pill.disabled:hover {
+		      border-color: var(--line);
+		      filter: none;
+		    }
+		    :root[data-theme="dark"] .quota-reset-credit-pill {
+		      color: #261901;
+		      background: linear-gradient(180deg, #f0ca58, #cf981f);
+		      border-color: #f0cf66;
+		    }
+		    :root[data-theme="dark"] .quota-reset-credit-pill.disabled {
+		      color: var(--muted);
+		      background: var(--button-disabled-bg);
+		      border-color: var(--line);
+		      box-shadow: none;
+		    }
+		    :root[data-theme="dark"] .quota-reset-credit-pill:hover {
+		      background: linear-gradient(180deg, #ffd76f, #dda52c);
+		      border-color: #ffe08a;
+		      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.32), 0 0 0 2px rgba(240, 207, 102, 0.16);
+		    }
+		    :root[data-theme="dark"] .quota-reset-credit-pill.disabled:hover {
+		      color: var(--muted);
+		      background: var(--button-disabled-bg);
+		      border-color: var(--line);
+		      box-shadow: none;
+		    }
+		    @media (prefers-color-scheme: dark) {
+		      :root:not([data-theme]) .quota-reset-credit-pill:hover {
+		        background: linear-gradient(180deg, #ffd76f, #dda52c);
+		        border-color: #ffe08a;
+		        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.32), 0 0 0 2px rgba(240, 207, 102, 0.16);
+		      }
+		      :root:not([data-theme]) .quota-reset-credit-pill.disabled:hover {
+		        color: var(--muted);
+		        background: var(--button-disabled-bg);
+		        border-color: var(--line);
+		        box-shadow: none;
+		      }
+		    }
     .quota-bucket {
 	      border: 1px solid var(--line);
 	      border-radius: 0;
@@ -7892,6 +12258,12 @@ class Handler(BaseHTTPRequestHandler):
 	        width: 100%;
 	      }
 	      .action-note { grid-column: 1 / -1; margin: 0; }
+	      .launcher-grid {
+	        grid-template-columns: 1fr;
+	      }
+	      .launcher-field.resume-session {
+	        grid-column: auto;
+	      }
 	      .stats-modal table { display: table; width: 100%; }
 	      .stats-modal thead { display: table-header-group; }
 	      .stats-modal tbody { display: table-row-group; }
@@ -7901,6 +12273,17 @@ class Handler(BaseHTTPRequestHandler):
 	        display: table-cell;
 	        width: auto;
 	        padding: 8px 10px;
+	      }
+	      .control-active-grid { grid-template-columns: 1fr; }
+	      .control-event,
+	      .control-event.compact {
+	        grid-template-columns: 1fr;
+	      }
+	      .control-compose {
+	        grid-template-columns: 1fr;
+	      }
+	      .control-compose button {
+	        width: 100%;
 	      }
 	    }
   </style>
@@ -7920,9 +12303,76 @@ class Handler(BaseHTTPRequestHandler):
 	        <button id="statsToggle" class="stats-toggle" type="button" aria-label="Open stats" title="Open stats"></button>
 	        <button id="themeToggle" class="theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle color theme"></button>
 	      </div>
-	    </header>
+    </header>
     <div id="message" class="message" aria-live="polite"></div>
-    <div id="statsModal" class="modal-backdrop" hidden>
+    <section id="sessionTabs" class="session-tabs" aria-label="Provision-managed Codex CLI sessions"></section>
+    <section id="launcherBar" class="launcher-dock" aria-label="Launch Codex CLI session" hidden>
+      <div class="launcher-modal" role="dialog" aria-modal="false" aria-labelledby="launcherTitle">
+        <div class="launcher-head">
+          <h2 id="launcherTitle">Launch Codex CLI</h2>
+          <button id="launcherClose" class="control-close" type="button" aria-label="Close launcher">x</button>
+        </div>
+        <div class="launcher-grid">
+          <label class="launcher-field workdir">
+            <span>Workdir</span>
+            <select id="launcherSession"></select>
+          </label>
+          <label class="launcher-field">
+            <span>Mode</span>
+            <select id="launcherMode">
+              <option value="new">New session</option>
+              <option value="resume-last">Resume latest</option>
+              <option value="resume-session">Resume selected</option>
+            </select>
+          </label>
+          <label class="launcher-field">
+            <span>Permissions</span>
+            <select id="launcherPermission">
+              <option value="workspace-write">Workspace write</option>
+              <option value="read-only">Read only</option>
+              <option value="full-access">Full access</option>
+              <option value="bypass">Bypass prompts</option>
+            </select>
+          </label>
+          <div class="launcher-actions">
+            <button id="launcherStart" type="button">Launch</button>
+          </div>
+          <label id="launcherResumeField" class="launcher-field resume-session" hidden>
+            <span>Resume Session</span>
+            <select id="launcherResumeSession"></select>
+          </label>
+        </div>
+      </div>
+    </section>
+    <div id="controlModal" class="control-dock" hidden>
+      <section class="control-modal" role="dialog" aria-modal="false" aria-labelledby="controlTitle">
+        <div class="control-head">
+          <div class="control-title-block">
+            <h2 id="controlTitle">Session</h2>
+          </div>
+          <div class="control-head-actions">
+            <select id="controlTurnSelect" class="control-turn-select" aria-label="Observed turn"></select>
+            <button id="controlForget" type="button">Forget</button>
+            <button id="controlClose" class="control-close" type="button" aria-label="Close session">x</button>
+          </div>
+	        </div>
+	        <div id="controlStatusPills" class="control-status-pills"></div>
+	        <div class="control-toolbar">
+          <div class="control-view-tabs" role="tablist" aria-label="Session view">
+            <button id="controlDiscussionView" class="control-view-button active" type="button" data-control-view="discussion">Discussion</button>
+            <button id="controlDetailsView" class="control-view-button" type="button" data-control-view="details">Session Details</button>
+            <button id="controlResumeView" class="control-view-button" type="button" data-control-view="resume">Resume</button>
+          </div>
+          <input id="controlSearch" class="control-search" type="search" placeholder="Search discussion">
+        </div>
+        <div id="controlContent" class="control-content"></div>
+        <form id="controlCompose" class="control-compose">
+          <textarea id="controlPrompt" placeholder="Live CLI input is not connected yet" disabled></textarea>
+          <button id="controlSend" type="submit" disabled>Send</button>
+        </form>
+      </section>
+    </div>
+    <div id="statsModal" class="modal-backdrop stats-backdrop" hidden>
       <section class="stats-modal" role="dialog" aria-modal="true" aria-labelledby="statsTitle">
         <div class="stats-head">
           <h2 id="statsTitle">Stats</h2>
@@ -7931,6 +12381,17 @@ class Handler(BaseHTTPRequestHandler):
         <div id="statsContent" class="stats-content"></div>
       </section>
     </div>
+    <div id="confirmModal" class="modal-backdrop" hidden>
+      <section class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+        <h2 id="confirmTitle">Confirm action</h2>
+        <p id="confirmMessage"></p>
+        <div class="confirm-actions">
+          <button id="confirmCancel" type="button">Cancel</button>
+          <button id="confirmAccept" class="danger" type="button">Confirm</button>
+        </div>
+      </section>
+    </div>
+    <div id="uiTooltip" class="ui-tooltip" hidden></div>
     <section class="profiles">
       <table>
         <colgroup>
@@ -7951,15 +12412,46 @@ class Handler(BaseHTTPRequestHandler):
 	    const INITIAL = __INITIAL_STATE__;
 	    const LOGIN_BROWSER_REMOTE_NOTE = __LOGIN_BROWSER_REMOTE_NOTE__;
 	    const THEME_KEY = "provision-theme";
-	    const SUN_ICON = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path><path d="M12 20v2"></path><path d="m4.93 4.93 1.41 1.41"></path><path d="m17.66 17.66 1.41 1.41"></path><path d="M2 12h2"></path><path d="M20 12h2"></path><path d="m6.34 17.66-1.41 1.41"></path><path d="m19.07 4.93-1.41 1.41"></path></svg>';
-	    const MOON_ICON = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20.5 14.4A7.5 7.5 0 0 1 9.6 3.5 8.5 8.5 0 1 0 20.5 14.4Z"></path></svg>';
-	    const CHART_ICON = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 3v18h18"></path><path d="m7 15 4-4 3 3 5-7"></path><path d="M19 7v5h-5"></path></svg>';
-	    let socket = null;
+		    const SUN_ICON = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path><path d="M12 20v2"></path><path d="m4.93 4.93 1.41 1.41"></path><path d="m17.66 17.66 1.41 1.41"></path><path d="M2 12h2"></path><path d="M20 12h2"></path><path d="m6.34 17.66-1.41 1.41"></path><path d="m19.07 4.93-1.41 1.41"></path></svg>';
+		    const MOON_ICON = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20.5 14.4A7.5 7.5 0 0 1 9.6 3.5 8.5 8.5 0 1 0 20.5 14.4Z"></path></svg>';
+		    const CHART_ICON = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 3v18h18"></path><path d="m7 15 4-4 3 3 5-7"></path><path d="M19 7v5h-5"></path></svg>';
+		    const CONTROL_TRANSCRIPT_WINDOW_SIZE = 80;
+		    const CONTROL_TRANSCRIPT_WINDOW_STEP = 40;
+		    let socket = null;
 	    let reconnectTimer = null;
 	    let latestLiveBusy = Boolean(INITIAL.status && INITIAL.status.live_busy);
 	    let latestStats = INITIAL.status && INITIAL.status.stats ? INITIAL.status.stats : { profiles: [], recent: [] };
 	    let latestModelCatalog = INITIAL.status && Array.isArray(INITIAL.status.model_catalog) ? INITIAL.status.model_catalog : [];
+	    let latestControlPlane = INITIAL.status && INITIAL.status.control_plane ? INITIAL.status.control_plane : { sessions: [] };
+	    let latestCodex = INITIAL.status && INITIAL.status.codex ? INITIAL.status.codex : {};
+	    let selectedControlSessionKey = "";
+		    let selectedLauncherSessionKey = "";
+		    let draggedSessionTabKey = "";
+		    let launcherPanelOpen = false;
+		    let launcherMode = "new";
+		    let launcherPermission = "workspace-write";
+		    let launcherResumeSessionId = "";
+		    let controlSearchText = "";
+		    let controlView = "discussion";
+			    let controlPromptHistoryIndex = null;
+			    let controlPromptHistorySessionKey = "";
+		    let controlPromptHistoryDraft = "";
+		    let pendingControlRender = false;
+		    let renderedControlScrollKey = "";
+		    let controlRenderDeferredAt = 0;
+		    let controlRenderDeferTimer = null;
+		    let controlTurnSelectInteracting = false;
+		    const controlScrollPositions = {};
+		    const controlInnerScrollPositions = {};
+		    const controlTranscriptWindows = {};
+		    const expandedControlMessages = {};
+		    const selectedControlTurnKeys = {};
+		    const manuallySelectedControlTurnKeys = {};
+		    const latestObservedUserKeys = {};
+		    const followLatestTurnAfterUserInput = {};
+		    const selectedResumeCandidateIds = {};
 	    const statsVisibleProfiles = {};
+	    let pendingConfirmation = null;
 		    let openPinMenuProfile = null;
 		    let openModelMenuProfile = null;
 		    let openLoginMenuProfile = null;
@@ -7981,6 +12473,423 @@ class Handler(BaseHTTPRequestHandler):
         "'": "&#39;"
       })[char]);
     }
+
+	    function normalizeControlMessageTextForDisplay(value, role) {
+	      let text = String(value || "").replace(/\r\n?/g, "\n");
+	      if (["user", "user_pending", "resume", "context_compaction"].includes(String(role || ""))) {
+	        text = text.replace(/^[\s\uFEFF\u200B\u200C\u200D]+|[\s\uFEFF\u200B\u200C\u200D]+$/g, "");
+	      }
+	      return text;
+	    }
+
+	    function safeMarkdownHref(value) {
+	      const raw = String(value || "").trim();
+	      if (!raw) return "";
+	      if (raw.startsWith("#")) return escapeHtml(raw);
+	      try {
+	        const parsed = new URL(raw, window.location.href);
+	        if (!["http:", "https:", "mailto:"].includes(parsed.protocol)) return "";
+	      } catch {
+	        return "";
+	      }
+	      return escapeHtml(raw);
+	    }
+
+	    function restoreMarkdownTokens(html, inserts) {
+	      return html.replace(/\u0000(\d+)\u0000/g, (_match, index) => inserts[Number(index)] || "");
+	    }
+
+	    function renderMarkdownInline(value) {
+	      const inserts = [];
+	      const token = (html) => {
+	        inserts.push(html);
+	        return `\u0000${inserts.length - 1}\u0000`;
+	      };
+	      let text = String(value || "");
+	      text = text.replace(/`([^`\n]+)`/g, (_match, code) => (
+	        token(`<code>${escapeHtml(code)}</code>`)
+	      ));
+	      text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (match, label, href) => {
+	        const safeHref = safeMarkdownHref(href);
+	        if (!safeHref) {
+	          const rawHref = String(href || "").trim();
+	          if (/^(?:\/|~\/|\.{1,2}\/)/.test(rawHref)) {
+	            return token(`<code class="markdown-file-ref" title="${escapeHtml(rawHref)}">${escapeHtml(label)}</code>`);
+	          }
+	          return match;
+	        }
+	        return token(`<a href="${safeHref}" target="_blank" rel="noreferrer">${renderMarkdownInline(label)}</a>`);
+	      });
+	      text = text.replace(/(^|[\s([{,;])([A-Za-z_][A-Za-z0-9_.-]*=[A-Za-z0-9_./:-]+)/g, (_match, prefix, assignment) => (
+	        `${prefix}${token(`<code>${escapeHtml(assignment)}</code>`)}`
+	      ));
+	      let html = escapeHtml(text);
+	      html = html.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+	      html = html.replace(/__([^_\n]+)__/g, "<strong>$1</strong>");
+	      html = html.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+	      html = html.replace(/(^|[\s(])\*([^*\n]+)\*(?=$|[\s).,;:!?])/g, "$1<em>$2</em>");
+	      html = html.replace(/(^|[\s(])_([^_\n]+)_(?=$|[\s).,;:!?])/g, "$1<em>$2</em>");
+	      return restoreMarkdownTokens(html, inserts);
+	    }
+
+		    function repairStreamedMarkdownSource(value) {
+		      let source = String(value || "").replace(/\r\n?/g, "\n");
+		      source = source.replace(/\[\s*\n{2,}\s*([^\]\n]{1,160}?)\s*\]/g, (_match, label) => `[${label.trim()}]`);
+		      source = source.replace(/\[([^\]\n]{1,120}?)\s*\n{2,}\s*([^\]\n]{1,120}?)\]/g, (_match, left, right) => {
+		        const label = `${left.trim()}${right.trim()}`;
+		        return label.length <= 180 ? `[${label}]` : _match;
+		      });
+		      source = source.replace(/\]\s*\n{2,}\s*\(([^)\n]{1,500})\)/g, (_match, href) => `](${href.trim()})`);
+		      source = source.replace(/\bx\n{2,}Unit\b/g, "xUnit");
+		      return source;
+		    }
+
+	    function normalizeMarkdownSource(value) {
+	      const lines = repairStreamedMarkdownSource(value).split("\n");
+	      let inFence = false;
+	      let fenceLanguage = "";
+	      let repairFenceLines = false;
+	      let passthroughMarkdownFence = false;
+	      let yamlRepairStack = [];
+	      let jsonRepairIndent = 0;
+	      const normalizeFenceCodeLine = (line, lang) => {
+	        const raw = String(line || "");
+	        if (/^json$/i.test(lang)) {
+	          const rendered = [];
+	          for (const rawLine of raw.split("\n")) {
+	            let text = rawLine.trim();
+	            if (!text) {
+	              rendered.push("");
+	              continue;
+	            }
+	            const trailingClosers = [];
+	            while (!/^[}\]],?$/.test(text)) {
+	              const closeMatch = text.match(/^(.*\S)\s*([}\]])(,?)$/);
+	              if (!closeMatch) break;
+	              text = closeMatch[1].trimEnd();
+	              trailingClosers.unshift(`${closeMatch[2]}${closeMatch[3] || ""}`);
+	            }
+	            while (/^[}\]]/.test(text)) {
+	              jsonRepairIndent = Math.max(0, jsonRepairIndent - 1);
+	              const close = text.slice(0, text[1] === "," ? 2 : 1);
+	              rendered.push(`${" ".repeat(jsonRepairIndent * 2)}${close}`);
+	              text = text.slice(close.length).trim();
+	            }
+	            if (text) {
+	              rendered.push(`${" ".repeat(jsonRepairIndent * 2)}${text}`);
+	              if (/[{[]\s*,?$/.test(text)) {
+	                jsonRepairIndent += 1;
+	              }
+	            }
+	            for (const close of trailingClosers) {
+	              jsonRepairIndent = Math.max(0, jsonRepairIndent - 1);
+	              rendered.push(`${" ".repeat(jsonRepairIndent * 2)}${close}`);
+	            }
+	          }
+	          return rendered.join("\n");
+	        }
+	        if (/^(?:yaml|yml)$/i.test(lang)) {
+	          const matches = Array.from(raw.matchAll(/[A-Za-z_][A-Za-z0-9_-]*:/g));
+	          if (!matches.length) return raw;
+	          const parentKeys = new Set(["launcher", "quota", "resume", "metadata"]);
+	          const rendered = [];
+	          for (let index = 0; index < matches.length; index += 1) {
+	            const match = matches[index];
+	            const next = matches[index + 1];
+	            const segment = raw.slice(match.index, next ? next.index : undefined).trim();
+	            const colon = segment.indexOf(":");
+	            if (colon < 0) continue;
+	            const key = segment.slice(0, colon).trim();
+	            const value = segment.slice(colon + 1).trim();
+	            let indent = Math.max(0, yamlRepairStack.length) * 2;
+	            if (!value) {
+	              if (!yamlRepairStack.length || key === "session") {
+	                indent = 0;
+	                yamlRepairStack = [key];
+	              } else if (parentKeys.has(key) && yamlRepairStack[0] === "session") {
+	                indent = 2;
+	                yamlRepairStack = ["session", key];
+	              } else {
+	                yamlRepairStack.push(key);
+	              }
+	            }
+	            rendered.push(`${" ".repeat(indent)}${key}:${value ? ` ${value}` : ""}`);
+	          }
+	          return rendered.join("\n");
+	        }
+	        if (/^(?:text|txt)$/i.test(lang)) {
+	          return raw.replace(/(\S)(\d{2}:\d{2}:\d{2}\s+)/g, "$1\n$2");
+	        }
+	        return raw;
+	      };
+	      const normalizeLine = (line, options = {}) => {
+	        let normalized = line;
+	        if (options.markdownPassthrough) {
+	          normalized = normalized.replace(/\s*```\s*$/, "");
+	          normalized = normalized.replace(/^(#{1,4}\s+)([A-Z][A-Za-z0-9_./:+ -]*?)-\s+([A-Z0-9].*)$/, "$1$2\n\n- $3");
+	          normalized = normalized.replace(/^(#{1,4}\s+)([A-Z][A-Za-z0-9_./:+-]*?)([A-Z][a-z].*)$/, "$1$2\n\n$3");
+	          normalized = normalized.replace(/([A-Za-z0-9`)])-\s+([A-Z][A-Za-z0-9])/g, "$1\n- $2");
+	        }
+	        normalized = normalized.replace(/^(#{1,4}\s+.*?)(Working directory:\s*)/i, "$1\n\n$2");
+	        normalized = normalized.replace(/(Working directory:\s+.*?)(Current status:)/i, "$1\n\n$2");
+	        normalized = normalized.replace(/([^#\n])\s*(#{1,4}\s+\S)/g, "$1\n\n$2");
+	        normalized = normalized.replace(/([^\n])\s*([-*+]\s+\[[ xX]\]\s+\S)/g, "$1\n$2");
+	        normalized = normalized.replace(/([^\n])\s*([-*+]\s+\*\*\S)/g, "$1\n$2");
+	        normalized = normalized.replace(/([.!?:])\s*([-*+]\s+\S)/g, "$1\n$2");
+	        return normalized;
+	      };
+	      return lines.map((line) => {
+	        const malformedFence = !inFence
+	          ? line.match(/^\s*```(markdown|md|json|yaml|yml|toml|ini|bash|sh|shell|python|py|javascript|js|typescript|ts|html|css|xml|sql|text|txt)(?=\S)(.*)$/i)
+	          : null;
+	        if (malformedFence) {
+	          const lang = malformedFence[1] || "";
+	          const rest = malformedFence[2] || "";
+	          if (/^(?:md|markdown)$/i.test(lang)) {
+	            passthroughMarkdownFence = true;
+	            return normalizeLine(rest, { markdownPassthrough: true });
+	          }
+	          inFence = true;
+	          fenceLanguage = lang;
+	          repairFenceLines = true;
+	          yamlRepairStack = [];
+	          jsonRepairIndent = 0;
+	          const trailingFence = rest.match(/^(.*\S)\s*```\s*$/);
+	          if (trailingFence) {
+	            inFence = false;
+	            fenceLanguage = "";
+	            repairFenceLines = false;
+	            const repaired = normalizeFenceCodeLine(trailingFence[1], lang);
+	            yamlRepairStack = [];
+	            jsonRepairIndent = 0;
+	            return `\`\`\`${lang}\n${repaired}\n\`\`\``;
+	          }
+	          return `\`\`\`${lang}\n${normalizeFenceCodeLine(rest, lang)}`;
+	        }
+	        if (passthroughMarkdownFence) {
+	          if (/^\s*```\s*$/.test(line)) {
+	            passthroughMarkdownFence = false;
+	            return "";
+	          }
+	          const trailingFence = line.match(/^(.*\S)\s*```\s*$/);
+	          if (trailingFence) {
+	            passthroughMarkdownFence = false;
+	            return normalizeLine(trailingFence[1], { markdownPassthrough: true });
+	          }
+	          return normalizeLine(line, { markdownPassthrough: true });
+	        }
+	        if (/^\s*```/.test(line)) {
+	          inFence = !inFence;
+	          fenceLanguage = inFence ? (line.trim().match(/^```([A-Za-z0-9_.+-]*)/) || [])[1] || "" : "";
+	          repairFenceLines = false;
+	          yamlRepairStack = [];
+	          jsonRepairIndent = 0;
+	          return line;
+	        }
+	        if (inFence) {
+	          const trailingFence = line.match(/^(.*\S)\s*```\s*$/);
+	          if (trailingFence) {
+	            inFence = false;
+	            const repaired = repairFenceLines
+	              ? normalizeFenceCodeLine(trailingFence[1], fenceLanguage)
+	              : trailingFence[1];
+	            fenceLanguage = "";
+	            repairFenceLines = false;
+	            yamlRepairStack = [];
+	            jsonRepairIndent = 0;
+	            return `${repaired}\n\`\`\``;
+	          }
+	          return repairFenceLines ? normalizeFenceCodeLine(line, fenceLanguage) : line;
+	        }
+	        return normalizeLine(line);
+	      }).join("\n");
+	    }
+
+	    function markdownBlockStarts(lines, index) {
+	      const line = lines[index] || "";
+	      const next = lines[index + 1] || "";
+	      return (
+	        /^```/.test(line.trim())
+	        || /^\s{0,3}#{1,4}\s+/.test(line)
+	        || /^\s{0,3}>\s?/.test(line)
+	        || /^\s*([-*+])\s+/.test(line)
+	        || /^\s*\d+\.\s+/.test(line)
+	        || /^\s{0,3}[-*_](?:\s*[-*_]){2,}\s*$/.test(line)
+	        || markdownTableStarts(line, next)
+	      );
+	    }
+
+	    function markdownTableStarts(line, next) {
+	      return line.includes("|") && /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(next || "");
+	    }
+
+	    function markdownTableCells(line) {
+	      let text = String(line || "").trim();
+	      if (text.startsWith("|")) text = text.slice(1);
+	      if (text.endsWith("|")) text = text.slice(0, -1);
+	      return text.split("|").map((cell) => cell.trim());
+	    }
+
+	    function renderMarkdownTable(lines, index) {
+	      const headers = markdownTableCells(lines[index]);
+	      let cursor = index + 2;
+	      const rows = [];
+	      while (cursor < lines.length && lines[cursor].includes("|") && lines[cursor].trim()) {
+	        rows.push(markdownTableCells(lines[cursor]));
+	        cursor += 1;
+	      }
+	      const head = headers.map((cell) => `<th>${renderMarkdownInline(cell)}</th>`).join("");
+	      const body = rows.map((row) => (
+	        `<tr>${headers.map((_header, cellIndex) => `<td>${renderMarkdownInline(row[cellIndex] || "")}</td>`).join("")}</tr>`
+	      )).join("");
+	      return {
+	        html: `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`,
+	        index: cursor
+	      };
+	    }
+
+	    function markdownIndentedCodeLines(lines, index) {
+	      const codeLines = [];
+	      let cursor = index;
+	      while (cursor < lines.length && (/^(?: {4}|\t)/.test(lines[cursor]) || !lines[cursor].trim())) {
+	        if (!lines[cursor].trim()) {
+	          codeLines.push("");
+	        } else {
+	          codeLines.push(lines[cursor].replace(/^(?: {4}|\t)/, ""));
+	        }
+	        cursor += 1;
+	      }
+	      while (codeLines.length && !codeLines[codeLines.length - 1]) codeLines.pop();
+	      return { codeLines, index: cursor };
+	    }
+
+	    function markdownIndentedCodeLooksIntentional(codeLines) {
+	      const meaningful = codeLines.map((line) => line.trim()).filter(Boolean);
+	      if (!meaningful.length) return false;
+	      const strongCodeLine = meaningful.some((line) => (
+	        /^[$>#]\s+/.test(line)
+	        || /\s--?[A-Za-z0-9][\w-]*/.test(line)
+	        || /(?:[{}[\];=]|=>|<\/?\w|&&|\|\|)/.test(line)
+	      ));
+	      const commandShaped = meaningful.every((line) => (
+	        /^[A-Za-z0-9_./-]+(?:\s+[A-Za-z0-9_./:-]+){0,8}$/.test(line)
+	      ));
+	      const proseLike = meaningful.some((line) => (
+	        line.split(/\s+/).length >= 10
+	        && /[,.!?;:]/.test(line)
+	        && !/\s--?[A-Za-z0-9][\w-]*/.test(line)
+	      ));
+	      return !proseLike && (strongCodeLine || (meaningful.length <= 4 && commandShaped));
+	    }
+
+	    function renderMarkdown(value) {
+	      const lines = normalizeMarkdownSource(value).split("\n");
+	      const blocks = [];
+	      let index = 0;
+	      while (index < lines.length) {
+	        const line = lines[index];
+	        const trimmed = line.trim();
+	        if (!trimmed) {
+	          index += 1;
+	          continue;
+	        }
+	        if (/^(?: {4}|\t)/.test(line)) {
+	          const rendered = markdownIndentedCodeLines(lines, index);
+	          if (markdownIndentedCodeLooksIntentional(rendered.codeLines)) {
+	            blocks.push(`<pre><code>${escapeHtml(rendered.codeLines.join("\n"))}</code></pre>`);
+	            index = rendered.index;
+	            continue;
+	          }
+	        }
+	        const fence = trimmed.match(/^```([A-Za-z0-9_.+-]*)\s*$/);
+	        if (fence) {
+	          const codeLines = [];
+	          index += 1;
+	          while (index < lines.length && !/^```\s*$/.test(lines[index].trim())) {
+	            codeLines.push(lines[index]);
+	            index += 1;
+	          }
+	          if (index < lines.length) index += 1;
+	          const lang = fence[1] ? ` data-language="${escapeHtml(fence[1])}"` : "";
+	          blocks.push(`<pre${lang}><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+	          continue;
+	        }
+	        const heading = line.match(/^\s{0,3}(#{1,4})\s+(.+)$/);
+	        if (heading) {
+	          const level = heading[1].length;
+	          blocks.push(`<h${level}>${renderMarkdownInline(heading[2].trim())}</h${level}>`);
+	          index += 1;
+	          continue;
+	        }
+	        if (/^\s{0,3}[-*_](?:\s*[-*_]){2,}\s*$/.test(line)) {
+	          blocks.push("<hr>");
+	          index += 1;
+	          continue;
+	        }
+	        if (markdownTableStarts(line, lines[index + 1] || "")) {
+	          const rendered = renderMarkdownTable(lines, index);
+	          blocks.push(rendered.html);
+	          index = rendered.index;
+	          continue;
+	        }
+	        if (/^\s{0,3}>\s?/.test(line)) {
+	          const quoteLines = [];
+	          while (index < lines.length && /^\s{0,3}>\s?/.test(lines[index])) {
+	            quoteLines.push(lines[index].replace(/^\s{0,3}>\s?/, ""));
+	            index += 1;
+	          }
+	          blocks.push(`<blockquote>${renderMarkdown(quoteLines.join("\n"))}</blockquote>`);
+	          continue;
+	        }
+	        const unordered = line.match(/^\s*([-*+])\s+(.+)$/);
+	        const ordered = line.match(/^\s*(\d+)\.\s+(.+)$/);
+	        if (unordered || ordered) {
+	          const listTag = ordered ? "ol" : "ul";
+	          const start = ordered ? Math.max(1, Number(ordered[1] || 1)) : 1;
+	          const items = [];
+	          while (index < lines.length) {
+	            const current = lines[index];
+	            const itemMatch = listTag === "ol"
+	              ? current.match(/^\s*\d+\.\s+(.+)$/)
+	              : current.match(/^\s*[-*+]\s+(.+)$/);
+	            if (!itemMatch) {
+	              if (!current.trim() && index + 1 < lines.length) {
+	                const next = lines[index + 1] || "";
+	                const nextItem = listTag === "ol"
+	                  ? next.match(/^\s*\d+\.\s+(.+)$/)
+	                  : next.match(/^\s*[-*+]\s+(.+)$/);
+	                if (nextItem) {
+	                  index += 1;
+	                  continue;
+	                }
+	              }
+	              break;
+	            }
+	            const itemLines = [itemMatch[1]];
+	            index += 1;
+	            while (index < lines.length && /^\s{2,}\S/.test(lines[index]) && !markdownBlockStarts(lines, index)) {
+	              itemLines.push(lines[index].trim());
+	              index += 1;
+	            }
+	            items.push(`<li>${itemLines.map((itemLine) => renderMarkdownInline(itemLine)).join("<br>")}</li>`);
+	          }
+	          const startAttr = listTag === "ol" && start > 1 ? ` start="${start}"` : "";
+	          blocks.push(`<${listTag}${startAttr}>${items.join("")}</${listTag}>`);
+	          continue;
+	        }
+	        const paragraph = [];
+	        while (index < lines.length && lines[index].trim() && !markdownBlockStarts(lines, index)) {
+	          paragraph.push(lines[index].trim());
+	          index += 1;
+	        }
+	        if (paragraph.length) {
+	          blocks.push(`<p>${paragraph.map((part) => renderMarkdownInline(part)).join("<br>")}</p>`);
+	        } else {
+	          index += 1;
+	        }
+	      }
+	      return blocks.join("");
+	    }
 
 	    function formatNumber(value) {
 	      return Number(value || 0).toLocaleString();
@@ -8055,6 +12964,1175 @@ class Handler(BaseHTTPRequestHandler):
 	      return `${profile} ${type || "event"}`;
 	    }
 
+	    function scrollSnapshot(element) {
+	      if (!element) return null;
+	      return {
+	        top: element.scrollTop,
+	        atBottom: element.scrollHeight - element.scrollTop - element.clientHeight < 24
+	      };
+	    }
+
+	    function restoreScrollSnapshot(element, snapshot) {
+	      if (!element || !snapshot) return;
+	      element.scrollTop = snapshot.atBottom
+	        ? Math.max(0, element.scrollHeight - element.clientHeight)
+	        : snapshot.top;
+	    }
+
+	    function formatAge(seconds) {
+	      const value = Number(seconds);
+	      if (!Number.isFinite(value)) return "";
+	      if (value < 60) return `${Math.max(0, Math.round(value))}s`;
+	      if (value < 3600) return `${Math.round(value / 60)}m`;
+	      return `${(value / 3600).toFixed(1)}h`;
+	    }
+
+	    function controlPlane(status) {
+	      return status && status.control_plane && typeof status.control_plane === "object"
+	        ? status.control_plane
+	        : latestControlPlane || { sessions: [] };
+	    }
+
+	    function controlSessions(status) {
+	      const plane = controlPlane(status);
+	      return Array.isArray(plane.sessions) ? plane.sessions : [];
+	    }
+
+	    function sessionTitle(session) {
+	      return String(session.title || session.name || session.display || session.cwd || "Session");
+	    }
+
+	    function sessionMeta(session) {
+	      const pieces = [];
+	      if (session.pinned_profile) pieces.push(`pinned ${session.pinned_profile}`);
+	      else if (session.last_profile) pieces.push(`last ${session.last_profile}`);
+	      const active = Number(session.active_requests || 0);
+	      const pending = Number(session.pending_websocket_work || 0);
+	      const tunnels = Number(session.active_tunnels || 0);
+	      if (active) pieces.push(`${active} request${active === 1 ? "" : "s"}`);
+	      if (pending) pieces.push(`${pending} turn${pending === 1 ? "" : "s"}`);
+	      else if (tunnels) pieces.push(`${tunnels} tunnel${tunnels === 1 ? "" : "s"}`);
+	      return pieces.join(" / ") || String(session.display || session.cwd || "idle");
+	    }
+
+	    function updateControlDockGeometry() {
+	      const modal = document.getElementById("controlModal");
+	      const tabs = document.getElementById("sessionTabs");
+	      if (!modal || !tabs) return;
+	      const top = tabs.offsetTop + tabs.offsetHeight + 8;
+	      modal.style.setProperty("--control-dock-top", `${Math.max(0, top)}px`);
+	      const launcher = document.getElementById("launcherBar");
+	      if (launcher) launcher.style.setProperty("--control-dock-top", `${Math.max(0, top)}px`);
+		      const stats = document.getElementById("statsModal");
+		      if (stats) {
+		        const tabsTop = tabs.getBoundingClientRect().top;
+		        stats.style.setProperty("--stats-modal-top", `${Math.max(0, tabsTop)}px`);
+		      }
+	    }
+
+	    function controlScrollKey() {
+	      const turn = selectedControlTurnKeys[selectedControlSessionKey || ""] || "";
+	      return `${selectedControlSessionKey || "none"}:${controlView || "discussion"}:${turn}:${controlSearchText || ""}`;
+	    }
+
+		    function controlTranscriptWindowKey() {
+		      return `${selectedControlSessionKey || "none"}:${controlSearchText || ""}`;
+		    }
+
+		    function controlTranscriptWindow(total) {
+		      if (total <= CONTROL_TRANSCRIPT_WINDOW_SIZE) {
+		        return { start: 0, end: total };
+		      }
+		      const key = controlTranscriptWindowKey();
+		      const existing = controlTranscriptWindows[key];
+		      if (!existing) {
+		        const start = Math.max(0, total - CONTROL_TRANSCRIPT_WINDOW_SIZE);
+		        const value = { start, end: total, previousTotal: total };
+		        controlTranscriptWindows[key] = value;
+		        return value;
+		      }
+		      if (total > existing.previousTotal && existing.end >= existing.previousTotal) {
+		        const delta = total - existing.previousTotal;
+		        existing.end = total;
+		        existing.start = Math.max(0, existing.start + delta);
+		      }
+		      existing.start = Math.max(0, Math.min(existing.start, total - 1));
+		      existing.end = Math.max(existing.start + 1, Math.min(existing.end, total));
+		      existing.previousTotal = total;
+		      return existing;
+		    }
+
+		    function expandControlTranscriptWindow(direction) {
+		      const key = controlTranscriptWindowKey();
+		      const current = controlTranscriptWindows[key];
+		      if (!current) return false;
+		      const oldStart = current.start;
+		      const oldEnd = current.end;
+		      const total = Number(current.previousTotal || 0);
+		      if (direction === "above") {
+		        current.start = Math.max(0, current.start - CONTROL_TRANSCRIPT_WINDOW_STEP);
+		      } else {
+		        current.end = Math.min(total, current.end + CONTROL_TRANSCRIPT_WINDOW_STEP);
+		      }
+		      return oldStart !== current.start || oldEnd !== current.end;
+		    }
+
+	    function saveControlScroll() {
+	      const content = document.getElementById("controlContent");
+	      if (!content) return;
+	      const key = renderedControlScrollKey || controlScrollKey();
+	      controlScrollPositions[key] = content.scrollTop;
+	    }
+
+	    function saveControlInnerScroll() {
+	      const content = document.getElementById("controlContent");
+	      if (!content) return;
+	      const prefix = renderedControlScrollKey || controlScrollKey();
+	      content.querySelectorAll("[data-control-inner-scroll]").forEach((element) => {
+	        const key = element.dataset.controlInnerScroll || "";
+	        if (!key) return;
+	        controlInnerScrollPositions[`${prefix}::${key}`] = element.scrollTop;
+	      });
+	    }
+
+	    function restoreControlScroll() {
+	      const content = document.getElementById("controlContent");
+	      if (!content) return;
+	      const top = controlScrollPositions[controlScrollKey()];
+	      if (typeof top === "number") content.scrollTop = top;
+	    }
+
+	    function restoreControlInnerScroll() {
+	      const content = document.getElementById("controlContent");
+	      if (!content) return;
+	      const prefix = controlScrollKey();
+	      content.querySelectorAll("[data-control-inner-scroll]").forEach((element) => {
+	        const key = element.dataset.controlInnerScroll || "";
+	        const top = controlInnerScrollPositions[`${prefix}::${key}`];
+	        if (typeof top === "number") element.scrollTop = top;
+	      });
+	    }
+
+	    function controlContentAtBottom(content) {
+	      if (!content) return true;
+	      return content.scrollHeight - content.scrollTop - content.clientHeight < 24;
+	    }
+
+		    function updateControlScrollBadges() {
+		      const content = document.getElementById("controlContent");
+		      if (!content || controlView !== "discussion") return;
+		      const transcript = content.querySelector(".control-transcript");
+		      const topBadge = content.querySelector("[data-control-scroll='above']");
+		      const bottomBadge = content.querySelector("[data-control-scroll='below']");
+		      if (!transcript || !topBadge || !bottomBadge) return;
+		      const bounds = content.getBoundingClientRect();
+		      const hiddenAbove = Number(transcript.dataset.hiddenAbove || 0);
+		      const hiddenBelow = Number(transcript.dataset.hiddenBelow || 0);
+		      let visibleAbove = 0;
+		      let visibleBelow = 0;
+		      for (const item of transcript.querySelectorAll(".control-message[data-transcript-index]")) {
+		        const itemBounds = item.getBoundingClientRect();
+		        if (itemBounds.bottom < bounds.top + 8) visibleAbove += 1;
+		        if (itemBounds.top > bounds.bottom - 8) visibleBelow += 1;
+		      }
+		      const above = hiddenAbove + visibleAbove;
+		      const below = hiddenBelow + visibleBelow;
+		      topBadge.hidden = above <= 0;
+		      bottomBadge.hidden = below <= 0;
+		      topBadge.textContent = `${above} above`;
+		      bottomBadge.textContent = `${below} below`;
+		      topBadge.title = hiddenAbove > 0 ? `Show older hidden transcript entries (${hiddenAbove} hidden)` : "Scroll upward";
+		      bottomBadge.title = hiddenBelow > 0 ? `Show newer hidden transcript entries (${hiddenBelow} hidden)` : "Scroll downward";
+		    }
+
+	    function controlSelectionActive() {
+	      const modal = document.getElementById("controlModal");
+	      const selection = window.getSelection ? window.getSelection() : null;
+	      if (!modal || !selection || selection.isCollapsed || !selection.rangeCount) return false;
+	      const anchor = selection.anchorNode && selection.anchorNode.nodeType === Node.ELEMENT_NODE
+	        ? selection.anchorNode
+	        : selection.anchorNode ? selection.anchorNode.parentElement : null;
+	      const focus = selection.focusNode && selection.focusNode.nodeType === Node.ELEMENT_NODE
+	        ? selection.focusNode
+	        : selection.focusNode ? selection.focusNode.parentElement : null;
+	      return Boolean((anchor && modal.contains(anchor)) || (focus && modal.contains(focus)));
+	    }
+
+	    function controlRenderShouldDefer() {
+	      return controlSelectionActive();
+	    }
+
+	    function flushPendingControlRender() {
+	      if (!pendingControlRender || controlRenderShouldDefer()) return;
+	      renderControlModal(true);
+	    }
+
+	    function scheduleControlRenderFlush() {
+	      if (controlRenderDeferTimer) return;
+	      controlRenderDeferTimer = setTimeout(() => {
+	        controlRenderDeferTimer = null;
+	        if (pendingControlRender) renderControlModal(true);
+	      }, 2050);
+	    }
+
+	    function renderSessionTabs(status) {
+	      const container = document.getElementById("sessionTabs");
+	      if (!container) return;
+	      const sessions = controlSessions(status);
+	      const launchSelected = launcherPanelOpen ? " selected" : "";
+	      const launchTab = `
+	        <button class="session-tab launch-tab${launchSelected}" type="button" data-launch-tab="1" title="Launch a Codex CLI session">
+	          <span class="session-tab-title">+</span>
+	          <span class="session-tab-meta">Launch</span>
+	        </button>
+	      `;
+	      if (!sessions.length) {
+	        selectedControlSessionKey = "";
+	        container.innerHTML = '<div class="session-tabs-empty">No Provision-managed Codex CLI sessions observed yet</div>' + launchTab;
+	        updateControlDockGeometry();
+	        return;
+	      }
+	      if (selectedControlSessionKey && !sessions.some((session) => session.key === selectedControlSessionKey)) {
+	        selectedControlSessionKey = "";
+	      }
+	      container.innerHTML = sessions.map((session) => {
+	        const key = String(session.key || "");
+	        const active = session.active ? " active" : "";
+	        const selected = key && key === selectedControlSessionKey ? " selected" : "";
+	        return `
+          <button class="session-tab${active}${selected}" type="button" draggable="true" data-session-key="${escapeHtml(key)}" title="${escapeHtml(session.cwd || session.display || key)}">
+            <span class="session-tab-close" data-session-close="${escapeHtml(key)}" aria-label="Close tab" title="Close tab">x</span>
+            <span class="session-tab-title">${escapeHtml(sessionTitle(session))}</span>
+            <span class="session-tab-meta">${escapeHtml(sessionMeta(session))}</span>
+          </button>
+	        `;
+	      }).join("") + launchTab;
+	      updateControlDockGeometry();
+	    }
+
+		    function orderedSessionKeysFromTabs() {
+		      return Array.from(document.querySelectorAll("#sessionTabs .session-tab[data-session-key]"))
+		        .map((tab) => tab.dataset.sessionKey || "")
+		        .filter(Boolean);
+		    }
+
+		    function clearSessionTabDropClasses() {
+		      document.querySelectorAll("#sessionTabs .session-tab").forEach((tab) => {
+		        tab.classList.remove("dragging", "drop-before", "drop-after");
+		      });
+		    }
+
+		    function sendSessionTabOrder() {
+		      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+		      const sessionKeys = orderedSessionKeysFromTabs();
+		      if (!sessionKeys.length) return;
+		      socket.send(JSON.stringify({
+		        action: "reorder_sessions",
+		        session_keys: sessionKeys,
+		        token: TOKEN
+		      }));
+		    }
+
+		    function sessionTabDropPosition(tab, event) {
+		      const rect = tab.getBoundingClientRect();
+		      return event.clientX > rect.left + rect.width / 2 ? "after" : "before";
+		    }
+
+		    async function forgetControlSession(sessionKey) {
+		      if (!sessionKey || !socket || socket.readyState !== WebSocket.OPEN) return;
+		      const sessions = controlSessions({ control_plane: latestControlPlane });
+		      const session = sessions.find((item) => item.key === sessionKey);
+		      if (!session) return;
+		      const live = sessionIsLive(session);
+		      const label = String(session.cwd || session.display || sessionKey);
+		      if (live) {
+		        const first = await confirmAction({
+		          title: "Forget live session",
+		          message: `This session appears live. Forgetting it will close the associated Codex CLI launcher and remove it from the dashboard:\n\n${label}`,
+		          acceptLabel: "Continue",
+		          danger: true
+		        });
+		        if (!first) return;
+		        const second = await confirmAction({
+		          title: "Close launcher",
+		          message: `Confirm again: close this live launcher and forget the session?\n\n${label}`,
+		          acceptLabel: "Close launcher",
+		          danger: true
+		        });
+		        if (!second) return;
+		      } else {
+		        const confirmed = await confirmAction({
+		          title: "Forget session",
+		          message: `Forget this idle observed session from the dashboard?\n\n${label}`,
+		          acceptLabel: "Forget",
+		          danger: false
+		        });
+		        if (!confirmed) return;
+		      }
+		      socket.send(JSON.stringify({
+		        action: "forget_session",
+		        session_key: sessionKey,
+		        force_live: live,
+		        token: TOKEN
+		      }));
+		      if (selectedControlSessionKey === sessionKey) {
+		        selectedControlSessionKey = "";
+		        const modal = document.getElementById("controlModal");
+		        if (modal) modal.hidden = true;
+		      }
+		    }
+
+	    function launcherSessionScore(session) {
+	      const key = String(session.key || "");
+	      let score = 0;
+	      if (key && key === selectedControlSessionKey) score += 16;
+	      if (key && key === selectedLauncherSessionKey) score += 8;
+	      if (!session.ui_launched) score += 4;
+	      if (session.pty_control_available) score += 2;
+	      if (session.active) score += 1;
+	      return score;
+	    }
+
+		    function dedupedLauncherSessions(sessions) {
+		      const byWorkdir = new Map();
+	      for (const session of sessions) {
+	        const key = String(session.key || "");
+	        const cwd = String(session.cwd || session.display || key);
+	        if (!key || !cwd) continue;
+	        const workdirKey = cwd;
+	        const existing = byWorkdir.get(workdirKey);
+	        if (!existing || launcherSessionScore(session) > launcherSessionScore(existing)) {
+	          byWorkdir.set(workdirKey, session);
+	        }
+	      }
+		      return Array.from(byWorkdir.values());
+		    }
+
+		    function renderResumeCandidateOptions(candidates, selectedId) {
+		      if (!candidates.length) return '<option value="">No resumable sessions found</option>';
+		      return candidates.map((candidate) => {
+		        const id = String(candidate.id || "");
+		        const when = candidate.timestamp ? formatEventTime(candidate.timestamp) : "";
+		        const label = `${when ? `${when} - ` : ""}${candidate.label || id}`;
+		        return `<option value="${escapeHtml(id)}" ${id === selectedId ? "selected" : ""}>${escapeHtml(label)}</option>`;
+		      }).join("");
+		    }
+
+		    function renderLauncherBar(status) {
+		      const bar = document.getElementById("launcherBar");
+		      const select = document.getElementById("launcherSession");
+		      const modeSelect = document.getElementById("launcherMode");
+		      const permissionSelect = document.getElementById("launcherPermission");
+		      const resumeField = document.getElementById("launcherResumeField");
+		      const resumeSelect = document.getElementById("launcherResumeSession");
+		      const start = document.getElementById("launcherStart");
+		      if (!bar || !select || !modeSelect || !permissionSelect || !resumeField || !resumeSelect || !start) return;
+		      bar.hidden = !launcherPanelOpen;
+		      if (!launcherPanelOpen) {
+		        updateControlDockGeometry();
+		        return;
+	      }
+	      const sessions = controlSessions(status);
+	      const known = dedupedLauncherSessions(sessions);
+	      if (!selectedLauncherSessionKey && selectedControlSessionKey && known.some((session) => session.key === selectedControlSessionKey)) {
+	        selectedLauncherSessionKey = selectedControlSessionKey;
+	      }
+	      if (!selectedLauncherSessionKey || !known.some((session) => session.key === selectedLauncherSessionKey)) {
+	        selectedLauncherSessionKey = known.length ? String(known[0].key || "") : "";
+	      }
+	      select.innerHTML = known.length
+	        ? known.map((session) => {
+	          const key = String(session.key || "");
+	          const label = `${session.cwd || session.display || key}${session.associated_profile ? ` (${session.associated_profile})` : ""}`;
+	          return `<option value="${escapeHtml(key)}" ${key === selectedLauncherSessionKey ? "selected" : ""}>${escapeHtml(label)}</option>`;
+	        }).join("")
+		        : '<option value="">No observed workdirs</option>';
+		      select.disabled = !known.length;
+		      const selectedSession = known.find((session) => String(session.key || "") === selectedLauncherSessionKey) || null;
+		      const candidates = selectedSession && Array.isArray(selectedSession.resume_candidates)
+		        ? selectedSession.resume_candidates
+		        : [];
+		      if (!launcherResumeSessionId || !candidates.some((candidate) => String(candidate.id || "") === launcherResumeSessionId)) {
+		        launcherResumeSessionId = candidates.length ? String(candidates[0].id || "") : "";
+		      }
+		      modeSelect.value = launcherMode;
+		      permissionSelect.value = launcherPermission;
+		      resumeField.hidden = launcherMode !== "resume-session";
+		      resumeSelect.innerHTML = renderResumeCandidateOptions(candidates, launcherResumeSessionId);
+		      resumeSelect.disabled = launcherMode !== "resume-session" || !candidates.length;
+		      const needsResumeSelection = launcherMode === "resume-session";
+		      start.disabled = !known.length
+		        || !socket
+		        || socket.readyState !== WebSocket.OPEN
+		        || (needsResumeSelection && !launcherResumeSessionId);
+		      updateControlDockGeometry();
+		    }
+
+	    function selectedControlSession() {
+	      const sessions = controlSessions({ control_plane: latestControlPlane });
+	      return sessions.find((session) => session.key === selectedControlSessionKey) || null;
+	    }
+
+	    function controlCapabilityText(session) {
+	      const interaction = latestControlPlane && typeof latestControlPlane.interaction === "object"
+	        ? latestControlPlane.interaction
+	        : {};
+	      const sessionInteraction = session && typeof session.interaction === "object"
+	        ? session.interaction
+	        : {};
+	      if (sessionInteraction.reason) return String(sessionInteraction.reason);
+	      return String(interaction.reason || "Launch this Codex CLI session with `provision` to enable live UI input.");
+	    }
+
+	    function controlInteractionAvailable(session) {
+	      return Boolean(session && session.interaction && session.interaction.available);
+	    }
+
+	    function updateControlComposeState(session) {
+	      const prompt = document.getElementById("controlPrompt");
+	      const button = document.getElementById("controlSend");
+	      const available = controlInteractionAvailable(session);
+	      prompt.disabled = !available;
+	      button.disabled = !available || !prompt.value.trim();
+	      prompt.placeholder = available
+	        ? "Send to running Codex CLI"
+	        : controlCapabilityText(session);
+	    }
+
+		    function resetControlPromptHistory() {
+		      controlPromptHistoryIndex = null;
+		      controlPromptHistorySessionKey = "";
+		      controlPromptHistoryDraft = "";
+		    }
+
+		    function controlPromptHistory(session) {
+		      const transcript = session && Array.isArray(session.transcript) ? session.transcript : [];
+		      const history = [];
+		      let previous = "";
+		      for (const item of transcript) {
+		        if (String(item.role || "") !== "user") continue;
+		        const text = String(item.full_text || item.text || "").trim();
+		        if (!text || text === previous) continue;
+		        previous = text;
+		        history.push(text);
+		      }
+		      return history;
+		    }
+
+		    function setControlPromptValue(value) {
+		      const prompt = document.getElementById("controlPrompt");
+		      if (!prompt) return;
+		      prompt.value = value;
+		      updateControlComposeState(selectedControlSession());
+		      requestAnimationFrame(() => {
+		        const end = prompt.value.length;
+		        try {
+		          prompt.setSelectionRange(end, end);
+		        } catch {
+		        }
+		      });
+		    }
+
+		    function handleControlPromptHistory(event) {
+		      if (!["ArrowUp", "ArrowDown"].includes(event.key) || event.shiftKey || event.altKey || event.metaKey || event.ctrlKey) {
+		        return false;
+		      }
+		      const prompt = event.currentTarget;
+		      if (!(prompt instanceof HTMLTextAreaElement) || prompt.disabled) return false;
+		      const browsing = controlPromptHistoryIndex !== null
+		        && controlPromptHistorySessionKey === selectedControlSessionKey;
+		      if (prompt.value.trim() && !browsing) return false;
+		      const history = controlPromptHistory(selectedControlSession());
+		      if (!history.length) return false;
+		      event.preventDefault();
+		      if (!browsing) {
+		        controlPromptHistorySessionKey = selectedControlSessionKey;
+		        controlPromptHistoryDraft = prompt.value;
+		        controlPromptHistoryIndex = history.length;
+		      }
+		      if (event.key === "ArrowUp") {
+		        controlPromptHistoryIndex = Math.max(0, Number(controlPromptHistoryIndex) - 1);
+		        setControlPromptValue(history[controlPromptHistoryIndex] || "");
+		        return true;
+		      }
+		      controlPromptHistoryIndex = Math.min(history.length, Number(controlPromptHistoryIndex) + 1);
+		      if (controlPromptHistoryIndex >= history.length) {
+		        const draft = controlPromptHistoryDraft;
+		        resetControlPromptHistory();
+		        setControlPromptValue(draft);
+		        return true;
+		      }
+		      setControlPromptValue(history[controlPromptHistoryIndex] || "");
+		      return true;
+		    }
+
+	    function renderControlActiveDetails(session) {
+	      const details = session.active_details && typeof session.active_details === "object" ? session.active_details : {};
+	      const requests = Array.isArray(details.requests) ? details.requests : [];
+	      const tunnels = Array.isArray(details.tunnels) ? details.tunnels : [];
+	      const requestCards = requests.map((request) => `
+	        <div class="control-active-card">
+	          <strong>Request</strong>
+	          <span>Profile: ${escapeHtml(request.profile || "unknown")}</span>
+	          ${request.age_seconds != null ? `<span>Age: ${escapeHtml(formatAge(request.age_seconds))}</span>` : ""}
+	        </div>
+	      `);
+	      const tunnelCards = tunnels.map((tunnel, index) => {
+	        const traffic = `${formatBytes(tunnel.bytes_up)} up / ${formatBytes(tunnel.bytes_down)} down`;
+	        const messages = `${formatNumber(tunnel.messages_up)} up / ${formatNumber(tunnel.messages_down)} down`;
+	        const bits = [];
+	        const hasTurn = Number(tunnel.pending_work || 0) > 0 || Boolean(tunnel.turn_id);
+	        const label = `${hasTurn ? "Turn tunnel" : "Session tunnel"} ${index + 1}`;
+	        if (Number(tunnel.pending_work || 0) > 0) bits.push("active");
+	        else bits.push("idle");
+	        if (tunnel.service_tier) bits.push(String(tunnel.service_tier));
+	        return `
+	          <div class="control-active-card">
+	            <strong>${escapeHtml(label)}${bits.length ? ` (${escapeHtml(bits.join(", "))})` : ""}</strong>
+	            <span>Profile: ${escapeHtml(tunnel.profile || "unknown")}</span>
+	            ${tunnel.turn_id ? `<span>Turn: ${escapeHtml(tunnel.turn_id)}</span>` : ""}
+	            ${tunnel.age_seconds != null ? `<span>Open: ${escapeHtml(formatAge(tunnel.age_seconds))}</span>` : ""}
+	            ${tunnel.last_data_age_seconds != null ? `<span>Last data: ${escapeHtml(formatAge(tunnel.last_data_age_seconds))} ago</span>` : ""}
+	            <span>Traffic: ${escapeHtml(traffic)}</span>
+	            <span>Messages: ${escapeHtml(messages)}</span>
+	          </div>
+	        `;
+	      });
+	      const cards = requestCards.concat(tunnelCards);
+	      if (!cards.length) return '<div class="control-empty">No active request or tunnel is currently attached to this session</div>';
+	      return `<div class="control-active-grid">${cards.join("")}</div>`;
+	    }
+
+	    function controlTranscriptMatches(item, query) {
+	      if (!query) return true;
+	      const haystack = `${item.role || ""} ${item.text || ""} ${item.full_text || ""} ${item.search_text || ""}`.toLowerCase();
+	      return haystack.includes(query.toLowerCase());
+	    }
+
+	    function controlTurnKey(turn) {
+	      return String(turn && (turn.key || turn.turn_id || turn.start_index) || "");
+	    }
+
+	    function controlTurns(session, transcript = null) {
+	      const turns = session && Array.isArray(session.turns) ? session.turns.slice() : [];
+	      if (turns.length) return turns;
+	      const rows = transcript || (session && Array.isArray(session.transcript) ? session.transcript : []);
+	      if (!rows.length) return [];
+	      return [{
+	        key: "observed-activity",
+	        label: "Observed activity",
+	        start_index: 0,
+	        end_index: rows.length - 1,
+	        timestamp: rows[0].ts || "",
+	        updated_at: rows[rows.length - 1].updated_at || rows[rows.length - 1].ts || ""
+	      }];
+	    }
+
+	    function transcriptItemsForTurn(transcript, turn) {
+	      const start = Math.max(0, Number(turn && turn.start_index || 0));
+	      const end = Math.max(start, Number(turn && turn.end_index != null ? turn.end_index : start));
+	      return transcript.filter((item) => {
+	        const index = Number(item.control_index);
+	        return Number.isFinite(index) && index >= start && index <= end;
+	      });
+	    }
+
+	    function turnMatchesSearch(transcript, turn, query) {
+	      if (!query) return true;
+	      const label = String(turn && turn.label || "").toLowerCase();
+	      const needle = query.toLowerCase();
+	      if (label.includes(needle)) return true;
+	      return transcriptItemsForTurn(transcript, turn).some((item) => controlTranscriptMatches(item, query));
+	    }
+
+	    function turnOptionLabel(turn, transcript, query) {
+	      const when = turn && turn.timestamp ? formatEventTime(turn.timestamp) : "";
+	      const label = String(turn && turn.label || turn && turn.turn_id || "Observed turn");
+	      let prefix = when ? `${when} - ` : "";
+	      let suffix = turn && turn.pending ? " (pending)" : "";
+	      if (query) {
+	        const matches = transcriptItemsForTurn(transcript, turn)
+	          .filter((item) => controlTranscriptMatches(item, query)).length;
+	        if (matches > 0) suffix += ` (${matches} match${matches === 1 ? "" : "es"})`;
+	      }
+	      return `${prefix}${label}${suffix}`;
+	    }
+
+	    function latestUserInputKey(session) {
+	      const transcript = session && Array.isArray(session.transcript) ? session.transcript : [];
+	      for (let index = transcript.length - 1; index >= 0; index -= 1) {
+	        const item = transcript[index] || {};
+	        const role = String(item.role || "");
+	        if (role !== "user" && role !== "user_pending") continue;
+	        const text = String(item.full_text || item.text || "");
+	        return [
+	          role,
+	          item.ts || "",
+	          text.length,
+	          text.slice(0, 96)
+	        ].join(":");
+	      }
+	      return "";
+	    }
+
+	    function observeControlUserInputs(controlPlane) {
+	      const sessions = controlSessions({ control_plane: controlPlane || latestControlPlane || { sessions: [] } });
+	      for (const session of sessions) {
+	        const sessionKey = String(session && session.key || "");
+	        if (!sessionKey) continue;
+	        const userKey = latestUserInputKey(session);
+	        const previous = latestObservedUserKeys[sessionKey];
+	        if (userKey && previous && userKey !== previous) {
+	          delete manuallySelectedControlTurnKeys[sessionKey];
+	          followLatestTurnAfterUserInput[sessionKey] = true;
+	        }
+	        latestObservedUserKeys[sessionKey] = userKey;
+	      }
+	    }
+
+	    function selectedTurnForSessionShouldFollowLatest(sessionKey) {
+	      if (!sessionKey || controlSearchText.trim()) return false;
+	      if (manuallySelectedControlTurnKeys[sessionKey]) return false;
+	      return Boolean(followLatestTurnAfterUserInput[sessionKey]);
+	    }
+
+	    function selectedTurnForSession(session, transcript) {
+	      const turns = controlTurns(session, transcript);
+	      if (!turns.length) return null;
+	      const query = controlSearchText.trim();
+	      const matchingTurns = query ? turns.filter((turn) => turnMatchesSearch(transcript, turn, query)) : turns;
+	      const available = matchingTurns.length ? matchingTurns : turns;
+	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
+	      const selectedKey = selectedControlTurnKeys[sessionKey] || "";
+	      const selected = available.find((turn) => controlTurnKey(turn) === selectedKey);
+	      const fallback = available[available.length - 1] || null;
+	      if (fallback && selectedTurnForSessionShouldFollowLatest(sessionKey)) {
+	        selectedControlTurnKeys[sessionKey] = controlTurnKey(fallback);
+	        delete followLatestTurnAfterUserInput[sessionKey];
+	        return fallback;
+	      }
+	      if (fallback) selectedControlTurnKeys[sessionKey] = controlTurnKey(selected || fallback);
+	      return selected || fallback;
+	    }
+
+	    function renderControlTurnOptions(session) {
+	      const transcript = session && Array.isArray(session.transcript) ? session.transcript : [];
+	      const turns = controlTurns(session, transcript);
+	      if (!turns.length) return '<option value="">No observed turns</option>';
+	      const selected = selectedTurnForSession(session, transcript);
+	      const selectedKey = controlTurnKey(selected);
+	      return turns.map((turn) => {
+	        const key = controlTurnKey(turn);
+	        const disabled = controlSearchText && !turnMatchesSearch(transcript, turn, controlSearchText) ? "disabled" : "";
+	        return `<option value="${escapeHtml(key)}" ${key === selectedKey ? "selected" : ""} ${disabled}>${escapeHtml(turnOptionLabel(turn, transcript, controlSearchText))}</option>`;
+	      }).join("");
+	    }
+
+	    function controlMessageKey(item, fallback) {
+	      const parts = [
+	        selectedControlSessionKey || "session",
+	        item.role || "message",
+	        item.turn_id || "",
+	        item.call_id || "",
+	        item.ts || ""
+	      ];
+	      if (item.ts || item.call_id || item.turn_id) return parts.join("|");
+	      parts.push(fallback || "");
+	      return parts.join("|");
+	    }
+
+		    function splitToolStatusSuffix(value) {
+		      const match = String(value || "").match(/^(.*?)(?:\s+\(([^)]*)\))?$/);
+		      const label = match ? match[1].trim() : String(value || "").trim();
+		      const attrs = {};
+		      const suffix = match && match[2] ? match[2] : "";
+		      for (const part of suffix.split(/\s*,\s*/)) {
+		        const status = part.match(/^status\s+(.+)$/i);
+		        const exit = part.match(/^exit\s+(.+)$/i);
+		        const duration = part.match(/^duration\s+(.+)$/i);
+		        if (status) attrs.status = status[1].trim();
+		        else if (exit) attrs.exit = exit[1].trim();
+		        else if (duration) attrs.duration = duration[1].trim();
+		      }
+		      return { label, attrs };
+		    }
+
+		    function parseToolActivityText(value) {
+		      const lines = String(value || "").replace(/\r\n?/g, "\n").split("\n");
+		      const first = lines[0] || "";
+		      const firstMatch = first.match(/^(Tool|Command):\s*(.+)$/i);
+		      if (!firstMatch) return null;
+		      const parsedFirst = splitToolStatusSuffix(firstMatch[2]);
+		      const result = {
+		        kind: firstMatch[1].toLowerCase(),
+		        name: firstMatch[1].toLowerCase() === "tool" ? parsedFirst.label : "command",
+		        command: firstMatch[1].toLowerCase() === "command" ? parsedFirst.label : "",
+		        status: parsedFirst.attrs.status || "",
+		        exit: parsedFirst.attrs.exit || "",
+		        duration: parsedFirst.attrs.duration || "",
+		        sections: []
+		      };
+		      let currentSection = null;
+		      const pushSection = () => {
+		        if (!currentSection) return;
+		        const text = currentSection.lines.join("\n").replace(/\s+$/g, "");
+		        if (text.trim()) result.sections.push({ label: currentSection.label, text });
+		        currentSection = null;
+		      };
+		      for (const rawLine of lines.slice(1)) {
+		        const line = rawLine || "";
+		        const commandMatch = line.match(/^Command:\s*(.+)$/i);
+		        if (commandMatch) {
+		          pushSection();
+		          const parsedCommand = splitToolStatusSuffix(commandMatch[1]);
+		          result.command = parsedCommand.label || result.command;
+		          if (parsedCommand.attrs.status) result.status = parsedCommand.attrs.status;
+		          if (parsedCommand.attrs.exit) result.exit = parsedCommand.attrs.exit;
+		          if (parsedCommand.attrs.duration) result.duration = parsedCommand.attrs.duration;
+		          continue;
+		        }
+		        const sectionMatch = line.match(/^([A-Za-z][A-Za-z0-9 _/-]{1,40}):\s*$/);
+		        if (sectionMatch) {
+		          pushSection();
+		          currentSection = { label: sectionMatch[1].trim(), lines: [] };
+		          continue;
+		        }
+		        if (!currentSection) currentSection = { label: "Details", lines: [] };
+		        currentSection.lines.push(line);
+		      }
+		      pushSection();
+		      return result;
+		    }
+
+		    function isControlToolName(name) {
+		      return /^ctc_[a-f0-9]{16,}$/i.test(String(name || "").trim());
+		    }
+
+		    function toolSectionIsPatch(section) {
+		      const label = String(section && section.label || "").toLowerCase();
+		      const text = String(section && section.text || "");
+		      return ["arguments", "input", "patch", "content"].includes(label) && /^\*\*\* Begin Patch/m.test(text);
+		    }
+
+		    function renderPatchText(text) {
+		      return String(text || "").split("\n").map((line) => {
+		        let cls = "context";
+		        if (/^\*\*\* (Begin Patch|End Patch|Update File:|Add File:|Delete File:|Move to:)/.test(line) || /^@@/.test(line)) {
+		          cls = "meta";
+		        } else if (/^\+/.test(line)) {
+		          cls = "add";
+		        } else if (/^-/.test(line)) {
+		          cls = "delete";
+		        }
+		        return `<span class="tool-patch-line ${cls}">${escapeHtml(line || " ")}</span>`;
+		      }).join("");
+		    }
+
+		    function renderToolSection(section, ownerKey, sectionIndex) {
+		      const isPatch = toolSectionIsPatch(section);
+		      const body = isPatch ? renderPatchText(section.text) : escapeHtml(section.text);
+		      const scrollKey = `${ownerKey}:section:${sectionIndex}:${section.label}`;
+		      return `
+		        <div class="control-tool-section${isPatch ? " patch" : ""}">
+		          <span class="control-tool-section-label">${escapeHtml(section.label)}</span>
+		          <pre data-control-inner-scroll="${escapeHtml(scrollKey)}">${body}</pre>
+		        </div>
+		      `;
+		    }
+
+		    function renderControlToolBlock(item, fallback, options = {}) {
+		      const key = controlMessageKey(item, fallback);
+		      const displayText = String(item.text || "");
+		      const fullText = String(item.full_text || "");
+		      const compact = Boolean(options.compact);
+		      const hasMore = Boolean(compact || item.truncated || (fullText && fullText !== displayText));
+		      const expanded = Boolean(expandedControlMessages[key]);
+		      const text = expanded && fullText ? fullText : displayText;
+		      const parsed = parseToolActivityText(text);
+		      if (!parsed) {
+		        return `<div class="control-tool-block"><strong>Tool / command</strong>${renderControlMessageText(item, fallback, { markdown: false, compact })}</div>`;
+		      }
+		      if (parsed.kind === "tool" && isControlToolName(parsed.name) && !parsed.command && !parsed.sections.length) {
+		        return `
+		          <div class="control-tool-block control-signal">
+		            <div class="control-tool-summary">
+		              <span class="control-tool-title">Control signal <code>${escapeHtml(parsed.name)}</code></span>
+		              <span class="control-tool-status observed">observed</span>
+		            </div>
+		          </div>
+		        `;
+		      }
+		      const status = parsed.status || "observed";
+		      const statusClass = status.toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
+		      const summaryBits = [parsed.exit ? `exit ${parsed.exit}` : "", parsed.duration || ""].filter(Boolean);
+		      const summary = summaryBits.length ? `<span>${escapeHtml(summaryBits.join(" / "))}</span>` : "";
+		      const command = parsed.command
+		        ? `<div class="control-tool-command">${escapeHtml(parsed.command)}</div>`
+		        : "";
+		      const sections = parsed.sections.length
+		        ? `<div class="control-tool-sections">${parsed.sections.map((section, sectionIndex) => renderToolSection(section, key, sectionIndex)).join("")}</div>`
+		        : "";
+		      const button = hasMore
+		        ? `<button class="control-show-more" type="button" data-message-key="${escapeHtml(key)}">${expanded ? "Show less" : "Show more"}</button>`
+		        : "";
+		      return `
+		        <div class="control-tool-block">
+		          <div class="control-tool-summary">
+		            <span class="control-tool-title">${escapeHtml(parsed.kind === "command" ? "Command" : "Tool")} <code>${escapeHtml(parsed.name || parsed.command || "tool")}</code></span>
+		            <span class="control-tool-status ${escapeHtml(statusClass)}">${escapeHtml(status)}</span>
+		          </div>
+		          ${summary}
+		          ${command}
+		          ${sections}
+		          ${button}
+		        </div>
+		      `;
+		    }
+
+	    function renderControlMessageText(item, fallback, options = {}) {
+	      const key = controlMessageKey(item, fallback);
+	      const role = String(item.role || "");
+	      const displayText = normalizeControlMessageTextForDisplay(item.text, role);
+	      const fullText = normalizeControlMessageTextForDisplay(item.full_text, role);
+	      const compact = Boolean(options.compact);
+	      const hasMore = Boolean(compact || item.truncated || (fullText && fullText !== displayText));
+	      const expanded = Boolean(expandedControlMessages[key]);
+	      const text = expanded && fullText ? fullText : displayText;
+	      const useMarkdown = options.markdown !== false && role !== "tool" && role !== "error";
+	      const className = `control-message-text ${useMarkdown ? "markdown" : "plain"}${expanded ? " expanded" : ""}`;
+	      const body = useMarkdown ? renderMarkdown(text) : escapeHtml(text);
+	      const button = hasMore
+	        ? `<button class="control-show-more" type="button" data-message-key="${escapeHtml(key)}">${expanded ? "Show less" : "Show more"}</button>`
+	        : "";
+	      return `<div class="${className}" data-control-inner-scroll="${escapeHtml(`${key}:message`)}">${body}</div>${button}`;
+	    }
+
+	    function controlTranscriptGroups(items) {
+	      const groups = [];
+	      for (const item of items) {
+	        const role = String(item.role || "message");
+	        if (role === "assistant_progress" || role === "tool") {
+	          const turn = String(item.turn_id || "");
+	          const last = groups[groups.length - 1];
+	          if (last && last.kind === "assistant_activity" && String(last.turn_id || "") === turn) {
+	            last.items.push(item);
+	            last.updated_at = item.updated_at || item.ts || last.updated_at;
+	          } else {
+	            groups.push({
+	              kind: "assistant_activity",
+	              role: "assistant_progress",
+	              turn_id: turn,
+	              ts: item.ts,
+	              updated_at: item.updated_at || item.ts,
+	              items: [item]
+	            });
+	          }
+	        } else {
+	          groups.push({ kind: "message", item });
+	        }
+	      }
+	      return groups;
+	    }
+
+	    function controlMessageRoleLabel(role) {
+	      if (role === "resume") return "resumed context";
+	      if (role === "context_compaction") return "context replay";
+	      if (role === "assistant_progress") return "assistant activity";
+	      if (role === "tool") return "tool / command";
+	      if (role === "user_pending") return "user";
+	      return role;
+	    }
+
+	    function controlTurnMarkup(item) {
+	      const turnId = String(item && item.turn_id || "");
+	      if (turnId) return ` / ${escapeHtml(turnId)}`;
+	      if (String(item && item.role || "") === "user_pending") {
+	        return ` <span class="control-message-turn">/ <span class="control-message-spinner" aria-hidden="true"></span>pending</span>`;
+	      }
+	      return "";
+	    }
+
+	    function renderControlTranscriptGroup(group, index, total) {
+	      const compact = index < Math.max(0, total - 5) ? " compact" : "";
+	      if (group.kind === "assistant_activity") {
+	        const turn = group.turn_id ? ` / ${group.turn_id}` : "";
+	        const body = group.items.map((item, itemIndex) => {
+	          const role = String(item.role || "");
+	          if (role === "tool") {
+	            return renderControlToolBlock(item, `activity-${index}-${itemIndex}`, { compact: Boolean(compact) });
+	          }
+	          return renderControlMessageText(item, `activity-${index}-${itemIndex}`, { compact: Boolean(compact) });
+	        }).join("");
+	        return `
+	          <article class="control-message assistant_activity assistant_progress${compact}" data-transcript-index="${index}">
+	            <div class="control-message-head">
+	              <span>assistant activity${escapeHtml(turn)}</span>
+	              <span>${escapeHtml(formatEventTime(group.updated_at || group.ts))}</span>
+	            </div>
+	            <div class="control-activity-parts">${body}</div>
+	          </article>
+	        `;
+	      }
+	      const item = group.item;
+	      const role = String(item.role || "message");
+	      const displayRole = controlMessageRoleLabel(role);
+	      return `
+	        <article class="control-message ${escapeHtml(role)}${compact}" data-transcript-index="${index}">
+	          <div class="control-message-head">
+	            <span>${escapeHtml(displayRole)}${controlTurnMarkup(item)}</span>
+	            <span>${escapeHtml(formatEventTime(item.updated_at || item.ts))}</span>
+	          </div>
+	          ${renderControlMessageText(item, `message-${index}`, { compact: Boolean(compact) })}
+	        </article>
+	      `;
+	    }
+
+	    function renderControlTranscript(session) {
+	      const transcript = Array.isArray(session.transcript) ? session.transcript.slice() : [];
+	      if (!transcript.length) {
+	        return '<div class="control-empty">No discussion text captured for this session yet</div>';
+	      }
+	      const turn = selectedTurnForSession(session, transcript);
+	      if (!turn) {
+	        return '<div class="control-empty">No observed turns for this session yet</div>';
+	      }
+	      if (controlSearchText && !turnMatchesSearch(transcript, turn, controlSearchText)) {
+	        return '<div class="control-empty">No observed turns match the current search</div>';
+	      }
+	      let visible = transcriptItemsForTurn(transcript, turn);
+	      const pending = transcript.filter((item) => String(item.role || "") === "user_pending" && !visible.includes(item));
+	      if (pending.length) visible = visible.concat(pending);
+	      if (controlSearchText) {
+	        const matched = visible.filter((item) => controlTranscriptMatches(item, controlSearchText));
+	        if (!matched.length && !String(turn.label || "").toLowerCase().includes(controlSearchText.toLowerCase())) {
+	          return '<div class="control-empty">No discussion entries in this turn match the current search</div>';
+	        }
+	      }
+	      const groups = controlTranscriptGroups(visible);
+	      const matchedTurns = controlSearchText
+	        ? controlTurns(session, transcript).filter((candidate) => turnMatchesSearch(transcript, candidate, controlSearchText)).length
+	        : 0;
+	      const searchNote = matchedTurns > 1
+	        ? `<div class="control-transcript-window-note">${matchedTurns} turns match. Use the turn selector to navigate.</div>`
+	        : "";
+	      return `
+	        ${searchNote}
+	        <div class="control-transcript" data-total="${groups.length}">
+	          ${groups.map((group, offset) => (
+	            renderControlTranscriptGroup(group, offset, groups.length)
+	          )).join("")}
+	        </div>
+	      `;
+	    }
+
+	    function renderControlEvents(session) {
+	      const events = Array.isArray(session.events) ? session.events.slice().reverse() : [];
+	      if (!events.length) {
+	        return '<div class="control-empty">No recorded activity for this session yet</div>';
+	      }
+	      return `<div class="control-events">${events.map((event) => {
+	        const summary = event.summary || statsEventText(event);
+	        const profile = event.profile ? `<span>Profile: ${escapeHtml(event.profile)}</span>` : "";
+	        const type = event.type ? `<span>Type: ${escapeHtml(event.type)}</span>` : "";
+	        const tier = event.service_tier ? `<span>Tier: ${escapeHtml(event.service_tier)}</span>` : "";
+	        return `
+	          <div class="control-event compact">
+	            <span>${escapeHtml(formatEventTime(event.ts))}</span>
+	            <div class="control-event-detail">
+	              <strong>${escapeHtml(summary)}</strong>
+	              ${profile}
+	              ${type}
+	              ${tier}
+	            </div>
+	          </div>
+	        `;
+	      }).join("")}</div>`;
+	    }
+
+	    function sessionAssociatedProfile(session) {
+	      return String((session && (session.associated_profile || session.pinned_profile || session.last_profile)) || "");
+	    }
+
+	    function sessionIsLive(session) {
+	      if (!session) return false;
+	      if (session.pty_control_available || session.ui_launcher_running || session.active) return true;
+	      if (Number(session.active_requests || 0) > 0) return true;
+	      if (Number(session.active_tunnels || 0) > 0) return true;
+	      if (Number(session.pending_websocket_work || 0) > 0) return true;
+	      return false;
+	    }
+
+	    function updateControlHeaderActions(session) {
+	      const turnSelect = document.getElementById("controlTurnSelect");
+	      const forget = document.getElementById("controlForget");
+	      if (!turnSelect || !forget) return;
+	      const connected = socket && socket.readyState === WebSocket.OPEN;
+	      const turns = session ? controlTurns(session, Array.isArray(session.transcript) ? session.transcript : []) : [];
+	      if (!controlTurnSelectInteracting && document.activeElement !== turnSelect) {
+	        const nextOptions = session ? renderControlTurnOptions(session) : '<option value="">No observed turns</option>';
+	        turnSelect.innerHTML = nextOptions;
+	      }
+	      turnSelect.disabled = !turns.length;
+	      turnSelect.hidden = controlView !== "discussion";
+	      forget.disabled = !connected || !session;
+	      forget.title = sessionIsLive(session)
+	        ? "Close the associated launcher and forget this live session"
+	        : "Forget this idle observed session";
+	    }
+
+	    function sendLaunchSession(sessionKey, mode, sessionId = "") {
+	      if (!sessionKey || !socket || socket.readyState !== WebSocket.OPEN) return;
+	      const sessions = controlSessions({ control_plane: latestControlPlane });
+	      const session = sessions.find((item) => item.key === sessionKey) || {};
+	      socket.send(JSON.stringify({
+	        action: "launch_session",
+	        session_key: sessionKey,
+	        profile: sessionAssociatedProfile(session),
+	        mode,
+	        session_id: sessionId,
+	        permission: launcherPermission,
+	        token: TOKEN
+	      }));
+	    }
+
+	    function selectedResumeCandidateId(session) {
+	      const key = String(session && session.key || selectedControlSessionKey || "");
+	      const candidates = session && Array.isArray(session.resume_candidates) ? session.resume_candidates : [];
+	      const selected = selectedResumeCandidateIds[key] || "";
+	      if (selected && candidates.some((candidate) => String(candidate.id || "") === selected)) return selected;
+	      const fallback = candidates.length ? String(candidates[0].id || "") : "";
+	      selectedResumeCandidateIds[key] = fallback;
+	      return fallback;
+	    }
+
+	    function renderResumePane(session) {
+	      const candidates = session && Array.isArray(session.resume_candidates) ? session.resume_candidates : [];
+	      if (!candidates.length) {
+	        return '<div class="control-empty">No resumable Codex CLI sessions were found for this workdir.</div>';
+	      }
+	      const selectedId = selectedResumeCandidateId(session);
+	      const rows = candidates.map((candidate) => {
+	        const id = String(candidate.id || "");
+	        const when = candidate.timestamp ? formatEventTime(candidate.timestamp) : "";
+	        const selected = id === selectedId ? " selected" : "";
+	        const label = candidate.label || id;
+	        return `
+	          <button class="control-resume-item${selected}" type="button" data-resume-candidate="${escapeHtml(id)}">
+	            <span class="control-resume-main">
+	              <span class="control-resume-label">${escapeHtml(label)}</span>
+	              <span class="control-resume-meta">${escapeHtml([when, id].filter(Boolean).join(" / "))}</span>
+	            </span>
+	            <span class="badge">${id === selectedId ? "Selected" : "Choose"}</span>
+	          </button>
+	        `;
+	      }).join("");
+	      const disabled = !selectedId || !socket || socket.readyState !== WebSocket.OPEN ? "disabled" : "";
+	      return `
+	        <section class="control-detail-section">
+	          <h3>Resume Session</h3>
+	          <div class="control-section-body">
+	            <div class="control-resume-list">${rows}</div>
+	            <div class="control-resume-actions">
+	              <button type="button" data-resume-action="resume-session" ${disabled}>Resume</button>
+	              <button type="button" data-resume-action="fork-session" ${disabled}>Fork</button>
+	            </div>
+	          </div>
+	        </section>
+	      `;
+	    }
+
+	    function renderControlModal(force = false) {
+	      const modal = document.getElementById("controlModal");
+	      if (!modal || modal.hidden) return;
+	      if (!force && controlRenderShouldDefer()) {
+	        if (!controlRenderDeferredAt) controlRenderDeferredAt = Date.now();
+	        if (Date.now() - controlRenderDeferredAt < 2000) {
+	          pendingControlRender = true;
+	          scheduleControlRenderFlush();
+	          return;
+	        }
+	      }
+	      controlRenderDeferredAt = 0;
+	      const session = selectedControlSession();
+	      if (!session) {
+	        modal.hidden = true;
+	        return;
+	      }
+	      updateControlDockGeometry();
+	      document.getElementById("controlTitle").textContent = String(session.cwd || session.display || sessionTitle(session));
+	      const active = Number(session.active_requests || 0);
+	      const tunnels = Number(session.active_tunnels || 0);
+	      const pending = Number(session.pending_websocket_work || 0);
+	      const recent = Number(session.recent_websocket_activity || 0);
+	      const associatedProfile = sessionAssociatedProfile(session) || "unknown";
+	      const activeState = recent || pending || active || tunnels ? "Active" : "Idle";
+	      const pills = [
+	        `<span class="pill">${escapeHtml(session.pinned_profile ? `Pinned ${session.pinned_profile}` : `Profile ${associatedProfile}`)}</span>`,
+	        `<span class="pill">Requests <strong>${active}</strong></span>`,
+	        `<span class="pill">Tunnels <strong>${tunnels}</strong></span>`,
+	        `<span class="pill">Turns <strong>${pending}</strong></span>`,
+	        `<span class="pill">${activeState}</span>`
+	      ];
+	      if (session.context && session.context.label) {
+	        const contextTitle = [
+	          session.context.input_tokens ? `${formatNumber(session.context.input_tokens)} input tokens` : "",
+	          session.context.remaining_tokens ? `${formatNumber(session.context.remaining_tokens)} tokens remaining` : "",
+	          session.context.updated_at ? `Updated ${formatEventTime(session.context.updated_at)}` : ""
+	        ].filter(Boolean).join(" / ");
+	        pills.push(`<span class="pill" title="${escapeHtml(contextTitle)}">Context <strong>${escapeHtml(session.context.label)}</strong></span>`);
+	      }
+	      if (session.quota_compact_html) pills.push(String(session.quota_compact_html));
+	      document.getElementById("controlStatusPills").innerHTML = pills.join("");
+	      const panel = modal.querySelector(".control-modal");
+	      if (panel) {
+	        panel.classList.toggle("details-view", controlView === "details");
+	        panel.classList.toggle("resume-view", controlView === "resume");
+	        panel.classList.toggle("discussion-view", controlView === "discussion");
+	      }
+	      document.querySelectorAll("[data-control-view]").forEach((button) => {
+	        button.classList.toggle("active", button.dataset.controlView === controlView);
+	        button.setAttribute("aria-selected", button.dataset.controlView === controlView ? "true" : "false");
+	      });
+	      const content = document.getElementById("controlContent");
+	      const nextScrollKey = controlScrollKey();
+	      const sameScrollSurface = renderedControlScrollKey === nextScrollKey;
+	      const shouldFollowDiscussion = controlView === "discussion"
+	        && !controlSearchText
+	        && (!sameScrollSurface || controlContentAtBottom(content));
+	      if (sameScrollSurface) {
+	        saveControlScroll();
+	        saveControlInnerScroll();
+	      }
+	      if (controlView === "details") {
+	        content.innerHTML = `
+	          <section class="control-detail-section">
+	            <h3>Active Turn State</h3>
+	            <div class="control-section-body">${renderControlActiveDetails(session)}</div>
+	          </section>
+	          <section class="control-detail-section">
+	            <h3>Session Activity</h3>
+	            <div class="control-section-body">${renderControlEvents(session)}</div>
+	          </section>
+	        `;
+	      } else if (controlView === "resume") {
+	        content.innerHTML = renderResumePane(session);
+	      } else {
+	        content.innerHTML = renderControlTranscript(session);
+	      }
+	      normalizeNativeTooltips(modal);
+	      renderedControlScrollKey = nextScrollKey;
+	      if (shouldFollowDiscussion) {
+	        content.scrollTop = content.scrollHeight;
+	      } else {
+	        restoreControlScroll();
+	      }
+	      requestAnimationFrame(restoreControlInnerScroll);
+	      updateControlComposeState(session);
+	      updateControlHeaderActions(session);
+	      requestAnimationFrame(updateControlScrollBadges);
+	      pendingControlRender = false;
+	    }
+
 	    function statsProfileColor(index) {
 	      const colors = ["#d83434", "#198754", "#2563eb", "#b7791f", "#7c3aed", "#0891b2", "#be185d"];
 	      return colors[index % colors.length];
@@ -8085,7 +14163,11 @@ class Handler(BaseHTTPRequestHandler):
 	        .map((point) => ({
 	          profile: String(point.profile || "unknown"),
 	          ts: Date.parse(point.ts || ""),
-	          value: Number(point.value || 0)
+	          value: Number(point.value || 0),
+	          tokens: Number(point.tokens || 0),
+	          traffic: Number(point.traffic || 0),
+	          requests: Number(point.requests || 0),
+	          quotaUpdates: Number(point.quota_updates || 0)
 	        }))
 	        .filter((point) => Number.isFinite(point.ts) && Number.isFinite(point.value));
 	      if (!points.length) {
@@ -8094,12 +14176,40 @@ class Handler(BaseHTTPRequestHandler):
 	      const minTs = Math.min(...points.map((point) => point.ts));
 	      const maxTs = Math.max(...points.map((point) => point.ts));
 	      const maxValue = Math.max(1, ...points.map((point) => point.value));
-	      const width = 760;
-	      const height = 190;
-	      const padX = 24;
-	      const padY = 18;
-	      const usableWidth = width - padX * 2;
-	      const usableHeight = height - padY * 2;
+	      const width = 1000;
+	      const height = 230;
+	      const padLeft = 54;
+	      const padRight = 24;
+	      const padTop = 22;
+	      const padBottom = 34;
+	      const plotRight = width - padRight;
+	      const plotBottom = height - padBottom;
+	      const usableWidth = width - padLeft - padRight;
+	      const usableHeight = height - padTop - padBottom;
+	      const xFor = (ts) => padLeft + (maxTs === minTs ? usableWidth : ((ts - minTs) / (maxTs - minTs)) * usableWidth);
+	      const yFor = (value) => padTop + usableHeight - (value / maxValue) * usableHeight;
+	      const timeLabel = (ts) => new Date(ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+	      const yTicks = [0, maxValue / 2, maxValue];
+	      const xTicks = maxTs === minTs ? [minTs] : [minTs, minTs + (maxTs - minTs) / 2, maxTs];
+	      const yGrid = yTicks.map((value) => {
+	        const y = yFor(value);
+	        return `
+	          <path class="stats-graph-grid" d="M${padLeft} ${y.toFixed(1)}H${width - padRight}"></path>
+	          <text class="stats-graph-label" x="${padLeft - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end">${escapeHtml(formatNumber(Math.round(value)))}</text>
+	        `;
+	      }).join("");
+	      const xGrid = xTicks.map((ts) => {
+	        const x = xFor(ts);
+	        return `
+	          <path class="stats-graph-grid" d="M${x.toFixed(1)} ${padTop}V${height - padBottom}"></path>
+	          <text class="stats-graph-label" x="${x.toFixed(1)}" y="${height - 10}" text-anchor="${ts === minTs ? "start" : ts === maxTs ? "end" : "middle"}">${escapeHtml(timeLabel(ts))}</text>
+	        `;
+	      }).join("");
+	      const referenceY = yFor(maxValue);
+	      const reference = `
+	        <path class="stats-graph-reference" d="M${padLeft} ${referenceY.toFixed(1)}H${width - padRight}"></path>
+	        <text class="stats-graph-label" x="${width - padRight}" y="${(referenceY - 6).toFixed(1)}" text-anchor="end">peak ${escapeHtml(formatNumber(Math.round(maxValue)))}</text>
+	      `;
 	      const grouped = new Map();
 	      for (const point of points) {
 	        if (!grouped.has(point.profile)) grouped.set(point.profile, []);
@@ -8110,24 +14220,169 @@ class Handler(BaseHTTPRequestHandler):
 	        const color = statsProfileColor(profileIndex < 0 ? 0 : profileIndex);
 	        const sorted = rows.slice().sort((a, b) => a.ts - b.ts);
 	        const path = sorted.map((point, index) => {
-	          const x = padX + (maxTs === minTs ? usableWidth : ((point.ts - minTs) / (maxTs - minTs)) * usableWidth);
-	          const y = padY + usableHeight - (point.value / maxValue) * usableHeight;
+	          const x = xFor(point.ts);
+	          const y = yFor(point.value);
 	          return `${index ? "L" : "M"}${x.toFixed(1)} ${y.toFixed(1)}`;
 	        }).join(" ");
-	        return `<path d="${path}" fill="none" stroke="${color}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"></path>`;
+	        const latest = sorted[sorted.length - 1];
+	        const marker = latest
+	          ? `<circle class="stats-graph-marker" cx="${xFor(latest.ts).toFixed(1)}" cy="${yFor(latest.value).toFixed(1)}" r="4.2" fill="${color}"></circle>`
+	          : "";
+	        return `
+	          <path d="${path}" fill="none" stroke="${color}" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"></path>
+	          ${marker}
+	        `;
 	      }).join("");
+	      const interactivePoints = points.map((point) => {
+	        const profileIndex = profiles.indexOf(point.profile);
+	        return {
+	          profile: point.profile,
+	          ts: point.ts,
+	          time: timeLabel(point.ts),
+	          value: point.value,
+	          tokens: point.tokens,
+	          traffic: point.traffic,
+	          requests: point.requests,
+	          quotaUpdates: point.quotaUpdates,
+	          x: xFor(point.ts),
+	          y: yFor(point.value),
+	          color: statsProfileColor(profileIndex < 0 ? 0 : profileIndex)
+	        };
+	      });
 	      return `
-	        <svg class="stats-graph-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Profile usage trend">
-	          <path d="M${padX} ${height - padY}H${width - padX}" stroke="currentColor" opacity="0.22"></path>
-	          <path d="M${padX} ${padY}V${height - padY}" stroke="currentColor" opacity="0.22"></path>
+	        <svg class="stats-graph-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Profile usage trend" data-points="${escapeHtml(JSON.stringify(interactivePoints))}" data-width="${width}" data-height="${height}" data-plot-left="${padLeft}" data-plot-right="${plotRight}" data-plot-top="${padTop}" data-plot-bottom="${plotBottom}">
+	          ${yGrid}
+	          ${xGrid}
+	          <path class="stats-graph-axis" d="M${padLeft} ${height - padBottom}H${width - padRight}"></path>
+	          <path class="stats-graph-axis" d="M${padLeft} ${padTop}V${height - padBottom}"></path>
+	          ${reference}
 	          ${lines}
 	        </svg>
+	        <div class="stats-graph-cursor" hidden></div>
+	        <div class="stats-graph-hover-dot" hidden></div>
+	        <div class="stats-graph-tooltip" hidden></div>
 	      `;
 	    }
+
+	    function statsGraphData(graph) {
+	      const svg = graph ? graph.querySelector(".stats-graph-svg") : null;
+	      if (!svg) return null;
+	      let points = [];
+	      try {
+	        points = JSON.parse(svg.dataset.points || "[]");
+	      } catch {
+	        points = [];
+	      }
+	      if (!Array.isArray(points) || !points.length) return null;
+	      const bounds = svg.getBoundingClientRect();
+	      const width = Number(svg.dataset.width || 1000);
+	      const height = Number(svg.dataset.height || 230);
+	      if (!bounds.width || !bounds.height || !width || !height) return null;
+	      const plot = {
+	        left: Number(svg.dataset.plotLeft || 0),
+	        right: Number(svg.dataset.plotRight || width),
+	        top: Number(svg.dataset.plotTop || 0),
+	        bottom: Number(svg.dataset.plotBottom || height)
+	      };
+	      return { svg, points, bounds, width, height, plot };
+	    }
+
+	    function nearestStatsPoint(graph, clientX, clientY) {
+	      const data = statsGraphData(graph);
+	      if (!data) return null;
+	      const x = ((clientX - data.bounds.left) / data.bounds.width) * data.width;
+	      const y = ((clientY - data.bounds.top) / data.bounds.height) * data.height;
+	      if (
+	        x < data.plot.left ||
+	        x > data.plot.right ||
+	        y < data.plot.top ||
+	        y > data.plot.bottom
+	      ) {
+	        return null;
+	      }
+	      let best = null;
+	      let bestScore = Infinity;
+	      for (const point of data.points) {
+	        const dx = Number(point.x || 0) - x;
+	        const dy = Number(point.y || 0) - y;
+	        const score = Math.abs(dx) * 2 + Math.abs(dy);
+	        if (score < bestScore) {
+	          best = point;
+	          bestScore = score;
+	        }
+	      }
+	      if (!best) return null;
+	      return { point: best, data };
+	    }
+
+	    function statsGraphTooltipHtml(point) {
+	      const traffic = Number(point.traffic || 0);
+	      const value = Number(point.value || 0);
+	      const tokens = Number(point.tokens || 0);
+	      const pieces = [
+	        `<strong>${escapeHtml(point.profile || "unknown")}</strong>`,
+	        `<span>${escapeHtml(point.time || "")}</span>`
+	      ];
+	      if (tokens) pieces.push(`<span>Tokens: ${escapeHtml(formatNumber(tokens))}</span>`);
+	      if (value && value !== tokens) pieces.push(`<span>Trend value: ${escapeHtml(formatNumber(value))}</span>`);
+	      if (traffic) pieces.push(`<span>Traffic: ${escapeHtml(formatBytes(traffic))}</span>`);
+	      if (Number(point.requests || 0)) pieces.push(`<span>Requests: ${escapeHtml(formatNumber(point.requests))}</span>`);
+	      if (Number(point.quotaUpdates || 0)) pieces.push(`<span>Quota updates: ${escapeHtml(formatNumber(point.quotaUpdates))}</span>`);
+	      return pieces.join("");
+	    }
+
+	    function updateStatsGraphHover(graph, event) {
+	      const nearest = nearestStatsPoint(graph, event.clientX, event.clientY);
+	      if (!nearest) {
+	        hideStatsGraphHover(graph);
+	        return;
+	      }
+	      const { point, data } = nearest;
+	      const cursor = graph.querySelector(".stats-graph-cursor");
+	      const dot = graph.querySelector(".stats-graph-hover-dot");
+	      const tooltip = graph.querySelector(".stats-graph-tooltip");
+	      if (!cursor || !dot || !tooltip) return;
+	      const left = (Number(point.x || 0) / data.width) * data.bounds.width;
+	      const top = (Number(point.y || 0) / data.height) * data.bounds.height;
+	      cursor.hidden = false;
+	      dot.hidden = false;
+	      tooltip.hidden = false;
+	      cursor.style.left = `${left}px`;
+	      dot.style.left = `${left}px`;
+	      dot.style.top = `${top}px`;
+	      dot.style.background = point.color || "";
+	      tooltip.innerHTML = statsGraphTooltipHtml(point);
+	      const tooltipWidth = tooltip.offsetWidth || 220;
+	      const tooltipHeight = tooltip.offsetHeight || 96;
+	      const preferredLeft = left > data.bounds.width * 0.58 ? left - tooltipWidth - 12 : left + 12;
+	      const tooltipLeft = Math.max(8, Math.min(data.bounds.width - tooltipWidth - 8, preferredLeft));
+	      const tooltipTop = Math.max(8, Math.min(data.bounds.height - tooltipHeight - 8, top - 42));
+	      tooltip.style.left = `${tooltipLeft}px`;
+	      tooltip.style.top = `${tooltipTop}px`;
+	    }
+
+	    function hideStatsGraphHover(graph) {
+	      for (const selector of [".stats-graph-cursor", ".stats-graph-hover-dot", ".stats-graph-tooltip"]) {
+	        const node = graph ? graph.querySelector(selector) : null;
+	        if (node) node.hidden = true;
+	      }
+	    }
+
+		    function setStatsOpen(open) {
+		      const modal = document.getElementById("statsModal");
+		      const toggle = document.getElementById("statsToggle");
+		      if (!modal) return;
+		      updateControlDockGeometry();
+		      modal.hidden = !open;
+		      if (toggle) toggle.classList.toggle("active", Boolean(open));
+		      if (open) renderStats(latestStats);
+		    }
 
 	    function renderStats(stats) {
 	      const content = document.getElementById("statsContent");
 	      if (!content) return;
+	      const contentScroll = scrollSnapshot(content);
+	      const recentScroll = scrollSnapshot(content.querySelector(".stats-recent"));
 	      const profiles = Array.isArray(stats.profiles) ? stats.profiles : [];
 	      const profileNames = statsProfiles(stats);
 	      syncStatsVisibleProfiles(profileNames);
@@ -8160,7 +14415,7 @@ class Handler(BaseHTTPRequestHandler):
 	          </tr>
 	        `;
 	      }).join("") : '<tr><td colspan="8">No stats recorded yet</td></tr>';
-	      const recent = Array.isArray(stats.recent) ? stats.recent.slice().reverse() : [];
+	      const recent = Array.isArray(stats.recent) ? stats.recent.slice() : [];
 	      const recentHtml = recent.length ? recent.map((event) => `
 	        <div class="stats-event">
 	          <span>${escapeHtml(formatEventTime(event.ts))}</span>
@@ -8199,7 +14454,101 @@ class Handler(BaseHTTPRequestHandler):
 	          <h3>Recent Activity</h3>
 	          <div class="stats-recent">${recentHtml}</div>
 	        </section>
-	      `;
+		      `;
+	      normalizeNativeTooltips(content);
+	      restoreScrollSnapshot(content, contentScroll);
+	      restoreScrollSnapshot(content.querySelector(".stats-recent"), recentScroll);
+		    }
+
+		    function showUiMessage(text) {
+		      const message = document.getElementById("message");
+		      if (!message) return;
+		      if (text) {
+		        message.textContent = text;
+		        message.classList.add("visible");
+		      } else {
+		        message.textContent = "";
+		        message.classList.remove("visible");
+		      }
+		    }
+
+	    function closeConfirmation(result) {
+	      const modal = document.getElementById("confirmModal");
+	      if (modal) modal.hidden = true;
+	      if (pendingConfirmation) {
+	        const resolve = pendingConfirmation.resolve;
+	        pendingConfirmation = null;
+	        resolve(Boolean(result));
+	      }
+	    }
+
+	    function confirmAction({ title = "Confirm action", message = "", acceptLabel = "Confirm", danger = true } = {}) {
+	      const modal = document.getElementById("confirmModal");
+	      const titleNode = document.getElementById("confirmTitle");
+	      const messageNode = document.getElementById("confirmMessage");
+	      const accept = document.getElementById("confirmAccept");
+	      const cancel = document.getElementById("confirmCancel");
+	      if (!modal || !titleNode || !messageNode || !accept || !cancel) {
+	        return Promise.resolve(false);
+	      }
+	      if (pendingConfirmation) closeConfirmation(false);
+	      titleNode.textContent = title;
+	      messageNode.textContent = message;
+	      accept.textContent = acceptLabel;
+	      accept.classList.toggle("danger", Boolean(danger));
+	      modal.hidden = false;
+	      accept.focus();
+	      return new Promise((resolve) => {
+	        pendingConfirmation = { resolve };
+	      });
+	    }
+
+	    function normalizeNativeTooltips(root = document) {
+	      if (!root || !root.querySelectorAll) return;
+	      root.querySelectorAll("[title]").forEach((node) => {
+		        const text = node.getAttribute("title") || "";
+		        node.removeAttribute("title");
+		        if (!text) return;
+		        node.setAttribute("data-tooltip", text);
+		        if (!node.getAttribute("aria-label") && !node.textContent.trim()) {
+		          node.setAttribute("aria-label", text);
+		        }
+	      });
+	    }
+
+	    function uiTooltipTarget(target) {
+	      if (!(target instanceof Element)) return null;
+		      const node = target.closest("[data-tooltip], [title]");
+		      if (!node) return null;
+		      if (node.hasAttribute("title")) normalizeNativeTooltips(node.parentElement || document);
+		      return node.getAttribute("data-tooltip") ? node : null;
+	    }
+
+	    function positionUiTooltip(event, target) {
+	      const tooltip = document.getElementById("uiTooltip");
+	      if (!tooltip || tooltip.hidden) return;
+	      const rect = target.getBoundingClientRect();
+	      const baseX = typeof event.clientX === "number" ? event.clientX : rect.left + rect.width / 2;
+	      const baseY = typeof event.clientY === "number" ? event.clientY : rect.bottom;
+	      const left = Math.max(8, Math.min(window.innerWidth - tooltip.offsetWidth - 8, baseX + 12));
+	      const top = Math.max(8, Math.min(window.innerHeight - tooltip.offsetHeight - 8, baseY + 14));
+	      tooltip.style.left = `${left}px`;
+	      tooltip.style.top = `${top}px`;
+	    }
+
+	    function showUiTooltip(event) {
+	      const target = uiTooltipTarget(event.target);
+	      const tooltip = document.getElementById("uiTooltip");
+	      if (!target || !tooltip) return;
+	      tooltip.textContent = target.getAttribute("data-tooltip") || "";
+	      if (!tooltip.textContent) return;
+	      tooltip.hidden = false;
+	      positionUiTooltip(event, target);
+	    }
+
+	    function hideUiTooltip() {
+	      const tooltip = document.getElementById("uiTooltip");
+	      if (tooltip) tooltip.hidden = true;
 	    }
 
 	    function setConnection(label, state) {
@@ -8577,6 +14926,9 @@ class Handler(BaseHTTPRequestHandler):
       const liveBusy = Boolean(status.live_busy);
       latestLiveBusy = liveBusy;
       latestStats = status.stats || latestStats || { profiles: [], recent: [] };
+      latestControlPlane = status.control_plane || latestControlPlane || { sessions: [] };
+      observeControlUserInputs(latestControlPlane);
+      latestCodex = status.codex || latestCodex || {};
       if (Array.isArray(status.model_catalog)) latestModelCatalog = status.model_catalog;
 	      if ((pendingAction === "refresh_quota" || pendingAction === "consume_reset_credit") && pendingProfile) {
 	        quotaRefreshInFlight = pendingProfile;
@@ -8591,6 +14943,8 @@ class Handler(BaseHTTPRequestHandler):
 	      document.getElementById("codexVersion").textContent = codexCli.version || "unknown";
 	      document.getElementById("activeRequests").textContent = String(activeRequests);
 	      document.getElementById("activeTunnels").textContent = String(activeTunnels);
+	      renderSessionTabs(status);
+	      renderLauncherBar(status);
 	      const connection = document.getElementById("connectionState");
 	      const isDisconnected = connection.textContent === "Disconnected";
 	      if (!isDisconnected) {
@@ -8601,18 +14955,16 @@ class Handler(BaseHTTPRequestHandler):
       document.getElementById("profileRows").innerHTML = (status.profiles || [])
         .map((profile) => profileRow(profile, pendingAction, pendingProfile))
         .join("");
+	      normalizeNativeTooltips(document.getElementById("profileRows"));
 	      restoreOpenMenus();
 	      if (!document.getElementById("statsModal").hidden) {
 	        renderStats(latestStats);
-	      }
-      const message = document.getElementById("message");
-      if (packet.message) {
-        message.textContent = packet.message;
-        message.classList.add("visible");
-      } else {
-        message.textContent = "";
-        message.classList.remove("visible");
       }
+	      renderControlModal();
+	      normalizeNativeTooltips(document);
+	      if (typeof packet.message === "string") {
+	        showUiMessage(packet.message);
+	      }
     }
 
     function connect() {
@@ -8626,6 +14978,8 @@ class Handler(BaseHTTPRequestHandler):
       socket = new WebSocket(url.toString());
 	      socket.addEventListener("open", () => {
 	        setConnection("Live", "");
+	        renderLauncherBar({ control_plane: latestControlPlane });
+	        updateControlHeaderActions(selectedControlSession());
 	        scheduleNextQuotaRefresh(250);
 	      });
       socket.addEventListener("message", (event) => {
@@ -8641,15 +14995,19 @@ class Handler(BaseHTTPRequestHandler):
 	      socket.addEventListener("close", () => {
 	        quotaRefreshInFlight = "";
 	        setConnection("Disconnected", "disconnected");
+	        renderLauncherBar({ control_plane: latestControlPlane });
+	        updateControlHeaderActions(selectedControlSession());
 	        reconnectTimer = setTimeout(connect, 1500);
 	      });
 	      socket.addEventListener("error", () => {
 	        quotaRefreshInFlight = "";
 	        setConnection("Disconnected", "disconnected");
+	        renderLauncherBar({ control_plane: latestControlPlane });
+	        updateControlHeaderActions(selectedControlSession());
 	      });
     }
 
-	    document.addEventListener("submit", (event) => {
+	    document.addEventListener("submit", async (event) => {
       const form = event.target.closest("form[data-action]");
       if (!form) return;
 	      if (!socket || socket.readyState !== WebSocket.OPEN) return;
@@ -8657,7 +15015,15 @@ class Handler(BaseHTTPRequestHandler):
 	      const action = form.dataset.action;
 	      const profile = form.dataset.profile || "";
 	      const confirmMessage = form.dataset.confirm || "";
-	      if (confirmMessage && !window.confirm(confirmMessage)) return;
+	      if (confirmMessage) {
+	        const confirmed = await confirmAction({
+	          title: action === "consume_reset_credit" ? "Use reset credit" : "Confirm action",
+	          message: confirmMessage,
+	          acceptLabel: action === "consume_reset_credit" ? "Use credit" : "Confirm",
+	          danger: action === "consume_reset_credit"
+	        });
+	        if (!confirmed) return;
+	      }
 	      if ((action === "refresh_quota" || action === "consume_reset_credit") && profile) {
 	        quotaRefreshAttempted.add(profile);
 	        let queuedIndex = quotaRefreshQueue.indexOf(profile);
@@ -8731,19 +15097,311 @@ class Handler(BaseHTTPRequestHandler):
 	      closeOpenMenus();
 	    });
 
+	    document.addEventListener("pointerover", showUiTooltip);
+	    document.addEventListener("pointermove", (event) => {
+	      const target = uiTooltipTarget(event.target);
+	      if (target) positionUiTooltip(event, target);
+	    });
+	    document.addEventListener("pointerout", (event) => {
+	      const next = event.relatedTarget;
+	      if (next instanceof Element && uiTooltipTarget(next)) return;
+	      hideUiTooltip();
+	    });
+	    document.addEventListener("focusin", showUiTooltip);
+	    document.addEventListener("focusout", hideUiTooltip);
+
+	    document.getElementById("launcherSession").addEventListener("change", (event) => {
+	      selectedLauncherSessionKey = event.target.value || "";
+	      launcherResumeSessionId = "";
+	      renderLauncherBar({ control_plane: latestControlPlane });
+	    });
+
+	    document.getElementById("launcherMode").addEventListener("change", (event) => {
+	      launcherMode = event.target.value || "new";
+	      renderLauncherBar({ control_plane: latestControlPlane });
+	    });
+
+	    document.getElementById("launcherPermission").addEventListener("change", (event) => {
+	      launcherPermission = event.target.value || "workspace-write";
+	    });
+
+		    document.getElementById("launcherResumeSession").addEventListener("change", (event) => {
+		      launcherResumeSessionId = event.target.value || "";
+		      renderLauncherBar({ control_plane: latestControlPlane });
+		    });
+
+	    document.getElementById("launcherStart").addEventListener("click", () => {
+	      const sessionId = launcherMode === "resume-session" ? launcherResumeSessionId : "";
+	      if (launcherMode === "resume-session" && !sessionId) return;
+	      sendLaunchSession(
+	        selectedLauncherSessionKey,
+	        launcherMode,
+	        sessionId
+	      );
+	      launcherPanelOpen = false;
+	      renderSessionTabs({ control_plane: latestControlPlane });
+	      renderLauncherBar({ control_plane: latestControlPlane });
+	    });
+
+	    document.getElementById("launcherClose").addEventListener("click", () => {
+	      launcherPanelOpen = false;
+	      renderSessionTabs({ control_plane: latestControlPlane });
+	      renderLauncherBar({ control_plane: latestControlPlane });
+	    });
+
+	    document.getElementById("controlTurnSelect").addEventListener("change", (event) => {
+	      if (!selectedControlSessionKey) return;
+	      const selectedTurn = event.target.value || "";
+	      selectedControlTurnKeys[selectedControlSessionKey] = selectedTurn;
+	      if (selectedTurn) manuallySelectedControlTurnKeys[selectedControlSessionKey] = selectedTurn;
+	      else delete manuallySelectedControlTurnKeys[selectedControlSessionKey];
+	      delete followLatestTurnAfterUserInput[selectedControlSessionKey];
+	      saveControlScroll();
+	      renderControlModal(true);
+	    });
+
+	    document.getElementById("controlTurnSelect").addEventListener("pointerenter", () => {
+	      controlTurnSelectInteracting = true;
+	    });
+
+	    document.getElementById("controlTurnSelect").addEventListener("pointerleave", () => {
+	      controlTurnSelectInteracting = false;
+	      updateControlHeaderActions(selectedControlSession());
+	    });
+
+	    document.getElementById("controlTurnSelect").addEventListener("focus", () => {
+	      controlTurnSelectInteracting = true;
+	    });
+
+	    document.getElementById("controlTurnSelect").addEventListener("blur", () => {
+	      controlTurnSelectInteracting = false;
+	      updateControlHeaderActions(selectedControlSession());
+	    });
+
+	    document.getElementById("sessionTabs").addEventListener("click", (event) => {
+	      const target = event.target;
+	      if (!(target instanceof Element)) return;
+		      const close = target.closest("[data-session-close]");
+		      if (close) {
+		        event.preventDefault();
+		        event.stopPropagation();
+		        forgetControlSession(close.dataset.sessionClose || "");
+		        return;
+		      }
+	      const launchTab = target.closest("[data-launch-tab]");
+	      if (launchTab) {
+	        saveControlScroll();
+			        resetControlPromptHistory();
+		        launcherPanelOpen = true;
+	        selectedControlSessionKey = "";
+	        pendingControlRender = false;
+	        document.getElementById("controlModal").hidden = true;
+	        renderSessionTabs({ control_plane: latestControlPlane });
+	        renderLauncherBar({ control_plane: latestControlPlane });
+	        return;
+	      }
+	      const tab = target.closest(".session-tab");
+	      if (!tab) return;
+		      saveControlScroll();
+		      resetControlPromptHistory();
+		      launcherPanelOpen = false;
+	      selectedControlSessionKey = tab.dataset.sessionKey || "";
+	      selectedLauncherSessionKey = selectedControlSessionKey;
+	      document.getElementById("controlModal").hidden = false;
+	      renderSessionTabs({ control_plane: latestControlPlane });
+	      renderLauncherBar({ control_plane: latestControlPlane });
+	      updateControlDockGeometry();
+	      renderControlModal(true);
+	    });
+
+		    document.getElementById("sessionTabs").addEventListener("dragstart", (event) => {
+		      const target = event.target;
+		      if (!(target instanceof Element)) return;
+		      const tab = target.closest(".session-tab[data-session-key]");
+		      if (!tab) return;
+		      draggedSessionTabKey = tab.dataset.sessionKey || "";
+		      tab.classList.add("dragging");
+		      if (event.dataTransfer) {
+		        event.dataTransfer.effectAllowed = "move";
+		        event.dataTransfer.setData("text/plain", draggedSessionTabKey);
+		      }
+		    });
+
+		    document.getElementById("sessionTabs").addEventListener("dragover", (event) => {
+		      if (!draggedSessionTabKey) return;
+		      const target = event.target;
+		      if (!(target instanceof Element)) return;
+		      const tab = target.closest(".session-tab[data-session-key]");
+		      if (!tab || tab.dataset.sessionKey === draggedSessionTabKey) return;
+		      event.preventDefault();
+		      clearSessionTabDropClasses();
+		      tab.classList.add(sessionTabDropPosition(tab, event) === "after" ? "drop-after" : "drop-before");
+		    });
+
+		    document.getElementById("sessionTabs").addEventListener("dragleave", (event) => {
+		      const target = event.target;
+		      if (!(target instanceof Element)) return;
+		      const tab = target.closest(".session-tab[data-session-key]");
+		      if (tab) tab.classList.remove("drop-before", "drop-after");
+		    });
+
+		    document.getElementById("sessionTabs").addEventListener("drop", (event) => {
+	      if (!draggedSessionTabKey) return;
+	      event.preventDefault();
+	      const container = document.getElementById("sessionTabs");
+		      const dragged = Array.from(container.querySelectorAll(".session-tab[data-session-key]"))
+		        .find((tab) => tab.dataset.sessionKey === draggedSessionTabKey);
+		      const target = event.target instanceof Element ? event.target.closest(".session-tab[data-session-key]") : null;
+		      if (dragged && target && target !== dragged) {
+		        const position = sessionTabDropPosition(target, event);
+		        container.insertBefore(dragged, position === "after" ? target.nextSibling : target);
+		        sendSessionTabOrder();
+		      }
+		      draggedSessionTabKey = "";
+		      clearSessionTabDropClasses();
+		    });
+
+		    document.getElementById("sessionTabs").addEventListener("dragend", () => {
+		      draggedSessionTabKey = "";
+		      clearSessionTabDropClasses();
+		    });
+
+	    document.getElementById("controlForget").addEventListener("click", async () => {
+		      await forgetControlSession(selectedControlSessionKey);
+	    });
+
+	    document.getElementById("controlClose").addEventListener("click", () => {
+	      document.getElementById("controlModal").hidden = true;
+	      selectedControlSessionKey = "";
+	      pendingControlRender = false;
+	      renderSessionTabs({ control_plane: latestControlPlane });
+	      renderLauncherBar({ control_plane: latestControlPlane });
+	    });
+
+	    document.getElementById("controlModal").addEventListener("click", (event) => {
+	      if (event.target === event.currentTarget) {
+	        event.currentTarget.hidden = true;
+	        selectedControlSessionKey = "";
+	        pendingControlRender = false;
+	        renderSessionTabs({ control_plane: latestControlPlane });
+	        renderLauncherBar({ control_plane: latestControlPlane });
+	      }
+	    });
+
+	    document.querySelectorAll("[data-control-view]").forEach((button) => {
+	      button.addEventListener("click", () => {
+	        saveControlScroll();
+	        controlView = button.dataset.controlView || "discussion";
+	        renderControlModal(true);
+	      });
+	    });
+
+	    document.getElementById("controlSearch").addEventListener("input", (event) => {
+	      controlSearchText = event.target.value || "";
+	      renderControlModal(true);
+	    });
+
+	    document.getElementById("controlContent").addEventListener("click", (event) => {
+	      const target = event.target;
+	      if (!(target instanceof Element)) return;
+	      const candidate = target.closest("[data-resume-candidate]");
+	      if (candidate && selectedControlSessionKey) {
+	        selectedResumeCandidateIds[selectedControlSessionKey] = candidate.dataset.resumeCandidate || "";
+	        renderControlModal(true);
+	        return;
+	      }
+	      const resumeAction = target.closest("[data-resume-action]");
+	      if (resumeAction && selectedControlSessionKey) {
+	        const selectedId = selectedResumeCandidateIds[selectedControlSessionKey] || "";
+	        if (!selectedId) return;
+	        sendLaunchSession(selectedControlSessionKey, resumeAction.dataset.resumeAction || "resume-session", selectedId);
+	        return;
+	      }
+	      const button = target.closest(".control-show-more");
+	      if (!button) return;
+	      const key = button.dataset.messageKey || "";
+	      if (!key) return;
+	      expandedControlMessages[key] = !expandedControlMessages[key];
+	      renderControlModal(true);
+	    });
+
+		    document.getElementById("controlContent").addEventListener("scroll", () => {
+		      saveControlScroll();
+		      updateControlScrollBadges();
+		    }, { passive: true });
+
+	    document.getElementById("controlPrompt").addEventListener("input", () => {
+		      resetControlPromptHistory();
+	      updateControlComposeState(selectedControlSession());
+	    });
+
+	    document.getElementById("controlPrompt").addEventListener("keydown", (event) => {
+		      if (handleControlPromptHistory(event)) return;
+	      if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+	      event.preventDefault();
+	      document.getElementById("controlCompose").requestSubmit();
+	    });
+
+	    document.getElementById("controlCompose").addEventListener("submit", (event) => {
+	      event.preventDefault();
+	      const prompt = document.getElementById("controlPrompt");
+	      const text = prompt.value.trim();
+	      if (!text || !selectedControlSessionKey) return;
+	      if (!socket || socket.readyState !== WebSocket.OPEN) {
+	        showUiMessage("Dashboard websocket is not connected.");
+	        return;
+	      }
+	      socket.send(JSON.stringify({
+	        action: "session_prompt",
+	        session_key: selectedControlSessionKey,
+	        prompt: text,
+	        token: TOKEN
+	      }));
+	      delete manuallySelectedControlTurnKeys[selectedControlSessionKey];
+	      followLatestTurnAfterUserInput[selectedControlSessionKey] = true;
+	      selectedControlTurnKeys[selectedControlSessionKey] = "";
+	      prompt.value = "";
+		      resetControlPromptHistory();
+	      updateControlComposeState(selectedControlSession());
+	    });
+
+	    function sendSessionEscape() {
+	      if (!selectedControlSessionKey) return false;
+	      const session = selectedControlSession();
+	      if (!controlInteractionAvailable(session)) return false;
+	      if (!socket || socket.readyState !== WebSocket.OPEN) {
+	        showUiMessage("Dashboard websocket is not connected.");
+	        return true;
+	      }
+	      socket.send(JSON.stringify({
+	        action: "session_escape",
+	        session_key: selectedControlSessionKey,
+	        token: TOKEN
+	      }));
+	      return true;
+	    }
+
+	    document.addEventListener("keydown", (event) => {
+	      if (event.key !== "Escape" || event.defaultPrevented || pendingConfirmation) return;
+	      const modal = document.getElementById("controlModal");
+	      if (!modal || modal.hidden) return;
+	      const active = document.activeElement;
+	      if (active && active.id === "controlSearch") return;
+	      if (sendSessionEscape()) event.preventDefault();
+	    });
+
 	    document.getElementById("statsToggle").addEventListener("click", () => {
 	      const modal = document.getElementById("statsModal");
-	      renderStats(latestStats);
-	      modal.hidden = false;
+		      setStatsOpen(!modal || modal.hidden);
 	    });
 
 	    document.getElementById("statsClose").addEventListener("click", () => {
-	      document.getElementById("statsModal").hidden = true;
+		      setStatsOpen(false);
 	    });
 
 	    document.getElementById("statsModal").addEventListener("click", (event) => {
 	      if (event.target === event.currentTarget) {
-	        event.currentTarget.hidden = true;
+		        setStatsOpen(false);
 	      }
 	    });
 
@@ -8752,6 +15410,41 @@ class Handler(BaseHTTPRequestHandler):
 	      if (!(target instanceof HTMLInputElement) || !target.classList.contains("stats-profile-check")) return;
 	      statsVisibleProfiles[target.value] = target.checked;
 	      renderStats(latestStats);
+	    });
+
+	    document.getElementById("statsContent").addEventListener("pointermove", (event) => {
+	      const target = event.target;
+	      if (!(target instanceof Element)) return;
+	      const graph = target.closest(".stats-graph");
+	      if (!graph) return;
+	      updateStatsGraphHover(graph, event);
+	    });
+
+	    document.getElementById("statsContent").addEventListener("pointerdown", (event) => {
+	      const target = event.target;
+	      if (!(target instanceof Element)) return;
+	      const graph = target.closest(".stats-graph");
+	      if (!graph) return;
+	      updateStatsGraphHover(graph, event);
+	    });
+
+	    document.getElementById("statsContent").addEventListener("pointerleave", (event) => {
+	      const target = event.target;
+	      if (!(target instanceof Element)) return;
+	      const graph = target.closest(".stats-graph");
+	      if (graph) hideStatsGraphHover(graph);
+	    }, true);
+
+	    document.getElementById("confirmCancel").addEventListener("click", () => {
+	      closeConfirmation(false);
+	    });
+
+	    document.getElementById("confirmAccept").addEventListener("click", () => {
+	      closeConfirmation(true);
+	    });
+
+	    document.getElementById("confirmModal").addEventListener("click", (event) => {
+	      if (event.target === event.currentTarget) closeConfirmation(false);
 	    });
 
 	    document.getElementById("themeToggle").addEventListener("click", () => {
@@ -8765,9 +15458,34 @@ class Handler(BaseHTTPRequestHandler):
 	      }
 	    });
 
+	    document.addEventListener("keydown", (event) => {
+	      if (event.key === "Escape" && pendingConfirmation) {
+	        event.preventDefault();
+	        closeConfirmation(false);
+	      }
+	    });
+
+	    window.addEventListener("resize", () => {
+	      updateControlDockGeometry();
+	      renderControlModal(true);
+	    });
+
+	    document.addEventListener("selectionchange", () => {
+	      if (!controlSelectionActive()) setTimeout(flushPendingControlRender, 0);
+	    });
+
+	    document.getElementById("controlModal").addEventListener("focusout", () => {
+	      setTimeout(flushPendingControlRender, 0);
+	    });
+
+	    document.getElementById("controlModal").addEventListener("mouseup", () => {
+	      setTimeout(flushPendingControlRender, 0);
+	    });
+
 	    document.getElementById("statsToggle").innerHTML = CHART_ICON;
 	    updateThemeToggle();
 	    render(INITIAL);
+	    normalizeNativeTooltips(document);
 	    connect();
   </script>
 </body>

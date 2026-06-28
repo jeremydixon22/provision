@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "provision"
-version = "0.2.2"
-description = "Local profile-switching proxy and dashboard for Codex CLI"
+version = "0.3.0"
+description = "Linux-native control plane and account manager for Codex CLI"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"

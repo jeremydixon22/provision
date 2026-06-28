@@ -2,20 +2,21 @@
   <img src="src/provision/assets/provision.png" alt="Provision logo" width="700">
 </p>
 
-Provision is a local profile-switching proxy and dashboard for Codex CLI. Run
-`provision` instead of `codex` to keep Codex CLI's normal terminal workflow,
-resume history, and built-in login flow while Provision manages upstream
-credentials and session-aware switching.
+Provision is a Linux-native control plane and account manager for Codex CLI.
+Run `provision` instead of `codex` to keep Codex CLI's normal terminal workflow,
+resume history, and built-in login flow while adding a local browser dashboard
+for sessions, launch/resume, live terminal-backed interaction, quotas, reset
+credits, usage stats, and account-aware routing.
 
 Provision is useful even when you only use one account: it gives Codex CLI a
-localhost dashboard for active requests, live tunnels, observed working
-directories, per-account quota, and quota reset timing. With multiple accounts,
-it adds named ChatGPT login profiles, safe profile switching, and session pins
-so one Codex CLI session can stay tied to an account while another session uses
-a different profile.
+localhost dashboard for active sessions, live turns, terminal-backed input,
+quota/reset timing, reset-credit visibility, and usage trends. With multiple
+accounts, it adds named ChatGPT login profiles, safe profile switching, and
+session pins so one Codex CLI workspace can stay tied to an account while
+another workspace uses a different profile.
 
 The current implementation targets Codex CLI with ChatGPT login profiles. It is
-not a desktop Codex client or a remote control plane.
+not a desktop Codex client or a hosted multi-user service.
 
 The earlier cross-CLI credential research is still available in
 [docs/cli-credential-isolation.md](docs/cli-credential-isolation.md).
@@ -51,6 +52,10 @@ For example:
 ./bin/provision resume --last
 ```
 
+Open `provision ui` for the dashboard. The `+` tab can launch Codex CLI in an
+observed workdir, choose a permission preset, or resume a known session while
+keeping Codex CLI's native transcript history.
+
 For normal command usage, put `bin/provision` on PATH or install editable:
 
 ```bash
@@ -79,8 +84,14 @@ provision login --help
 
 - Named Codex CLI ChatGPT login profiles captured through isolated temporary
   `CODEX_HOME` directories.
-- A localhost dashboard with profile state, active request counts, WebSocket
-  tunnel state, observed working directories, session pins, and quota bars.
+- A localhost Codex CLI control plane with session tabs, launcher/resume
+  controls, discussion view, session details, live compose, and observed tool
+  activity.
+- PTY-backed UI interaction for Provision-managed launchers, so dashboard input
+  is sent to the running Codex CLI terminal rather than forking an unrelated
+  app-server thread.
+- A profile/account dashboard with active request counts, WebSocket tunnel
+  state, observed working directories, session pins, and quota bars.
 - Session-aware switching: unpinned Codex CLI activity blocks account changes,
   while pinned sessions can remain active without blocking switches for other
   sessions.
@@ -88,14 +99,15 @@ provision login --help
   refreshes shortly after detected quota reset times.
 - Rate-limit reset credit visibility and confirmation-gated redemption for
   supported Codex CLI app-server builds.
+- Usage stats with profile-level request, tunnel, traffic, token, fast-mode,
+  quota movement, and reset-credit activity.
 - Timestamped `/status` quota labels so Codex CLI can show which Provision
   profile supplied the displayed quota.
 - Codex CLI compatibility reporting in `provision status`, `provision doctor`,
   and the dashboard header, including the installed Codex CLI version and
   bundled model catalog source.
-- Read-only Codex CLI app-server control-plane readiness reporting, so future
-  thread/turn/token-usage integration can be gated on discovered local
-  capabilities instead of assumed Codex internals.
+- Codex CLI app-server capability probing for account usage, reset credits, and
+  future native app-server control-plane work.
 - Resume-compatible launching that keeps Codex CLI's native transcript history
   and `model_provider=openai` session identity intact.
 
@@ -107,6 +119,11 @@ to identify the calling working directory. The daemon removes that sentinel
 before forwarding upstream and injects the selected Provision profile's real
 credentials.
 
+When Codex CLI is launched through Provision, the launcher also maintains a
+local PTY bridge. The browser dashboard can use that bridge to show Codex CLI
+activity and send input to the same terminal session, preserving one
+conversation instead of creating a separate app-server thread.
+
 This keeps Codex CLI-compatible behavior intact:
 
 - `codex resume` and `provision resume` see the same local transcripts.
@@ -116,6 +133,9 @@ This keeps Codex CLI-compatible behavior intact:
   usage requests are proxied through the same account-selection layer.
 - Profile switches are refused while unpinned upstream work is active, with a
   short idle grace period before switching becomes available.
+- Dashboard control works for Provision-managed launchers. Stock Codex CLI
+  sessions may still be visible through proxy observations, but they do not have
+  the same live PTY input channel.
 
 ## Profiles
 
@@ -166,12 +186,20 @@ provision ui
 The dashboard is localhost-only and shows:
 
 - Active profile, active requests, active tunnels, and live idle/busy state.
+- Provision-managed Codex CLI sessions as tabs, including observed titles,
+  workdirs, active turn state, and session details.
+- A `+` launcher for starting Codex CLI in known workdirs, selecting permission
+  presets, and choosing recent sessions to resume.
+- A Discussion view with Markdown rendering, searchable transcript content,
+  tool-call activity, and a terminal-backed compose box for live interaction.
 - All enrolled profiles and their last-known quota.
 - Stacked quota bars for short-window and weekly limits, including reset times.
 - Available rate-limit reset credits, with a confirmation prompt before one is
   consumed.
 - Extra quota buckets when the upstream account reports them.
 - Observed Codex CLI working directories and session pins.
+- Usage stats with profile filters, a trend graph, profile totals, and a recent
+  activity feed.
 - Light/dark mode following the system preference, with a manual toggle.
 - The installed Codex CLI version and live compatibility state observed by
   Provision.
@@ -184,11 +212,20 @@ development and daemon upgrades do not leave stale UI code running in-place.
 These screenshots use sanitized fixture data generated by
 `tools/render_demo_assets.py`.
 
+Profile, model, quota, reset-credit, and session overview:
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/media/provision-dashboard-desktop-dark.png">
     <img src="docs/media/provision-dashboard-desktop-light.png" alt="Provision dashboard desktop screenshot" width="860">
   </picture>
+</p>
+
+Session control plane with observed turns, tool activity, resume controls, and
+terminal-backed compose:
+
+<p align="center">
+  <img src="docs/media/provision-control-plane-desktop-light.png" alt="Provision Codex CLI control plane screenshot" width="860">
 </p>
 
 <p align="center">
@@ -279,11 +316,13 @@ These files include credentials. Do not commit or sync them casually.
 | Command | Purpose |
 | --- | --- |
 | `provision` | Launch Codex CLI through the active Provision profile. |
+| `provision resume [--last\|--all] [Codex CLI args...]` | Resume Codex CLI through Provision while preserving native Codex CLI transcript history. |
+| `provision exec "prompt"` | Run Codex CLI non-interactively through the active Provision profile. |
 | `provision import-default [--name <profile_name>] [--overwrite]` | Import the current stock Codex CLI `~/.codex/auth.json` as a Provision profile. Defaults to `default`; existing profiles are left unchanged unless `--overwrite` is set. |
 | `provision login <profile_name> [--device-auth]` | Capture a new Codex CLI ChatGPT login into an isolated Provision profile. |
 | `provision profiles` | List enrolled profiles and show which one is active. |
 | `provision use <profile_name>` | Switch the active profile when unpinned proxy work is idle. |
-| `provision ui [--port <port>]` | Start the daemon if needed and print the localhost dashboard URL. |
+| `provision ui [--port <port>]` | Start the daemon if needed and print the localhost dashboard URL for profiles, sessions, quota, stats, and launch/resume controls. |
 | `provision status` | Print JSON status for Provision home, Codex CLI compatibility, daemon, active profile, profiles, and dashboard URL. |
 | `provision app-server-probe [--read-account]` | Inspect the installed Codex CLI app-server schema, including usage, reset-credit, and control-plane readiness; with `--read-account`, start a short-lived Codex app-server and read account usage/rate-limit data for the current Codex CLI login. |
 | `provision start [--port <port>]` | Start the local proxy daemon without launching Codex CLI. |
@@ -345,17 +384,18 @@ isolation issues. See [SECURITY.md](SECURITY.md).
 - Provision targets Codex CLI. It does not currently manage desktop Codex apps.
 - The dashboard is localhost-only. It is intended for a single local user, not a
   remote multi-user control plane.
+- Live dashboard input depends on launching Codex CLI through Provision's PTY
+  bridge. Sessions that are only observed through proxy traffic can appear in
+  the dashboard, but may not be controllable from the browser.
 - Provision keeps Codex CLI's built-in `openai` provider identity for resume
   compatibility. Native Codex CLI account identity can therefore reflect the
   stock `~/.codex/auth.json`; Provision status labels, `provision status`, and
   `~/.provision/daemon.log` show the profile actually used by the proxy.
 - Quota sections are shaped from upstream usage payloads. If a profile or plan
   does not report a bucket, Provision does not invent one.
-- Turn/activity tracking is still based on Provision's proxy observations and
-  recognized Codex CLI traffic shapes. Provision reports whether the installed
-  Codex CLI app-server exposes read-only thread, turn, and token-usage
-  control-plane surfaces, but it does not yet depend on that experimental path
-  or start/steer turns from the dashboard.
+- Turn/activity tracking is based on Provision's PTY bridge, proxy observations,
+  and recognized Codex CLI traffic shapes. Codex CLI app-server control-plane
+  surfaces are probed but remain optional.
 - Codex CLI still applies its normal current-working-directory filter in the
   resume picker. Use `provision resume --all` when launching from a different
   directory than the sessions you want to see.
@@ -370,10 +410,12 @@ isolation issues. See [SECURITY.md](SECURITY.md).
   upstream billing, usage, or limits endpoints can be integrated cleanly.
 - Optional policy controls such as workspace defaults, spend guardrails, audit
   logs, and key rotation metadata.
-- Deeper Codex CLI app-server integration for richer activity tracking,
-  thread/turn state, token usage, login orchestration, model metadata, and
-  possibly cleaner `chatgptAuthTokens`-style credential injection if that
-  upstream surface becomes stable enough for third-party use.
+- A Provision-native app-server UI mode for users who intentionally want a
+  browser-first workflow separate from the Codex CLI terminal.
+- Deeper Codex CLI app-server integration for richer thread/turn state, token
+  usage, login orchestration, model metadata, and possibly cleaner
+  `chatgptAuthTokens`-style credential injection if that upstream surface
+  becomes stable enough for third-party use.
   See
   [docs/codex-app-server-integration.md](docs/codex-app-server-integration.md).
 

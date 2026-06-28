@@ -32,16 +32,19 @@ class Paths:
         self.codex = self.home / "codex"
         self.profiles = self.codex / "profiles"
         self.capture = self.codex / "capture"
+        self.launchers = self.codex / "launchers"
         self.active_profile = self.codex / "active-profile"
         self.profile_settings = self.codex / "profile-settings.json"
         self.session_pins = self.codex / "session-pins.json"
+        self.session_tabs = self.codex / "session-tabs.json"
         self.stats = self.codex / "stats.jsonl"
         self.reset_credit_events = self.codex / "reset-credit-events.jsonl"
+        self.reset_credit_state = self.codex / "reset-credit-state.json"
         self.state = self.home / "daemon.json"
         self.proxy_token = self.home / "proxy-token"
         self.log = self.home / "daemon.log"
 
     def ensure_base(self) -> None:
-        for path in (self.home, self.codex, self.profiles, self.capture):
+        for path in (self.home, self.codex, self.profiles, self.capture, self.launchers):
             path.mkdir(parents=True, exist_ok=True)
             path.chmod(0o700)

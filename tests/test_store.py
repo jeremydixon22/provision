@@ -27,8 +27,12 @@ from provision.daemon import analytics_turn_ids
 from provision.daemon import backend_proxy_prefix
 from provision.daemon import backend_upstream_path
 from provision.daemon import BillingRequiredError
+from provision.daemon import bridge_codex_history_into_app_home
 from provision.daemon import CHATGPT_ANALYTICS_EVENTS_PATH
+from provision.daemon import codex_resume_candidates_for_cwd
+from provision.daemon import DEFAULT_UPSTREAM_USER_AGENT
 from provision.daemon import error_requires_billing
+from provision.daemon import ensure_default_upstream_user_agent
 from provision.daemon import label_usage_payload
 from provision.daemon import logo_asset_bytes
 from provision.daemon import Handler
@@ -40,6 +44,7 @@ from provision.daemon import daemon_url_host
 from provision.daemon import daemon_bind_address
 from provision.daemon import project_session_sentinel
 from provision.daemon import redact_proxy_token
+from provision.daemon import render_compact_quota_html
 from provision.daemon import render_quota_html
 from provision.daemon import request_body_session
 from provision.daemon import rewrite_model_body
@@ -63,7 +68,9 @@ from provision.daemon import websocket_message_has_terminal_event
 from provision.daemon import websocket_message_completion_action
 from provision.daemon import websocket_message_has_tool_output
 from provision.daemon import websocket_message_starts_response
+from provision.daemon import websocket_message_thread_id
 from provision.daemon import websocket_message_token_usage
+from provision.daemon import websocket_message_tool_entries
 from provision.daemon import websocket_message_turn_id
 from provision.daemon import websocket_terminal_event_keeps_work_pending
 from provision.launcher import chatgpt_base_url_override
@@ -71,7 +78,7 @@ from provision.launcher import configured_daemon_host
 from provision.launcher import configured_daemon_port
 from provision.launcher import openai_base_url_override
 from provision.paths import Paths
-from provision.store import Store
+from provision.store import Store, StoreError
 
 
 def fake_jwt(payload: dict) -> str:
@@ -153,6 +160,19 @@ class StoreTests(unittest.TestCase):
         self.assertFalse(should_forward_incoming_header("OpenAI-Organization"))
         self.assertFalse(should_forward_incoming_header("OpenAI-Project"))
         self.assertTrue(should_forward_incoming_header("X-Codex-Turn-State"))
+
+    def test_forwarded_headers_get_non_urllib_user_agent(self) -> None:
+        headers = ensure_default_upstream_user_agent({"accept-encoding": "identity"})
+        self.assertEqual(headers["User-Agent"], DEFAULT_UPSTREAM_USER_AGENT)
+
+    def test_forwarded_headers_preserve_incoming_user_agent(self) -> None:
+        headers = ensure_default_upstream_user_agent(
+            {
+                "accept-encoding": "identity",
+                "User-Agent": "codex-cli-test",
+            }
+        )
+        self.assertEqual(headers["User-Agent"], "codex-cli-test")
 
     def test_backend_proxy_path_strips_local_token_prefix(self) -> None:
         self.assertEqual(backend_proxy_prefix("tok_123"), "/backend-api/provision-tok_123")
@@ -287,6 +307,62 @@ class StoreTests(unittest.TestCase):
         self.assertIn("gpt-5.3-codex-spark", markup)
         self.assertIn("quota-stack-bar", markup)
 
+    def test_compact_quota_html_selects_model_bucket(self) -> None:
+        markup = render_compact_quota_html(
+            {
+                "payload": {
+                    "rate_limit": {
+                        "primary_window": {"used_percent": 25, "limit_window_seconds": 18000},
+                        "secondary_window": {"used_percent": 16, "limit_window_seconds": 604800},
+                    },
+                    "additional_rate_limits": [
+                        {
+                            "limit_name": "Provision (default - updated 15:36 on 22 May)",
+                            "metered_feature": "codex",
+                            "rate_limit": {
+                                "primary_window": {
+                                    "used_percent": 25,
+                                    "limit_window_seconds": 18000,
+                                },
+                                "secondary_window": {
+                                    "used_percent": 16,
+                                    "limit_window_seconds": 604800,
+                                },
+                            },
+                        },
+                        {
+                            "limit_name": "GPT-5.3-Codex-Spark",
+                            "metered_feature": "gpt-5.3-codex-spark",
+                            "rate_limit": {
+                                "primary_window": {
+                                    "used_percent": 90,
+                                    "limit_window_seconds": 18000,
+                                },
+                                "secondary_window": {
+                                    "used_percent": 50,
+                                    "limit_window_seconds": 604800,
+                                },
+                            },
+                        }
+                    ],
+                },
+                "fetched_at": datetime(2026, 5, 22, 15, 36),
+            },
+            "gpt-5.3-codex-spark",
+        )
+
+        self.assertIn("control-compact-quota", markup)
+        self.assertGreater(markup.count("control-compact-quota"), 1)
+        self.assertIn("GPT-5.3-Codex-Spark", markup)
+        self.assertIn('<span class="control-compact-quota-name">Codex</span>', markup)
+        self.assertEqual(markup.count('<span class="control-compact-quota-name">Codex</span>'), 1)
+        self.assertLess(
+            markup.find("GPT-5.3-Codex-Spark"),
+            markup.find('<span class="control-compact-quota-name">Codex</span>'),
+        )
+        self.assertIn("10%", markup)
+        self.assertIn("50%", markup)
+
     def test_quota_html_renders_nonzero_credits_pill(self) -> None:
         markup = render_quota_html(
             {
@@ -398,6 +474,31 @@ class StoreTests(unittest.TestCase):
 
         self.assertNotIn("consume_reset_credit", markup)
         self.assertNotIn("Reset credits:", markup)
+
+    def test_quota_html_disables_reset_credit_control_while_verifying(self) -> None:
+        markup = render_quota_html(
+            {
+                "payload": {
+                    "rate_limit_reset_credits": {"available_count": 2},
+                    "rate_limit": {
+                        "primary_window": {"used_percent": 100, "limit_window_seconds": 18000},
+                    },
+                },
+                "reset_credit": {
+                    "status": "verifying",
+                    "label": "Reset verifying",
+                    "message": "Waiting for usage confirmation.",
+                    "blocks": True,
+                },
+            },
+            profile="default",
+            token="ui-token",
+        )
+
+        self.assertNotIn("consume_reset_credit", markup)
+        self.assertNotIn("/api/consume-reset-credit", markup)
+        self.assertIn("quota-reset-credit-pill disabled", markup)
+        self.assertIn("Reset verifying", markup)
 
     def test_quota_html_uses_primary_reset_even_when_weekly_exhausted(self) -> None:
         markup = render_quota_html(
@@ -758,6 +859,7 @@ class StoreTests(unittest.TestCase):
 
         sent = fake.stdin.getvalue()
         self.assertIn('"method":"initialize"', sent)
+        self.assertIn(f'"version":"{daemon_module.PROTOCOL_VERSION}"', sent)
         self.assertIn('"method":"initialized"', sent)
         self.assertIn('"method":"account/rateLimits/read"', sent)
         self.assertIn('"method":"account/usage/read"', sent)
@@ -837,6 +939,159 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(snapshot["payload"]["rate_limit_reset_credits"]["available_count"], 1)
             self.assertFalse(server.schedule_app_server_rate_limit_refresh("default"))
 
+    def test_reset_credit_guard_blocks_duplicate_consume_before_upstream_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            auth = {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": fake_jwt({"email": "user@example.test"}),
+                    "access_token": fake_jwt({"exp": 9999999999}),
+                    "refresh_token": "rt_test",
+                },
+            }
+            source = root / "auth.json"
+            source.write_text(json.dumps(auth), encoding="utf-8")
+            paths = Paths(root / "home")
+            Store(paths).import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            called = False
+            try:
+                now = datetime.now(timezone.utc)
+                with server.reset_credit_state_lock:
+                    server.reset_credit_state["default"] = {
+                        "status": "verifying",
+                        "requested_at": daemon_module.utc_timestamp(now),
+                        "cooldown_until": daemon_module.utc_timestamp(now + timedelta(days=1)),
+                    }
+                    server.save_reset_credit_state_locked()
+
+                def fail_if_called(*_args: Any, **_kwargs: Any) -> None:
+                    nonlocal called
+                    called = True
+                    raise AssertionError("upstream consume should not be called")
+
+                server.run_app_server_for_profile = fail_if_called  # type: ignore[method-assign]
+
+                with self.assertRaises(daemon_module.ResetCreditGuardError):
+                    server.consume_profile_rate_limit_reset_credit("default")
+            finally:
+                server.server_close()
+
+            self.assertFalse(called)
+
+    def test_reset_credit_consume_waits_for_usage_confirmation_before_cache_update(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            auth = {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": fake_jwt({"email": "user@example.test"}),
+                    "access_token": fake_jwt({"exp": 9999999999}),
+                    "refresh_token": "rt_test",
+                },
+            }
+            source = root / "auth.json"
+            source.write_text(json.dumps(auth), encoding="utf-8")
+            paths = Paths(root / "home")
+            Store(paths).import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            old_payload = {
+                "rate_limit": {
+                    "primary_window": {"used_percent": 0.0},
+                    "secondary_window": {"used_percent": 99.0},
+                },
+                "rate_limit_reset_credits": {"available_count": 1},
+            }
+            optimistic_rate_limits = {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "primary": {"usedPercent": 0.0},
+                    "secondary": {"usedPercent": 0.0},
+                },
+                "rateLimitResetCredits": {"availableCount": 0},
+            }
+            try:
+                server.update_usage_cache_from_observation(
+                    "default",
+                    old_payload,
+                    source="usage_fetch",
+                )
+                server.schedule_reset_credit_verification = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+                server.run_app_server_for_profile = lambda _profile, callback: {  # type: ignore[method-assign]
+                    "consume": {"outcome": "reset"},
+                    "rate_limits": optimistic_rate_limits,
+                }
+
+                result = server.consume_profile_rate_limit_reset_credit("default", idempotency_key="test-key")
+            finally:
+                server.server_close()
+
+            self.assertEqual(result["outcome"], "reset")
+            snapshot = server.usage_cache_snapshot("default")
+            assert snapshot is not None
+            self.assertEqual(snapshot["payload"]["rate_limit"]["secondary_window"]["used_percent"], 99.0)
+            status = server.reset_credit_status("default")
+            self.assertTrue(status["blocks"])
+            self.assertEqual(status["status"], "verifying")
+
+    def test_usage_fetch_verifies_reset_credit_and_starts_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            auth = {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": fake_jwt({"email": "user@example.test"}),
+                    "access_token": fake_jwt({"exp": 9999999999}),
+                    "refresh_token": "rt_test",
+                },
+            }
+            source = root / "auth.json"
+            source.write_text(json.dumps(auth), encoding="utf-8")
+            paths = Paths(root / "home")
+            Store(paths).import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            before_payload = {
+                "rate_limit": {
+                    "primary_window": {"used_percent": 0.0},
+                    "secondary_window": {"used_percent": 99.0},
+                },
+                "rate_limit_reset_credits": {"available_count": 1},
+            }
+            after_payload = {
+                "rate_limit": {
+                    "primary_window": {"used_percent": 1.0},
+                    "secondary_window": {"used_percent": 0.0},
+                },
+                "rate_limit_reset_credits": {"available_count": 0},
+            }
+            try:
+                now = datetime.now(timezone.utc)
+                with server.reset_credit_state_lock:
+                    server.reset_credit_state["default"] = {
+                        "status": "verifying",
+                        "idempotency_key": "test-key",
+                        "requested_at": daemon_module.utc_timestamp(now),
+                        "cooldown_until": daemon_module.utc_timestamp(now + timedelta(days=1)),
+                        "before_payload": before_payload,
+                    }
+                    server.save_reset_credit_state_locked()
+
+                self.assertTrue(
+                    server.reconcile_reset_credit_verification(
+                        "default",
+                        after_payload,
+                        source="usage_fetch",
+                    )
+                )
+                status = server.reset_credit_status("default")
+            finally:
+                server.server_close()
+
+            self.assertEqual(status["status"], "verified")
+            self.assertTrue(status["blocks"])
+            self.assertIn("cooldown_until", status)
+
     def test_fetch_usage_merges_recent_app_server_rate_limit_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -893,6 +1148,71 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(payload["rate_limit"]["primary_window"]["used_percent"], 50.0)
             self.assertEqual(payload["credits"]["balance"], "$1.00")
             self.assertEqual(payload["rate_limit_reset_credits"]["available_count"], 2)
+
+    def test_fetch_usage_ignores_app_server_rate_limits_while_reset_verifies(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            auth = {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": fake_jwt({"email": "user@example.test"}),
+                    "access_token": fake_jwt({"exp": 9999999999}),
+                    "refresh_token": "rt_test",
+                },
+            }
+            source = root / "auth.json"
+            source.write_text(json.dumps(auth), encoding="utf-8")
+            paths = Paths(root / "home")
+            Store(paths).import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            now = datetime.now(timezone.utc)
+            server.app_server_rate_limit_cache["default"] = {
+                "payload": {
+                    "rate_limit": {"secondary_window": {"used_percent": 0.0}},
+                    "rate_limit_reset_credits": {"available_count": 0},
+                },
+                "fetched_monotonic": time.monotonic(),
+            }
+
+            class FakeResponse:
+                def __enter__(self) -> FakeResponse:
+                    return self
+
+                def __exit__(self, *_args: Any) -> None:
+                    return None
+
+                def read(self) -> bytes:
+                    return json.dumps(
+                        {
+                            "rate_limit": {
+                                "secondary_window": {"used_percent": 99.0},
+                            },
+                            "rate_limit_reset_credits": {"available_count": 1},
+                        }
+                    ).encode("utf-8")
+
+            original_ensure = daemon_module.ensure_fresh_chatgpt_auth
+            original_urlopen = daemon_module.urllib.request.urlopen
+            try:
+                with server.reset_credit_state_lock:
+                    server.reset_credit_state["default"] = {
+                        "status": "verifying",
+                        "requested_at": daemon_module.utc_timestamp(now),
+                        "cooldown_until": daemon_module.utc_timestamp(now + timedelta(days=1)),
+                    }
+                    server.save_reset_credit_state_locked()
+                daemon_module.ensure_fresh_chatgpt_auth = lambda _auth_path: auth  # type: ignore[assignment]
+                daemon_module.urllib.request.urlopen = lambda _request, timeout=10: FakeResponse()
+
+                payload = server.fetch_usage_payload_uncached("default")
+            finally:
+                daemon_module.ensure_fresh_chatgpt_auth = original_ensure
+                daemon_module.urllib.request.urlopen = original_urlopen
+                server.server_close()
+
+            assert payload is not None
+            self.assertEqual(payload["rate_limit"]["secondary_window"]["used_percent"], 99.0)
+            self.assertEqual(payload["rate_limit_reset_credits"]["available_count"], 1)
 
     def test_usage_auto_refresh_logs_unexpected_failure_without_crashing(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1037,8 +1357,77 @@ class StoreTests(unittest.TestCase):
         decoded = decode_project_session_sentinel(sentinel, "token")
 
         self.assertEqual(decoded, {"key": "/tmp/provision", "cwd": "/tmp/provision"})
+        keyed = project_session_sentinel(
+            "token",
+            "/tmp/provision",
+            session_key="/tmp/provision::ui::abc123",
+        )
+        self.assertEqual(
+            decode_project_session_sentinel(keyed, "token"),
+            {"key": "/tmp/provision::ui::abc123", "cwd": "/tmp/provision"},
+        )
         self.assertEqual(decode_project_session_sentinel("provision-token", "token"), {})
         self.assertIsNone(decode_project_session_sentinel(sentinel, "other"))
+
+    def test_codex_resume_candidates_reads_recent_matching_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session_dir = root / "sessions" / "2026" / "06" / "22"
+            session_dir.mkdir(parents=True)
+            session_file = session_dir / "rollout-2026-06-22T10-00-00-019abc.jsonl"
+            session_file.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-06-22T10:00:00Z",
+                                "type": "session_meta",
+                                "payload": {
+                                    "id": "019abc",
+                                    "timestamp": "2026-06-22T10:00:00Z",
+                                    "cwd": "/workspace/provision",
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "input_text",
+                                            "text": "# AGENTS.md instructions for /workspace/provision\nFollow local project guidance.",
+                                        }
+                                    ],
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [{"type": "input_text", "text": "Resume me"}],
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            candidates = codex_resume_candidates_for_cwd(
+                "/workspace/provision",
+                codex_home=root,
+            )
+
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]["id"], "019abc")
+            self.assertEqual(candidates[0]["label"], "Resume me")
 
     def test_request_body_session_reads_turn_metadata_workspace(self) -> None:
         body = json.dumps(
@@ -1298,6 +1687,222 @@ class StoreTests(unittest.TestCase):
                     b'{"type":"custom_tool_call"}}'
                 ),
             )
+        )
+
+    def test_websocket_transcript_extracts_user_and_assistant_text(self) -> None:
+        user_payload = {
+            "type": "response.create",
+            "client_metadata": {
+                "x-codex-turn-metadata": json.dumps(
+                    {"turn_id": "turn-123", "thread_id": "thread-456", "cwd": "/workspace/provision"}
+                ),
+            },
+            "response": {
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Fix the failing test."}],
+                    }
+                ]
+            },
+        }
+        self.assertEqual(
+            daemon_module.websocket_message_user_text(
+                0x1,
+                json.dumps(user_payload).encode("utf-8"),
+            ),
+            "Fix the failing test.",
+        )
+        encoded_user = json.dumps(user_payload).encode("utf-8")
+        self.assertEqual(websocket_message_turn_id(0x1, encoded_user), "turn-123")
+        self.assertEqual(websocket_message_thread_id(0x1, encoded_user), "thread-456")
+        self.assertEqual(
+            daemon_module.websocket_message_assistant_entry(
+                0x1,
+                b'{"type":"response.output_text.delta","delta":"Working"}',
+            ),
+            {"role": "assistant_progress", "text": "Working", "append": True},
+        )
+        self.assertEqual(
+            daemon_module.websocket_message_assistant_text(
+                0x1,
+                b'{"type":"response.output_text.delta","delta":"Working"}',
+            ),
+            ("Working", True),
+        )
+        self.assertEqual(
+            daemon_module.websocket_message_assistant_entry(
+                0x1,
+                (
+                    b'{"type":"response.output_text.delta",'
+                    b'"delta":{"type":"output_text","text":" 2024**"}}'
+                ),
+            ),
+            {"role": "assistant_progress", "text": " 2024**", "append": True},
+        )
+        self.assertEqual(
+            daemon_module.websocket_message_assistant_text(
+                0x1,
+                (
+                    b'{"type":"response.completed","response":{"output":[{"role":"assistant",'
+                    b'"content":[{"type":"output_text","text":"Done."}]}]}}'
+                ),
+            ),
+            ("Done.", False),
+        )
+        self.assertEqual(
+            websocket_message_tool_entries(
+                0x1,
+                json.dumps(
+                    {
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "local_shell_call",
+                            "command": "python -m pytest",
+                            "status": "completed",
+                            "exit_code": 0,
+                            "stdout": "2 passed",
+                        },
+                    }
+                ).encode("utf-8"),
+            ),
+            [
+                {
+                    "role": "tool",
+                    "text": "Command: python -m pytest (status completed, exit 0)\nStdout:\n2 passed",
+                    "call_id": "",
+                    "status": "completed",
+                }
+            ],
+        )
+        self.assertEqual(
+            websocket_message_tool_entries(
+                0x1,
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": "call-1",
+                            "output": "Exit code: 0\nOutput:\n2 passed",
+                        },
+                    }
+                ).encode("utf-8"),
+            ),
+            [
+                {
+                    "role": "tool",
+                    "text": "Tool: call-1\nOutput:\nExit code: 0\nOutput:\n2 passed",
+                    "call_id": "call-1",
+                    "status": "",
+                }
+            ],
+        )
+        self.assertEqual(
+            websocket_message_tool_entries(
+                0x1,
+                json.dumps(
+                    {
+                        "type": "response.output_item.added",
+                        "item": {
+                            "type": "function_call",
+                            "name": "ctc_0123456789abcdef",
+                            "call_id": "ctc_0123456789abcdef",
+                            "status": "in_progress",
+                        },
+                    }
+                ).encode("utf-8"),
+            ),
+            [],
+        )
+        self.assertEqual(
+            daemon_module.user_transcript_entries(
+                "<environment_context><cwd>/tmp/old</cwd></environment_context>\n"
+                "Earlier question\n"
+                "<environment_context><cwd>/tmp/current</cwd></environment_context>\n"
+                "Current question"
+            ),
+            [
+                {"role": "resume", "text": "Earlier question"},
+                {"role": "user", "text": "Current question"},
+            ],
+        )
+        self.assertEqual(
+            daemon_module.user_transcript_entries(
+                "\ufeff\n\n"
+                "<environment_context><cwd>/tmp/current</cwd></environment_context>\n\n"
+                "\u200b\n\u200b\nInitial observed prompt\n\u200b\n\u200b"
+            ),
+            [{"role": "user", "text": "Initial observed prompt"}],
+        )
+        self.assertEqual(
+            daemon_module.split_user_entries_by_prompt_suffix(
+                [{"role": "user", "text": "Earlier follow-up\n\nCurrent question"}],
+                "Current question",
+            ),
+            [
+                {"role": "resume", "text": "Earlier follow-up"},
+                {"role": "user", "text": "Current question"},
+            ],
+        )
+        payload = {
+            "type": "response.create",
+            "response": {
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "<environment_context><cwd>/tmp/project</cwd></environment_context>",
+                            }
+                        ],
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Earlier CLI prompt"}],
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Current CLI prompt"}],
+                    },
+                ]
+            },
+        }
+        self.assertEqual(
+            daemon_module.response_create_payload_user_entries(payload),
+            [
+                {"role": "resume", "text": "Earlier CLI prompt"},
+                {"role": "user", "text": "Current CLI prompt"},
+            ],
+        )
+        padded_payload = {
+            "type": "response.create",
+            "response": {
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "<environment_context><cwd>/tmp/project</cwd></environment_context>\n\n",
+                            },
+                            {
+                                "type": "input_text",
+                                "text": "\u200b\n\u200b\nInitial observed prompt\n\u200b\n\u200b",
+                            },
+                        ],
+                    }
+                ]
+            },
+        }
+        self.assertEqual(
+            daemon_module.response_create_payload_user_entries(padded_payload),
+            [{"role": "user", "text": "Initial observed prompt"}],
         )
 
     def test_websocket_terminal_event_keeps_pending_for_tool_output(self) -> None:
@@ -1634,6 +2239,1076 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(default["fast_tokens"], 15)
             self.assertEqual(default["quota_updates"], 1)
             self.assertEqual(default["last_quota"]["Codex"]["primary_delta_percent"], -5)
+            self.assertEqual([event["type"] for event in summary["recent"]], ["websocket_tunnel", "token_usage"])
+            self.assertEqual([point["quota_updates"] for point in summary["series"]][-1], 1)
+
+    def test_control_plane_sessions_include_active_state_and_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            auth = {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": fake_jwt({"email": "user@example.test"}),
+                    "access_token": fake_jwt({"exp": 9999999999}),
+                    "refresh_token": "rt_test",
+                },
+            }
+            source = root / "auth.json"
+            source.write_text(json.dumps(auth), encoding="utf-8")
+            paths = Paths(root / "home")
+            Store(paths).import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            left, right = socket.socketpair()
+            request_id: int | None = None
+            tunnel_id: int | None = None
+            try:
+                cwd = "/workspace/provision"
+                session_key = server.observe_session(cwd, "default")
+                request_id = server.begin_request("default", session_key)
+                tunnel_id = server.begin_websocket("default", left, session_key)
+                server.begin_websocket_work(tunnel_id, "turn-123", "thread-456")
+                server.note_websocket_traffic(
+                    tunnel_id,
+                    bytes_count=64,
+                    message_count=2,
+                    from_downstream=True,
+                    service_tier="priority",
+                )
+                server.record_http_stats(
+                    profile="default",
+                    session_key=session_key,
+                    route=UpstreamRoute.CODEX_API,
+                    path="/v1/responses",
+                    method="POST",
+                    status_code=200,
+                    duration_seconds=0.1,
+                    bytes_in=12,
+                    bytes_out=34,
+                    service_tier="priority",
+                )
+                server.record_token_usage(
+                    profile="default",
+                    tunnel_id=tunnel_id,
+                    usage={
+                        "input_tokens": 10,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 5,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 15,
+                    },
+                )
+                server.record_websocket_transcript_message(
+                    tunnel_id,
+                    role="user",
+                    text="Fix the failing control-plane test.",
+                )
+                server.record_websocket_transcript_message(
+                    tunnel_id,
+                    role="assistant_progress",
+                    text="Checking behavior.",
+                    append=True,
+                )
+                server.record_websocket_transcript_message(
+                    tunnel_id,
+                    role="assistant_progress",
+                    text="At this point I have enough context.",
+                    append=True,
+                )
+                server.record_websocket_transcript_message(
+                    tunnel_id,
+                    role="tool",
+                    text="Command: pytest\nOutput:\n1 passed",
+                )
+
+                payload = server.control_plane_sessions()
+            finally:
+                if request_id is not None:
+                    server.end_request(request_id)
+                if tunnel_id is not None:
+                    server.end_websocket(tunnel_id)
+                left.close()
+                right.close()
+                server.server_close()
+
+            sessions = payload["sessions"]
+            self.assertEqual(len(sessions), 1)
+            session = sessions[0]
+            self.assertEqual(session["key"], session_key)
+            self.assertEqual(session["title"], "provision")
+            self.assertEqual(session["thread_id"], "thread-456")
+            self.assertEqual(session["active_requests"], 1)
+            self.assertEqual(session["pending_websocket_work"], 1)
+            self.assertIn("quota_html", session)
+            self.assertIn("No quota cached", session["quota_html"])
+            self.assertIn("quota_compact_html", session)
+            self.assertEqual(session["quota_compact_html"], "")
+            self.assertEqual(session["active_details"]["requests"][0]["profile"], "default")
+            self.assertEqual(session["active_details"]["tunnels"][0]["turn_id"], "turn-123")
+            self.assertEqual(session["active_details"]["tunnels"][0]["thread_id"], "thread-456")
+            self.assertEqual(session["transcript"][0]["role"], "user")
+            self.assertEqual(
+                session["transcript"][1]["text"],
+                "Checking behavior.\nAt this point I have enough context.",
+            )
+            self.assertEqual(session["transcript"][2]["role"], "tool")
+            self.assertEqual(session["turns"][0]["turn_id"], "turn-123")
+            self.assertIn("Fix the failing control-plane test.", session["turns"][0]["label"])
+            self.assertEqual(session["context"]["input_tokens"], 10)
+            self.assertIn("left", session["context"]["label"])
+            event_types = {event["type"] for event in session["events"]}
+            self.assertIn("http_request", event_types)
+            self.assertIn("token_usage", event_types)
+            self.assertTrue(
+                any("Token usage" in event["summary"] for event in session["events"])
+            )
+
+    def test_session_tabs_keep_observed_order_and_persist_reorder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                first = server.observe_session("/workspace/alpha", "default")
+                second = server.observe_session("/workspace/beta", "default")
+                server.observe_session("/workspace/alpha", "default")
+
+                self.assertEqual(
+                    [item["key"] for item in server.session_snapshots()],
+                    [first, second],
+                )
+
+                server.reorder_sessions([second, first])
+                self.assertEqual(
+                    [item["key"] for item in server.session_snapshots()],
+                    [second, first],
+                )
+            finally:
+                server.server_close()
+
+            restored = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                restored.observe_session("/workspace/alpha", "default")
+                restored.observe_session("/workspace/beta", "default")
+
+                self.assertEqual(
+                    [item["key"] for item in restored.session_snapshots()],
+                    [second, first],
+                )
+            finally:
+                restored.server_close()
+
+    @unittest.skipIf(not hasattr(socket, "AF_UNIX"), "PTY control sockets require AF_UNIX")
+    def test_send_session_prompt_uses_pty_control_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            auth = {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": fake_jwt({"email": "user@example.test"}),
+                    "access_token": fake_jwt({"exp": 9999999999}),
+                    "refresh_token": "rt_test",
+                },
+            }
+            source = root / "auth.json"
+            source.write_text(json.dumps(auth), encoding="utf-8")
+            paths = Paths(root / "home")
+            Store(paths).import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            control_path = root / "control.sock"
+            ready = threading.Event()
+            received: list[dict[str, Any]] = []
+
+            def control_socket() -> None:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                    listener.bind(str(control_path))
+                    listener.listen(1)
+                    ready.set()
+                    conn, _ = listener.accept()
+                    with conn:
+                        raw = conn.recv(4096)
+                        received.append(json.loads(raw.decode("utf-8")))
+                        conn.sendall(b'{"ok":true}')
+
+            thread = threading.Thread(target=control_socket, daemon=True)
+            thread.start()
+            self.assertTrue(ready.wait(1.0))
+            try:
+                session_key = server.observe_session(
+                    "/workspace/provision",
+                    "default",
+                    control_path=str(control_path),
+                    launcher_pid=1234,
+                    pty_managed=True,
+                )
+                snapshot = next(
+                    item for item in server.session_snapshots() if item["key"] == session_key
+                )
+                self.assertTrue(snapshot["pty_managed"])
+                self.assertTrue(snapshot["pty_control_available"])
+                self.assertTrue(snapshot["interaction"]["available"])
+                result = server.send_session_prompt(session_key, "Please continue.")
+            finally:
+                server.server_close()
+            thread.join(1.0)
+
+            self.assertEqual(result["mode"], "pty")
+            self.assertEqual(result["profile"], "default")
+            self.assertEqual(result["cwd"], "/workspace/provision")
+            self.assertEqual(received, [{"action": "send_text", "text": "Please continue."}])
+            transcript = server.control_transcripts[session_key]
+            self.assertEqual(len(transcript), 1)
+            self.assertEqual(transcript[0]["role"], "user_pending")
+            self.assertEqual(transcript[0]["text"], "Please continue.")
+
+            server.append_control_transcript(
+                session_key=session_key,
+                role="user",
+                text="Please continue.",
+                turn_id="turn-from-websocket",
+                profile="default",
+            )
+
+            self.assertEqual(len(transcript), 1)
+            self.assertEqual(transcript[0]["role"], "user")
+            self.assertEqual(transcript[0]["turn_id"], "turn-from-websocket")
+
+    def test_passive_session_observation_preserves_pty_control_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            paths = Paths(root / "home")
+            control_path = root / "control.sock"
+            control_path.write_text("", encoding="utf-8")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                session_key = server.observe_session(
+                    "/workspace/provision",
+                    "default",
+                    control_path=str(control_path),
+                    launcher_pid=1234,
+                    pty_managed=True,
+                )
+                server.observe_session("/workspace/provision", "default")
+                snapshot = next(
+                    item for item in server.session_snapshots() if item["key"] == session_key
+                )
+                self.assertTrue(snapshot["pty_managed"])
+                self.assertTrue(snapshot["pty_control_available"])
+                self.assertTrue(snapshot["interaction"]["available"])
+
+                server.observe_session(
+                    "/workspace/provision",
+                    "default",
+                    clear_control_path=True,
+                )
+                snapshot = next(
+                    item for item in server.session_snapshots() if item["key"] == session_key
+                )
+                self.assertFalse(snapshot["pty_managed"])
+                self.assertFalse(snapshot["pty_control_available"])
+                self.assertFalse(snapshot["interaction"]["available"])
+            finally:
+                server.server_close()
+
+    def test_ui_launcher_args_include_resume_cwd_and_permission(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            server = ProvisionServer(("127.0.0.1", 0), Paths(Path(temp) / "home"))
+            try:
+                args = server.build_ui_launcher_args(
+                    cwd="/workspace/provision",
+                    mode="resume-last",
+                    permission="read-only",
+                )
+                self.assertEqual(args[0], str(Path("bin/provision").resolve()))
+                self.assertEqual(args[1:6], ["resume", "--cd", "/workspace/provision", "--sandbox", "read-only"])
+                self.assertIn("--last", args)
+                selected = server.build_ui_launcher_args(
+                    cwd="/workspace/provision",
+                    mode="resume-session",
+                    permission="workspace-write",
+                    session_id="019abc",
+                )
+                self.assertEqual(selected[1], "resume")
+                self.assertIn("019abc", selected)
+
+                bypass = server.build_ui_launcher_args(
+                    cwd="/workspace/provision",
+                    mode="new",
+                    permission="bypass",
+                )
+                self.assertIn("--dangerously-bypass-approvals-and-sandbox", bypass)
+                self.assertNotIn("resume", bypass)
+            finally:
+                server.server_close()
+
+    def test_forget_session_removes_idle_observed_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            auth = {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": fake_jwt({"email": "user@example.test"}),
+                    "access_token": fake_jwt({"exp": 9999999999}),
+                    "refresh_token": "rt_test",
+                },
+            }
+            source = Path(temp) / "auth.json"
+            source.write_text(json.dumps(auth), encoding="utf-8")
+            Store(paths).import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                session_key = server.observe_session("/workspace/provision", "default")
+                server.pin_session(session_key, "default")
+                server.append_control_transcript(
+                    session_key=session_key,
+                    role="user",
+                    text="old prompt",
+                )
+                server.forget_session(session_key)
+                self.assertEqual(server.session_snapshots(), [])
+                self.assertNotIn(session_key, server.control_transcripts)
+                self.assertNotIn(session_key, server.pinned_sessions)
+            finally:
+                server.server_close()
+
+    def test_forget_session_refuses_live_pty_control(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            paths = Paths(root / "home")
+            control_path = root / "control.sock"
+            control_path.write_text("", encoding="utf-8")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                session_key = server.observe_session(
+                    "/workspace/provision",
+                    "default",
+                    control_path=str(control_path),
+                    pty_managed=True,
+                )
+                with self.assertRaises(StoreError):
+                    server.forget_session(session_key)
+                server.forget_session(session_key, force_live=True)
+                self.assertEqual(server.session_snapshots(), [])
+            finally:
+                server.server_close()
+
+    def test_codex_history_bridge_links_sessions_without_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "stock"
+            target = root / "app"
+            (source / "sessions").mkdir(parents=True)
+            (source / "sessions" / "rollout.jsonl").write_text("{}", encoding="utf-8")
+            (source / "state_5.sqlite").write_text("state", encoding="utf-8")
+            (source / "auth.json").write_text("stock-auth", encoding="utf-8")
+            target.mkdir()
+
+            bridge_codex_history_into_app_home(target, source)
+
+            self.assertTrue((target / "sessions").exists())
+            self.assertTrue((target / "state_5.sqlite").exists())
+            self.assertFalse((target / "auth.json").exists())
+
+    def test_app_server_thread_selection_requires_matching_cli_cwd(self) -> None:
+        payload = {
+            "data": [
+                {"id": "app-thread", "cwd": "/workspace/provision", "source": "appServer"},
+                {"id": "other-thread", "cwd": "/workspace/other", "source": "cli"},
+                {"id": "target-thread", "cwd": "/workspace/provision", "source": "cli"},
+            ]
+        }
+
+        self.assertEqual(
+            daemon_module.first_app_server_thread_id(payload, cwd="/workspace/provision"),
+            "target-thread",
+        )
+        self.assertIsNone(
+            daemon_module.first_app_server_thread_id(payload, cwd="/workspace/missing"),
+        )
+        self.assertEqual(daemon_module.first_app_server_thread_id(payload), "other-thread")
+
+    def test_tool_transcript_updates_matching_call_id(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.control_transcripts = {}
+        session_key = "/workspace/provision"
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="tool",
+            text="Command: pytest (status in_progress)",
+            call_id="call-1",
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="tool",
+            text="Command: pytest (status completed, exit 0)\nOutput:\n1 passed",
+            call_id="call-1",
+        )
+
+        transcript = server.control_transcripts[session_key]
+        self.assertEqual(len(transcript), 1)
+        self.assertIn("completed", transcript[0]["text"])
+        self.assertIn("1 passed", transcript[0]["text"])
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="tool",
+            text="Command: python -m pytest\nArguments:\ncmd: python -m pytest",
+            call_id="call-2",
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="tool",
+            text="Tool: call-2\nOutput:\nExit code: 0\nOutput:\n2 passed",
+            call_id="call-2",
+        )
+
+        self.assertEqual(len(transcript), 2)
+        self.assertIn("Command: python -m pytest", transcript[1]["text"])
+        self.assertIn("2 passed", transcript[1]["text"])
+        self.assertNotIn("Tool: call-2", transcript[1]["text"])
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="tool",
+            text="Tool: apply_patch (status in_progress)\nArguments:\n*** Begin Patch\n*** Update File: app.py\n@@\n-old\n+new\n*** End Patch",
+            call_id="call-3",
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="tool",
+            text="Tool: apply_patch (status completed)",
+            call_id="call-3",
+        )
+
+        self.assertEqual(len(transcript), 3)
+        self.assertIn("Tool: apply_patch (status completed)", transcript[2]["text"])
+        self.assertIn("Arguments:", transcript[2]["text"])
+        self.assertIn("*** Begin Patch", transcript[2]["text"])
+        self.assertIn("+new", transcript[2]["text"])
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="Assistant answer",
+            turn_id="turn-ui",
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant",
+            text="Assistant answer",
+            turn_id="turn-ui",
+        )
+
+        self.assertEqual(len(transcript), 4)
+        self.assertEqual(transcript[3]["role"], "assistant")
+        self.assertEqual(transcript[3]["text"], "Assistant answer")
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="Checks pass and reports an",
+            turn_id="turn-spacing",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="8-second measured window.",
+            turn_id="turn-spacing",
+            append=True,
+        )
+        spacing_text = transcript[-1]["text"]
+        self.assertIn("an 8-second measured window", spacing_text)
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="The result was meas",
+            turn_id="turn-word-split",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="ured correctly.",
+            turn_id="turn-word-split",
+            append=True,
+        )
+        word_split_text = transcript[-1]["text"]
+        self.assertIn("measured correctly", word_split_text)
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="Why it may not be updated:\n\n- model training and deployment are separate from live browsing/tool access",
+            turn_id="turn-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="- newer models can still carry older fixed training cutoffs",
+            turn_id="turn-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="- product surfaces may prioritize tool-augmented current lookup",
+            turn_id="turn-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="Practically: verify latest facts.",
+            turn_id="turn-list",
+            append=True,
+        )
+
+        list_text = transcript[-1]["text"]
+        self.assertIn("access\n- newer models", list_text)
+        self.assertIn("lookup\n\nPractically: verify latest facts.", list_text)
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="Other plausible reasons:\n\n- **",
+            turn_id="turn-bold-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="Safety/evaluation lag:** newer training data requires extra evaluation before deployment.",
+            turn_id="turn-bold-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="- **",
+            turn_id="turn-bold-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="Licensing/filtering constraints:** not all newer public data is usable for training.",
+            turn_id="turn-bold-list",
+            append=True,
+        )
+
+        bold_list_text = transcript[-1]["text"]
+        self.assertIn(
+            "- **Safety/evaluation lag:** newer training data requires extra evaluation",
+            bold_list_text,
+        )
+        self.assertIn(
+            "\n- **Licensing/filtering constraints:** not all newer public data",
+            bold_list_text,
+        )
+        self.assertNotIn("- **\n\nSafety", bold_list_text)
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="The acceptance checklist would be:\n\n- [x]",
+            turn_id="turn-task-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text=" Passive session observation works",
+            turn_id="turn-task-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="- [ ]",
+            turn_id="turn-task-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text=" Launch from UI",
+            turn_id="turn-task-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="- [ ]",
+            turn_id="turn-task-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text=" Resume from UI",
+            turn_id="turn-task-list",
+            append=True,
+        )
+
+        task_list_text = transcript[-1]["text"]
+        self.assertIn("- [x] Passive session observation works", task_list_text)
+        self.assertIn("\n- [ ] Launch from UI", task_list_text)
+        self.assertIn("\n- [ ] Resume from UI", task_list_text)
+        self.assertNotIn("[x]\n\nPassive", task_list_text)
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="Before:\n\n- active profile",
+            turn_id="turn-spaced-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text=" - remaining quota buckets",
+            turn_id="turn-spaced-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text=" - reset credit availability",
+            turn_id="turn-spaced-list",
+            append=True,
+        )
+
+        spaced_list_text = transcript[-1]["text"]
+        self.assertIn("- active profile\n - remaining quota buckets", spaced_list_text)
+        self.assertIn("\n - reset credit availability", spaced_list_text)
+        self.assertNotIn("active profile - remaining", spaced_list_text)
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="The important acceptance criteria are fairly concrete:\n\n- [x] Existing proxy/profile switching remains stable",
+            turn_id="turn-complete-task-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="- [x] Control-plane sessions reflect observed Codex activity",
+            turn_id="turn-complete-task-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text=" - [ ] Reset-credit behavior has been verified against live quota exhaustion",
+            turn_id="turn-complete-task-list",
+            append=True,
+        )
+
+        complete_task_list_text = transcript[-1]["text"]
+        self.assertIn(
+            "stable\n- [x] Control-plane sessions reflect observed",
+            complete_task_list_text,
+        )
+        self.assertIn(
+            "activity\n - [ ] Reset-credit behavior has been verified",
+            complete_task_list_text,
+        )
+        self.assertNotIn("stable- [x]", complete_task_list_text)
+        self.assertNotIn("activity - [ ]", complete_task_list_text)
+
+        long_text = "x" * (daemon_module.CONTROL_TRANSCRIPT_TEXT_LIMIT + 25)
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant",
+            text=long_text,
+            turn_id="turn-long",
+        )
+
+        self.assertEqual(transcript[-1]["role"], "assistant")
+        self.assertTrue(transcript[-1]["truncated"])
+        self.assertEqual(transcript[-1]["full_text"], long_text)
+        self.assertIn("...[truncated]", transcript[-1]["text"])
+
+    def test_apply_patch_tool_entry_keeps_input_patch_body(self) -> None:
+        entry = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "apply_patch_call",
+                "call_id": "patch-1",
+                "name": "apply_patch",
+                "status": "completed",
+                "input": "*** Begin Patch\n*** Update File: app.py\n@@\n-old\n+new\n*** End Patch",
+            }
+        )
+
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["role"], "tool")
+        self.assertIn("Tool: apply_patch (status completed)", entry["text"])
+        self.assertIn("Input:", entry["text"])
+        self.assertIn("*** Begin Patch", entry["text"])
+        self.assertIn("+new", entry["text"])
+
+        command_shaped = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "apply_patch_call",
+                "call_id": "patch-2",
+                "name": "apply_patch",
+                "cmd": "*** Begin Patch\n*** Update File: app.py\n@@\n-old\n+new\n*** End Patch",
+            }
+        )
+        self.assertIsNotNone(command_shaped)
+        assert command_shaped is not None
+        self.assertIn("Tool: apply_patch", command_shaped["text"])
+        self.assertIn("Input:", command_shaped["text"])
+        self.assertNotIn("Command: *** Begin Patch", command_shaped["text"])
+
+    def test_control_tool_call_entries_are_suppressed(self) -> None:
+        control_entry = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "function_call",
+                "call_id": "ctc_0123456789abcdef",
+                "name": "ctc_0123456789abcdef",
+                "status": "completed",
+                "arguments": "*** Begin Patch\n*** Update File: app.py\n@@\n-old\n+new\n*** End Patch",
+            }
+        )
+
+        self.assertIsNone(control_entry)
+        entries = daemon_module.tool_activity_entries_from_value(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "ctc_0123456789abcdef",
+                    "name": "ctc_0123456789abcdef",
+                    "status": "completed",
+                    "arguments": "*** Begin Patch\n*** Update File: app.py\n@@\n-old\n+new\n*** End Patch",
+                },
+                {
+                    "type": "apply_patch_call",
+                    "call_id": "patch-1",
+                    "name": "apply_patch",
+                    "status": "completed",
+                    "input": "*** Begin Patch\n*** Update File: app.py\n@@\n-old\n+new\n*** End Patch",
+                },
+            ]
+        )
+        self.assertEqual(len(entries), 1)
+        self.assertIn("Tool: apply_patch", entries[0]["text"])
+
+    def test_observed_user_input_does_not_inherit_stale_turn_id(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.control_transcripts = {}
+        server.active_lock = threading.RLock()
+        session_key = "/workspace/provision"
+        tunnel_id = 9
+        server.active_websockets = {
+            tunnel_id: {
+                "session_key": session_key,
+                "turn_id": "old-turn",
+                "profile": "default",
+            }
+        }
+
+        server.record_websocket_transcript_message(
+            tunnel_id,
+            role="user",
+            text="Run the next validation pass.",
+        )
+        transcript = server.control_transcripts[session_key]
+        self.assertEqual(transcript[0]["role"], "user")
+        self.assertEqual(transcript[0]["turn_id"], "")
+
+        server.active_websockets[tunnel_id]["turn_id"] = "new-turn"
+        server.record_websocket_transcript_message(
+            tunnel_id,
+            role="assistant_progress",
+            text="Starting validation.",
+            append=True,
+        )
+
+        self.assertEqual(transcript[0]["turn_id"], "new-turn")
+        self.assertEqual(transcript[1]["turn_id"], "new-turn")
+
+        server.active_websockets[tunnel_id]["pending_work"] = 1
+        server.active_websockets[tunnel_id]["turn_id"] = "active-turn"
+        server.record_websocket_transcript_message(
+            tunnel_id,
+            role="user",
+            text="A mid-turn clarification.",
+        )
+        self.assertEqual(transcript[-1]["turn_id"], "active-turn")
+
+    def test_control_transcript_user_entries_trim_display_framing(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.control_transcripts = {}
+        session_key = "/workspace/provision"
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="user",
+            text="\u200b\n\u200b\nInitial observed prompt\n\u200b\n\u200b",
+        )
+
+        transcript = server.control_transcripts[session_key]
+        self.assertEqual(transcript[0]["text"], "Initial observed prompt")
+        self.assertEqual(server.transcript_item_full_text(transcript[0]), "Initial observed prompt")
+        self.assertEqual(transcript[0]["search_text"], "user Initial observed prompt")
+
+    def test_same_turn_user_input_does_not_create_extra_control_turn(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        session_key = "/workspace/provision"
+        transcript = [
+            {
+                "ts": "2026-06-26T00:00:00Z",
+                "updated_at": "2026-06-26T00:00:00Z",
+                "role": "user",
+                "turn_id": "turn-1",
+                "text": "Start the implementation.",
+                "control_index": 0,
+            },
+            {
+                "ts": "2026-06-26T00:00:01Z",
+                "updated_at": "2026-06-26T00:00:01Z",
+                "role": "assistant_progress",
+                "turn_id": "turn-1",
+                "text": "Working.",
+                "control_index": 1,
+            },
+            {
+                "ts": "2026-06-26T00:00:02Z",
+                "updated_at": "2026-06-26T00:00:02Z",
+                "role": "user",
+                "turn_id": "turn-1",
+                "text": "Also check the edge case.",
+                "control_index": 2,
+            },
+            {
+                "ts": "2026-06-26T00:00:03Z",
+                "updated_at": "2026-06-26T00:00:03Z",
+                "role": "assistant",
+                "turn_id": "turn-1",
+                "text": "Done.",
+                "control_index": 3,
+            },
+        ]
+
+        turns = server.control_turns_from_transcript(transcript)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["turn_id"], "turn-1")
+        self.assertEqual(turns[0]["start_index"], 0)
+        self.assertEqual(turns[0]["end_index"], 3)
+
+    def test_resumed_context_replay_is_suppressed_with_marker(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.control_transcripts = {}
+        session_key = "/workspace/project-alpha"
+        turn_id = "turn-resume"
+        resume_text = "Earlier turn one.\n\nEarlier turn two."
+        user_text = "Go ahead and lock the hygiene/package-release arc, then address it"
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="resume",
+            text=resume_text,
+            turn_id=turn_id,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="user",
+            text=user_text,
+            turn_id=turn_id,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="Working on it.",
+            turn_id=turn_id,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="tool",
+            text="Command: pytest (status completed)",
+            turn_id=turn_id,
+            call_id="call-1",
+        )
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="resume",
+            text=resume_text,
+            turn_id=turn_id,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="user",
+            text=user_text,
+            turn_id=turn_id,
+        )
+
+        transcript = server.control_transcripts[session_key]
+        roles = [item["role"] for item in transcript]
+        self.assertEqual(roles.count("resume"), 1)
+        self.assertEqual(roles.count("user"), 1)
+        self.assertEqual(roles.count("context_compaction"), 1)
+        marker = next(item for item in transcript if item["role"] == "context_compaction")
+        self.assertIn("Context replay observed", marker["text"])
+        self.assertNotIn(user_text, marker["text"])
+
+    def test_pending_prompt_moves_after_resume_replay(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.control_transcripts = {}
+        session_key = "/workspace/release-app"
+        prompt = "Continue the release validation."
+
+        server.append_control_transcript(
+            session_key=session_key,
+            role="user_pending",
+            text=prompt,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="resume",
+            text="Earlier launcher prompt.\n\nAnother prior clarification.",
+            turn_id="turn-release-app",
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="resume",
+            text="Recent replayed prompt.",
+            turn_id="turn-release-app",
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="user",
+            text=prompt,
+            turn_id="turn-release-app",
+        )
+
+        transcript = server.control_transcripts[session_key]
+        self.assertEqual([item["role"] for item in transcript], ["resume", "user"])
+        self.assertIn("Earlier launcher prompt.", transcript[0]["text"])
+        self.assertIn("Recent replayed prompt.", transcript[0]["text"])
+        self.assertEqual(transcript[1]["text"], prompt)
+        self.assertEqual(transcript[1]["turn_id"], "turn-release-app")
+
+    def test_structured_downstream_user_items_keep_only_last_as_user(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.control_transcripts = {}
+        server.active_lock = threading.RLock()
+        session_key = "/workspace/release-app"
+        tunnel_id = 17
+        server.active_websockets = {
+            tunnel_id: {
+                "session_key": session_key,
+                "turn_id": "turn-release-app",
+                "pending_work": 1,
+                "profile": "default",
+            }
+        }
+        payload = {
+            "type": "response.create",
+            "client_metadata": {
+                "x-codex-turn-metadata": json.dumps(
+                    {"turn_id": "turn-release-app", "thread_id": "thread-release-app"}
+                )
+            },
+            "response": {
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "<environment_context><cwd>/workspace/release-app</cwd></environment_context>",
+                            }
+                        ],
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Earlier launcher prompt"}],
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Another prior clarification"}],
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Current visible prompt"}],
+                    },
+                ]
+            },
+        }
+
+        server.record_websocket_transcript(
+            tunnel_id,
+            0x1,
+            json.dumps(payload).encode("utf-8"),
+            from_downstream=True,
+        )
+
+        transcript = server.control_transcripts[session_key]
+        self.assertEqual([item["role"] for item in transcript], ["resume", "user"])
+        self.assertIn("Earlier launcher prompt", transcript[0]["text"])
+        self.assertIn("Another prior clarification", transcript[0]["text"])
+        self.assertEqual(transcript[1]["text"], "Current visible prompt")
+
+    def test_anonymized_codex_stream_fixture_builds_control_transcript(self) -> None:
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "codex_streams"
+            / "anonymized_control_plane_stream.jsonl"
+        )
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.control_transcripts = {}
+        server.active_lock = threading.RLock()
+        session_key = "/workspace/example"
+        tunnel_id = 7
+        server.active_websockets = {
+            tunnel_id: {
+                "session_key": session_key,
+                "turn_id": "",
+                "profile": "default",
+            }
+        }
+
+        for line in fixture.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            payload = json.dumps(row["payload"]).encode("utf-8")
+            from_downstream = row["direction"] == "downstream"
+            if from_downstream:
+                turn_id = daemon_module.websocket_message_turn_id(int(row["opcode"]), payload)
+                with server.active_lock:
+                    server.active_websockets[tunnel_id]["turn_id"] = turn_id or ""
+            server.record_websocket_transcript(
+                tunnel_id,
+                int(row["opcode"]),
+                payload,
+                from_downstream=from_downstream,
+            )
+
+        transcript = server.control_transcripts[session_key]
+        roles = [item["role"] for item in transcript]
+        self.assertEqual(roles.count("resume"), 1)
+        self.assertEqual(roles.count("user"), 1)
+        self.assertEqual(roles.count("assistant"), 1)
+        self.assertEqual(roles.count("tool"), 1)
+        self.assertEqual(roles.count("context_compaction"), 1)
+        self.assertIn("Summarized prior request", transcript[0]["text"])
+        self.assertIn("Please complete the package hygiene work.", transcript[1]["text"])
+        tool = next(item for item in transcript if item["role"] == "tool")
+        self.assertIn("Command: pytest -q", tool["text"])
+        self.assertIn("2 passed", tool["text"])
+        assistant = next(item for item in transcript if item["role"] == "assistant")
+        self.assertIn("Completed the hygiene pass.", assistant["text"])
+        self.assertIn("[workflow.yml]\n\n(/workspace/example/.github/workflows/workflow.yml)", assistant["text"])
 
     def test_cli_daemon_switch_routes_through_running_daemon(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
