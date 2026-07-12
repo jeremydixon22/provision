@@ -4913,6 +4913,28 @@ def quota_window_label(window: Any, fallback: str) -> str:
     return "Weekly" if label == "weekly" else label
 
 
+def quota_stack_display_windows(
+    rate_limit: dict[str, Any],
+) -> tuple[Any, Any, bool]:
+    """Map a temporarily absent five-hour quota to the stacked weekly display.
+
+    When OpenAI suspends the five-hour limit, Codex can report its only weekly
+    window as ``primary_window``. Treating that literal field name as a 5h
+    value makes the UI draw an invented weekly layer and label the real weekly
+    value as green. Preserve the weekly window and explicitly mark 5h as not
+    enforced instead.
+    """
+    primary = rate_limit.get("primary_window")
+    secondary = rate_limit.get("secondary_window")
+    primary_is_weekly = quota_window_label(primary, "5h") == "Weekly"
+    if primary_is_weekly:
+        weekly = secondary if isinstance(secondary, dict) and secondary else primary
+        return None, weekly, True
+    if not isinstance(primary, dict) and isinstance(secondary, dict):
+        return None, secondary, True
+    return primary, secondary, False
+
+
 def quota_status_text(label: str, window: Any) -> str:
     reset = quota_reset_label(window) if isinstance(window, dict) else ""
     return f"{label} ({reset})" if reset else label
@@ -4989,11 +5011,10 @@ def render_quota_count_window(window: Any, fallback: str) -> str:
 
 
 def quota_stack_context(rate_limit: dict[str, Any]) -> dict[str, Any]:
-    primary = rate_limit.get("primary_window")
-    secondary = rate_limit.get("secondary_window")
+    primary, secondary, primary_not_enforced = quota_stack_display_windows(rate_limit)
     primary_percent = quota_window_remaining_percent(primary)
     weekly_percent = quota_window_remaining_percent(secondary)
-    primary_label = quota_window_label(primary, "5h")
+    primary_label = "5h" if primary_not_enforced else quota_window_label(primary, "5h")
     weekly_label = quota_window_label(secondary, "Weekly")
     unbounded_kind = "unlimited" if quota_rate_limit_unlimited(rate_limit) else ""
 
@@ -5029,17 +5050,21 @@ def quota_stack_context(rate_limit: dict[str, Any]) -> dict[str, Any]:
     if primary_visual is not None and weekly_percent is not None and weekly_percent <= 0:
         primary_visual = 0.0
 
-    primary_reset_text = quota_status_text(primary_label, primary)
+    primary_reset_text = (
+        f"{primary_label} (Not enforced)"
+        if primary_not_enforced
+        else quota_status_text(primary_label, primary)
+    )
     weekly_status = quota_status_text(weekly_label, secondary)
     weekly_style = weekly_percent if weekly_percent is not None else 100.0
     primary_style = primary_visual if primary_visual is not None else 0.0
-    primary_text = quota_percent_text(primary_visual)
+    primary_text = "N/A" if primary_not_enforced else quota_percent_text(primary_visual)
     weekly_text = quota_percent_text(weekly_percent)
     primary_empty = " empty" if primary_style <= 0 else ""
     aria = " / ".join(
         piece
         for piece in (
-            f"{primary_label} {primary_text}" if primary_text else "",
+            f"{primary_label} not enforced" if primary_not_enforced else f"{primary_label} {primary_text}" if primary_text else "",
             f"{weekly_label} {weekly_text}" if weekly_text else "",
         )
         if piece
@@ -5053,6 +5078,7 @@ def quota_stack_context(rate_limit: dict[str, Any]) -> dict[str, Any]:
         "primary_text": primary_text,
         "weekly_text": weekly_text,
         "primary_empty": primary_empty,
+        "primary_not_enforced": primary_not_enforced,
         "aria": aria,
     }
 
@@ -5068,11 +5094,12 @@ def render_quota_horizons(context: dict[str, Any], name: str, title: str = "") -
         """
     weekly_status = str(context.get("weekly_status") or "")
     primary_status = str(context.get("primary_reset_text") or "")
+    primary_class = "quota-horizon primary not-enforced" if context.get("primary_not_enforced") else "quota-horizon primary"
     return f"""
       <div class="quota-title">
         <span class="quota-horizon weekly">{html.escape(weekly_status)}</span>
         <span class="quota-bucket-name" title="{html.escape(title)}">{html.escape(name)}</span>
-        <span class="quota-horizon primary">{html.escape(primary_status)}</span>
+        <span class="{primary_class}">{html.escape(primary_status)}</span>
       </div>
     """
 
@@ -5087,14 +5114,18 @@ def render_quota_stack(context: dict[str, Any]) -> str:
     primary_text = str(context.get("primary_text") or "")
     weekly_text = str(context.get("weekly_text") or "")
     primary_empty = str(context.get("primary_empty") or "")
+    primary_not_enforced = bool(context.get("primary_not_enforced"))
     aria = str(context.get("aria") or "")
     special = str(context.get("special") or "")
     stack_class = f" quota-stack-{html.escape(special)}" if special else ""
+    if primary_not_enforced:
+        stack_class += " quota-stack-primary-not-enforced"
     weekly_label_html = f'<span class="quota-weekly-label">{html.escape(weekly_text)}</span>'
-    primary_label_html = f'<span class="quota-primary-label-outside">{html.escape(primary_text)}</span>'
+    primary_label_class = "quota-primary-label-outside not-enforced" if primary_not_enforced else "quota-primary-label-outside"
+    primary_label_html = f'<span class="{primary_label_class}">{html.escape(primary_text)}</span>'
     bar_attrs = (
         f'role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{primary_style:.0f}" aria-label="{html.escape(aria)}"'
-        if not special
+        if not special and not primary_not_enforced
         else f'role="img" aria-label="{html.escape(aria)}"'
     )
 
@@ -5183,9 +5214,13 @@ def render_compact_quota_bucket_html(bucket: dict[str, Any], *, secondary: bool 
     weekly_style = float(context.get("weekly_style") or 0.0)
     primary_text = str(context.get("primary_text") or "")
     weekly_text = str(context.get("weekly_text") or "")
+    primary_not_enforced = bool(context.get("primary_not_enforced"))
     aria = str(context.get("aria") or title)
     special = str(context.get("special") or "")
     special_class = f" {html.escape(special)}" if special else ""
+    if primary_not_enforced:
+        special_class += " primary-not-enforced"
+    primary_class = "control-compact-quota-primary not-enforced" if primary_not_enforced else "control-compact-quota-primary"
     return f"""
       <span class="control-compact-quota{special_class}{secondary_class}" title="{html.escape(title)}">
         <span class="control-compact-quota-name">{html.escape(name)}</span>
@@ -5194,7 +5229,7 @@ def render_compact_quota_bucket_html(bucket: dict[str, Any], *, secondary: bool 
           <span class="control-compact-quota-weekly-fill" style="width: {weekly_style:.2f}%"></span>
           <span class="control-compact-quota-primary-fill" style="width: {primary_style:.2f}%"></span>
         </span>
-        <span class="control-compact-quota-primary">{html.escape(primary_text)}</span>
+        <span class="{primary_class}">{html.escape(primary_text)}</span>
       </span>
     """
 
@@ -5432,6 +5467,7 @@ def quota_stack_payload(rate_limit: dict[str, Any]) -> dict[str, Any]:
         "primary_text",
         "weekly_text",
         "primary_empty",
+        "primary_not_enforced",
         "aria",
         "special",
     ):
@@ -12305,6 +12341,9 @@ class Handler(BaseHTTPRequestHandler):
       min-width: 30px;
       text-align: right;
     }
+    .control-compact-quota-primary.not-enforced {
+      color: var(--muted);
+    }
     .control-compact-quota-weekly {
       color: var(--blue);
       min-width: 30px;
@@ -13544,6 +13583,9 @@ class Handler(BaseHTTPRequestHandler):
 	      text-align: left;
 	      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.58);
 	    }
+	    .quota-horizon.primary.not-enforced {
+	      color: var(--muted);
+	    }
 	    :root[data-theme="dark"] .quota-horizon.primary,
 	    :root[data-theme="dark"] .quota-horizon.weekly {
 	      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.45);
@@ -13613,6 +13655,9 @@ class Handler(BaseHTTPRequestHandler):
 	      white-space: nowrap;
 	      text-align: left;
 	      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.58);
+	    }
+	    .quota-primary-label-outside.not-enforced {
+	      color: var(--muted);
 	    }
 	    .quota-weekly-label {
 	      color: var(--blue);
@@ -16754,11 +16799,13 @@ class Handler(BaseHTTPRequestHandler):
 	          </div>
 	        `;
 	      }
+	      const primaryNotEnforced = Boolean(stack.primary_not_enforced);
+	      const primaryClass = primaryNotEnforced ? "primary not-enforced" : "primary";
 	      return `
 	        <div class="quota-title">
 	          <span class="quota-horizon weekly">${escapeHtml(stack.weekly_status || "")}</span>
 	          <span class="quota-bucket-name" title="${escapeHtml(title)}">${escapeHtml(name)}</span>
-	          <span class="quota-horizon primary">${escapeHtml(stack.primary_reset_text || "")}</span>
+	          <span class="quota-horizon ${primaryClass}">${escapeHtml(stack.primary_reset_text || "")}</span>
 	        </div>
 	      `;
 	    }
@@ -16772,12 +16819,14 @@ class Handler(BaseHTTPRequestHandler):
 	      const primaryText = String(stack.primary_text || "");
 	      const weeklyText = String(stack.weekly_text || "");
 	      const primaryEmpty = String(stack.primary_empty || "");
+	      const primaryNotEnforced = Boolean(stack.primary_not_enforced);
 	      const special = String(stack.special || "");
-	      const stackClass = special ? ` quota-stack-${special}` : "";
+	      const stackClass = `${special ? ` quota-stack-${special}` : ""}${primaryNotEnforced ? " quota-stack-primary-not-enforced" : ""}`;
 	      const aria = String(stack.aria || "");
-	      const barAttrs = special
+	      const barAttrs = special || primaryNotEnforced
 	        ? `role="img" aria-label="${escapeHtml(aria)}"`
 	        : `role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${primaryStyle.toFixed(0)}" aria-label="${escapeHtml(aria)}"`;
+	      const primaryLabelClass = primaryNotEnforced ? "quota-primary-label-outside not-enforced" : "quota-primary-label-outside";
 	      return `
 	        <div class="quota-stack${escapeHtml(stackClass)}">
 	          <div class="quota-stack-row">
@@ -16786,7 +16835,7 @@ class Handler(BaseHTTPRequestHandler):
 	              <span class="quota-weekly-fill" style="width: ${weeklyStyle.toFixed(2)}%"></span>
 	              <span class="quota-primary-fill${escapeHtml(primaryEmpty)}" style="width: ${primaryStyle.toFixed(2)}%"></span>
 	            </div>
-	            <span class="quota-primary-label-outside">${escapeHtml(primaryText)}</span>
+	            <span class="${primaryLabelClass}">${escapeHtml(primaryText)}</span>
 	          </div>
 	        </div>
 	      `;

@@ -501,6 +501,32 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(stack["weekly_text"], "84%")
         self.assertIn("Resets", stack["primary_reset_text"])
 
+    def test_quota_html_maps_a_single_weekly_window_to_not_enforced_five_hour_quota(self) -> None:
+        weekly_window = {
+            "used_percent": 40,
+            "limit_window_seconds": 604800,
+        }
+        for rate_limit in (
+            {"primary_window": weekly_window},
+            {"secondary_window": weekly_window},
+        ):
+            with self.subTest(rate_limit=rate_limit):
+                entry = {"payload": {"rate_limit": rate_limit}}
+                markup = render_quota_html(entry)
+                payload = quota_panel_payload(entry)
+                stack = payload["buckets"][0]["stack"]
+                compact = render_compact_quota_html(entry)
+
+                self.assertEqual(stack["weekly_text"], "60%")
+                self.assertEqual(stack["primary_text"], "N/A")
+                self.assertTrue(stack["primary_not_enforced"])
+                self.assertEqual(stack["primary_reset_text"], "5h (Not enforced)")
+                self.assertIn('class="quota-horizon primary not-enforced">5h (Not enforced)</span>', markup)
+                self.assertIn('class="quota-primary-label-outside not-enforced">N/A</span>', markup)
+                self.assertIn('class="quota-primary-fill empty" style="width: 0.00%"', markup)
+                self.assertIn('class="quota-weekly-fill" style="width: 60.00%"', markup)
+                self.assertIn('class="control-compact-quota-primary not-enforced">N/A</span>', compact)
+
     def test_compact_quota_html_selects_model_bucket(self) -> None:
         markup = render_compact_quota_html(
             {

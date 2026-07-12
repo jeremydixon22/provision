@@ -303,6 +303,10 @@ Quota is cached per profile. Provision refreshes politely:
   this app-server enrichment is cached, throttled, and background-only so it
   does not block the primary quota path.
 
+If OpenAI temporarily reports only a weekly Codex quota, Provision keeps the
+Weekly bar in its normal position and marks the 5-hour horizon as `N/A` / `Not
+enforced` rather than inventing a green 5-hour value.
+
 `provision status` prints JSON that includes the active profile, daemon state,
 profile list, dashboard URL, and Codex CLI compatibility payload. `provision
 doctor` presents the same Codex CLI version and bundled model-catalog readiness
