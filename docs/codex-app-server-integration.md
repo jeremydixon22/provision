@@ -1,9 +1,9 @@
 # Codex CLI App-Server Integration Notes
 
 Provision currently uses Codex CLI's normal TUI/exec surfaces and observes the
-traffic that Codex CLI sends through Provision's local proxy. Codex CLI `0.141.0`
-also exposes an experimental app-server protocol that can supplement some of
-Provision's inferred traffic parsing.
+traffic that Codex CLI sends through Provision's local proxy. Codex CLI `0.144.0`
+exposes the current app-server protocol and bundled GPT-5.6 model catalog that
+can supplement some of Provision's inferred traffic parsing.
 
 This note records the current shape so the next integration step can be
 intentional rather than tied to chat history.
@@ -43,8 +43,8 @@ These pieces map cleanly to current Provision features:
   `thread/status/changed`, `turn/started`, and `turn/completed`.
 - Replace WebSocket token scraping with `thread/tokenUsage/updated` where the
   app-server is available.
-- Replace the current `codex debug models --bundled` model-catalog probe with
-  `model/list` if Provision adopts an app-server client.
+- Enrich each profile's model picker from `model/list`; retain the bundled
+  catalog as a fallback while that optional read is pending or unavailable.
 - Use `account/rateLimits/read` and `account/rateLimits/updated` as a cleaner
   source for quota buckets and credits.
 - Use `account/usage/read` to mirror Codex CLI `/usage` token summaries and
@@ -73,6 +73,10 @@ Provision now uses the app-server in a narrow, optional path:
 - App-server quota enrichment is throttled and failure-backed-off per profile.
   Slow app-server startups, schema drift, or read failures are logged but do not
   block the primary quota/status display.
+- The dashboard requests `model/list` in the same short-lived, profile-scoped
+  app-server context. Results are cached and refreshed in the background, so
+  each profile sees its own available models and reasoning efforts without
+  delaying the UI.
 - Rate-limit reset credits are surfaced in the dashboard when
   `account/rateLimits/read` reports available credits. Redemption requires an
   explicit confirmation and calls `account/rateLimitResetCredit/consume` with an
@@ -88,7 +92,8 @@ This keeps the existing proxy and launcher path authoritative for routing,
 resume compatibility, session pins, and switch safety. The dashboard does not
 require the app-server to render or route normal Codex CLI traffic, and
 Provision does not yet use app-server methods to start, steer, or interrupt
-turns.
+turns; PTY-managed terminal input is the only interactive path for terminal
+sessions.
 
 ## Credential Injection Research
 

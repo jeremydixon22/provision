@@ -17,6 +17,7 @@ from .daemon import (
     CodexAppServerError,
     codex_app_server_schema_probe,
     codex_compatibility_payload,
+    codex_restart_requirement,
     daemon_bind_address,
     daemon_running,
     daemon_url_host,
@@ -328,11 +329,23 @@ def daemon_switch_profile(store: Store, name: str, port: int, host: str | None =
 
 def cmd_status(paths: Paths, store: Store) -> int:
     status = daemon_running(paths)
+    codex = codex_compatibility_payload()
+    daemon_codex = status.get("codex") if isinstance(status, dict) and isinstance(status.get("codex"), dict) else {}
+    daemon_restart = (
+        daemon_codex.get("restart_required")
+        if isinstance(daemon_codex.get("restart_required"), dict)
+        else {"required": False}
+    )
+    daemon_cli = daemon_codex.get("cli") if isinstance(daemon_codex.get("cli"), dict) else {}
+    current_cli = codex.get("cli") if isinstance(codex.get("cli"), dict) else {}
+    if not daemon_restart.get("required") and daemon_cli:
+        daemon_restart = codex_restart_requirement(daemon_cli, current_cli)
     payload = {
         "home": str(paths.home),
         "active_profile": store.active_profile(required=False),
-        "codex": codex_compatibility_payload(),
+        "codex": codex,
         "daemon": status or {"ok": False},
+        "daemon_restart_required": daemon_restart,
         "profiles": store.list_profiles(),
         "ui": ui_url(status.get("host"), status["port"]) if status else None,
     }
@@ -383,6 +396,13 @@ def cmd_doctor(paths: Paths, store: Store) -> int:
     checks.append(("active profile present", store.active_profile(required=False) is not None))
     state = daemon_running(paths)
     checks.append(("daemon reachable", state is not None))
+    daemon_codex = state.get("codex") if isinstance(state, dict) and isinstance(state.get("codex"), dict) else {}
+    restart_state = daemon_codex.get("restart_required") if isinstance(daemon_codex, dict) else None
+    if not isinstance(restart_state, dict) or not restart_state.get("required"):
+        daemon_cli = daemon_codex.get("cli") if isinstance(daemon_codex.get("cli"), dict) else {}
+        restart_state = codex_restart_requirement(daemon_cli, codex_cli) if daemon_cli else restart_state
+    if isinstance(restart_state, dict) and restart_state.get("required"):
+        checks.append((str(restart_state.get("reason") or "Provision daemon restart required"), False))
 
     failed = False
     for label, ok in checks:

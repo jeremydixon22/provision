@@ -2,11 +2,12 @@
   <img src="src/provision/assets/provision.png" alt="Provision logo" width="700">
 </p>
 
-Provision is a Linux-native control plane and account manager for Codex CLI.
-Run `provision` instead of `codex` to keep Codex CLI's normal terminal workflow,
-resume history, and built-in login flow while adding a local browser dashboard
-for sessions, launch/resume, live terminal-backed interaction, quotas, reset
-credits, usage stats, and account-aware routing.
+Provision is a Linux-native, local-first control plane and account manager for
+Codex CLI. Run `provision` instead of `codex` to keep Codex CLI's normal
+terminal workflow, resume history, and built-in login flow while adding a
+responsive local browser dashboard for sessions, launch/resume, live
+terminal-backed interaction, quotas, reset credits, usage stats, and
+account-aware routing.
 
 Provision is useful even when you only use one account: it gives Codex CLI a
 localhost dashboard for active sessions, live turns, terminal-backed input,
@@ -23,8 +24,8 @@ The earlier cross-CLI credential research is still available in
 
 ## Requirements
 
-- Codex CLI `0.141.0` or newer is the current validation target for the full
-  dashboard, model picker, quota, and compatibility-reporting path.
+- Codex CLI `0.144.0` or newer is the current validation target for the full
+  dashboard, GPT-5.6 model picker, quota, and compatibility-reporting path.
 - Python 3.11+ is recommended.
 - The richest quota display depends on Codex CLI and the ChatGPT backend
   reporting multi-bucket usage data. Older Codex CLI versions may still route
@@ -80,6 +81,22 @@ provision help
 provision login --help
 ```
 
+## What’s New In 0.4.0
+
+- Keeps a busy dashboard responsive by sending incremental live-state updates
+  and loading native Codex history and resume candidates only when requested.
+- Shows native Codex history beside live observations without duplicating turns
+  that Provision has already captured.
+- Routes direct image-generation requests and shows a concise completion entry
+  in Discussion after an image is created.
+- Reads each profile's available models from Codex CLI's app-server surface in
+  the background, while preserving the bundled catalog as a safe fallback.
+- Runs Codex commands that bypass Provision's HTTP provider path with the
+  active profile's credentials, without replacing the user's normal Codex
+  configuration or session history.
+- Warns when the installed Codex CLI changes underneath the daemon, so an
+  upgrade can be completed with a deliberate, non-disruptive daemon restart.
+
 ## What Provision Adds
 
 - Named Codex CLI ChatGPT login profiles captured through isolated temporary
@@ -87,6 +104,8 @@ provision login --help
 - A localhost Codex CLI control plane with session tabs, launcher/resume
   controls, discussion view, session details, live compose, and observed tool
   activity.
+- Incremental dashboard updates plus on-demand native-history and resume data,
+  keeping the control plane responsive as the number of managed sessions grows.
 - PTY-backed UI interaction for Provision-managed launchers, so dashboard input
   is sent to the running Codex CLI terminal rather than forking an unrelated
   app-server thread.
@@ -105,9 +124,14 @@ provision login --help
   profile supplied the displayed quota.
 - Codex CLI compatibility reporting in `provision status`, `provision doctor`,
   and the dashboard header, including the installed Codex CLI version and
-  bundled model catalog source.
+  bundled model catalog source, plus a non-disruptive daemon-restart warning
+  when Codex CLI changes underneath a running Provision daemon.
 - Codex CLI app-server capability probing for account usage, reset credits, and
   future native app-server control-plane work.
+- Profile-aware model catalogs from Codex CLI's optional app-server `model/list`
+  surface, cached and refreshed in the background with a bundled fallback.
+- Direct image-generation routing and readable completion cards in Discussion,
+  rather than a raw generated-image payload or an unexplained empty turn.
 - Resume-compatible launching that keeps Codex CLI's native transcript history
   and `model_provider=openai` session identity intact.
 
@@ -191,7 +215,12 @@ The dashboard is localhost-only and shows:
 - A `+` launcher for starting Codex CLI in known workdirs, selecting permission
   presets, and choosing recent sessions to resume.
 - A Discussion view with Markdown rendering, searchable transcript content,
-  tool-call activity, and a terminal-backed compose box for live interaction.
+  tool-call activity, image-generation completion, and a terminal-backed
+  compose box for live interaction. Messages remain content-sized instead of
+  stretching to fill an otherwise sparse pane.
+- Incremental live updates, on-demand history loading, and deferred resume
+  candidates, so opening or refreshing the dashboard does not repeatedly read
+  every known Codex transcript.
 - All enrolled profiles and their last-known quota.
 - Stacked quota bars for short-window and weekly limits, including reset times.
 - Available rate-limit reset credits, with a confirmation prompt before one is
@@ -372,6 +401,9 @@ provision start
 - App-server data is optional. If `provision app-server-probe` reports missing
   methods or app-server reads fail, Provision still routes Codex CLI traffic and
   uses the primary ChatGPT backend usage path.
+- GPT-5.6 Codex CLI model rows require Codex CLI `0.144.0` or newer. Older
+  local installs can still route through Provision, but their installed bundled
+  model catalog remains authoritative until Codex CLI is updated.
 
 ## Security
 
@@ -396,6 +428,9 @@ isolation issues. See [SECURITY.md](SECURITY.md).
 - Turn/activity tracking is based on Provision's PTY bridge, proxy observations,
   and recognized Codex CLI traffic shapes. Codex CLI app-server control-plane
   surfaces are probed but remain optional.
+- Provision can index native history for a session it currently knows, but it
+  cannot retroactively live-track or make controllable a wholly stock Codex CLI
+  session that has never connected through Provision.
 - Codex CLI still applies its normal current-working-directory filter in the
   resume picker. Use `provision resume --all` when launching from a different
   directory than the sessions you want to see.

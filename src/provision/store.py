@@ -142,6 +142,23 @@ class Store:
         self.paths.active_profile.write_text(name + "\n", encoding="utf-8")
         self.paths.active_profile.chmod(0o600)
 
+    def remove_profile(self, name: str) -> None:
+        """Remove credentials for a profile after a profile-scoped Codex logout."""
+        directory = self.profile_dir(name)
+        if not directory.exists():
+            return
+        shutil.rmtree(directory)
+        if self.stored_active_profile() != name:
+            return
+        remaining = self.profile_names()
+        if remaining:
+            self.set_active_profile(remaining[0])
+            return
+        try:
+            self.paths.active_profile.unlink()
+        except FileNotFoundError:
+            pass
+
     def proxy_token(self) -> str:
         if self.paths.proxy_token.exists():
             token = self.paths.proxy_token.read_text(encoding="utf-8").strip()

@@ -30,6 +30,8 @@ from provision.daemon import BillingRequiredError
 from provision.daemon import bridge_codex_history_into_app_home
 from provision.daemon import CHATGPT_ANALYTICS_EVENTS_PATH
 from provision.daemon import codex_resume_candidates_for_cwd
+from provision.daemon import codex_history_turn_index_for_cwd
+from provision.daemon import codex_history_turn_payload_for_cwd
 from provision.daemon import DEFAULT_UPSTREAM_USER_AGENT
 from provision.daemon import error_requires_billing
 from provision.daemon import ensure_default_upstream_user_agent
@@ -43,6 +45,7 @@ from provision.daemon import decode_project_session_sentinel
 from provision.daemon import daemon_url_host
 from provision.daemon import daemon_bind_address
 from provision.daemon import project_session_sentinel
+from provision.daemon import quota_panel_payload
 from provision.daemon import redact_proxy_token
 from provision.daemon import render_compact_quota_html
 from provision.daemon import render_quota_html
@@ -224,6 +227,164 @@ class StoreTests(unittest.TestCase):
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
         )
 
+    def test_ui_dirty_state_revision_tracks_mutations(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.ui_state_lock = threading.Lock()
+        server.ui_state_version = 0
+        server.ui_state_dirty_reasons = {}
+        server.ui_state_dirty_log = []
+
+        self.assertEqual(server.ui_state_revision(), 0)
+        self.assertEqual(server.mark_ui_dirty("test"), 1)
+        self.assertEqual(server.ui_state_revision(), 1)
+        self.assertEqual(server.ui_state_dirty_reasons["test"], 1)
+        self.assertEqual(server.ui_state_dirty_reasons_since(0), {"test"})
+
+    def test_ui_state_if_needed_uses_heartbeat_when_clean(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.ui_state_lock = threading.Lock()
+        server.ui_state_version = 3
+        server.ui_state_dirty_reasons = {}
+        server.active_lock = threading.RLock()
+        server.active_requests = {}
+        server.active_websockets = {}
+
+        handler = Handler.__new__(Handler)
+        handler.server = server
+        sent: list[str] = []
+        handler.send_ui_state = lambda **_kwargs: sent.append("state") or server.ui_state_revision()  # type: ignore[method-assign]
+        handler.send_ui_delta = lambda **_kwargs: sent.append("delta") or server.ui_state_revision()  # type: ignore[method-assign]
+        handler.send_ui_heartbeat = lambda: sent.append("heartbeat")  # type: ignore[method-assign]
+
+        result = handler.send_ui_state_if_needed(
+            last_sent_version=server.ui_state_revision(),
+            last_liveness_signature=server.ui_state_liveness_signature(),
+            last_safety_snapshot=time.monotonic(),
+            last_heartbeat=0.0,
+        )
+
+        self.assertEqual(sent, ["heartbeat"])
+        self.assertEqual(result[0], 3)
+
+    def test_ui_state_if_needed_sends_delta_when_dirty(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.ui_state_lock = threading.Lock()
+        server.ui_state_version = 3
+        server.ui_state_dirty_reasons = {}
+        server.ui_state_dirty_log = []
+        server.active_lock = threading.RLock()
+        server.active_requests = {}
+        server.active_websockets = {}
+
+        handler = Handler.__new__(Handler)
+        handler.server = server
+        sent: list[str] = []
+        handler.send_ui_state = lambda **_kwargs: sent.append("state") or server.ui_state_revision()  # type: ignore[method-assign]
+        handler.send_ui_delta = lambda **_kwargs: sent.append("delta") or server.ui_state_revision()  # type: ignore[method-assign]
+        handler.send_ui_heartbeat = lambda: sent.append("heartbeat")  # type: ignore[method-assign]
+
+        server.mark_ui_dirty("dirty")
+        result = handler.send_ui_state_if_needed(
+            last_sent_version=3,
+            last_liveness_signature=server.ui_state_liveness_signature(),
+            last_safety_snapshot=time.monotonic(),
+            last_heartbeat=0.0,
+        )
+
+        self.assertEqual(sent, ["delta"])
+        self.assertEqual(result[0], 4)
+
+    def test_ui_state_if_needed_sends_delta_when_liveness_changes(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.ui_state_lock = threading.Lock()
+        server.ui_state_version = 3
+        server.ui_state_dirty_reasons = {}
+        server.ui_state_dirty_log = []
+        server.active_lock = threading.RLock()
+        server.active_requests = {}
+        server.active_websockets = {}
+
+        handler = Handler.__new__(Handler)
+        handler.server = server
+        sent: list[str] = []
+        handler.send_ui_state = lambda **_kwargs: sent.append("state") or server.ui_state_revision()  # type: ignore[method-assign]
+        handler.send_ui_delta = lambda **_kwargs: sent.append("delta") or server.ui_state_revision()  # type: ignore[method-assign]
+        handler.send_ui_heartbeat = lambda: sent.append("heartbeat")  # type: ignore[method-assign]
+
+        old_signature = server.ui_state_liveness_signature()
+        server.active_requests[1] = {"profile": "default", "session_key": "/workspace/app"}
+        result = handler.send_ui_state_if_needed(
+            last_sent_version=server.ui_state_revision(),
+            last_liveness_signature=old_signature,
+            last_safety_snapshot=time.monotonic(),
+            last_heartbeat=0.0,
+        )
+
+        self.assertEqual(sent, ["delta"])
+        self.assertEqual(result[0], 3)
+        self.assertNotEqual(result[1], old_signature)
+
+    def test_ui_state_if_needed_sends_safety_snapshot(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.ui_state_lock = threading.Lock()
+        server.ui_state_version = 3
+        server.ui_state_dirty_reasons = {}
+        server.ui_state_dirty_log = []
+        server.active_lock = threading.RLock()
+        server.active_requests = {}
+        server.active_websockets = {}
+
+        handler = Handler.__new__(Handler)
+        handler.server = server
+        sent: list[str] = []
+        handler.send_ui_state = lambda **_kwargs: sent.append("state") or server.ui_state_revision()  # type: ignore[method-assign]
+        handler.send_ui_heartbeat = lambda: sent.append("heartbeat")  # type: ignore[method-assign]
+
+        result = handler.send_ui_state_if_needed(
+            last_sent_version=server.ui_state_revision(),
+            last_liveness_signature=server.ui_state_liveness_signature(),
+            last_safety_snapshot=time.monotonic() - daemon_module.UI_SAFETY_SNAPSHOT_SECONDS - 1,
+            last_heartbeat=0.0,
+        )
+
+        self.assertEqual(sent, ["state"])
+        self.assertEqual(result[0], 3)
+
+    def test_ui_state_packet_includes_revision(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.ui_state_lock = threading.Lock()
+        server.ui_state_version = 7
+        server.ui_state_dirty_reasons = {}
+        server.ui_state_dirty_log = []
+
+        handler = Handler.__new__(Handler)
+        handler.server = server
+        sent: list[dict[str, Any]] = []
+        handler.ui_status_payload = lambda: {"ok": True}  # type: ignore[method-assign]
+        handler.send_websocket_json = lambda data: sent.append(data)  # type: ignore[method-assign]
+
+        self.assertEqual(handler.send_ui_state(), 7)
+        self.assertEqual(sent[0]["type"], "state")
+        self.assertEqual(sent[0]["ui_state_version"], 7)
+
+    def test_ui_delta_packet_includes_sections_and_revision(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.ui_state_lock = threading.Lock()
+        server.ui_state_version = 8
+        server.ui_state_dirty_reasons = {}
+        server.ui_state_dirty_log = []
+
+        handler = Handler.__new__(Handler)
+        handler.server = server
+        sent: list[dict[str, Any]] = []
+        handler.ui_status_delta_payload = lambda sections: {"sections": sorted(sections)}  # type: ignore[method-assign]
+        handler.send_websocket_json = lambda data: sent.append(data)  # type: ignore[method-assign]
+
+        self.assertEqual(handler.send_ui_delta(reasons={"transcript"}), 8)
+        self.assertEqual(sent[0]["type"], "state_delta")
+        self.assertEqual(sent[0]["ui_state_version"], 8)
+        self.assertEqual(sent[0]["sections"], ["base", "control_plane"])
+
     def test_upstream_websocket_handshake_disables_extensions(self) -> None:
         handler = Handler.__new__(Handler)
         handler.headers = {
@@ -307,6 +468,39 @@ class StoreTests(unittest.TestCase):
         self.assertIn("gpt-5.3-codex-spark", markup)
         self.assertIn("quota-stack-bar", markup)
 
+    def test_quota_panel_payload_exposes_structured_buckets(self) -> None:
+        payload = quota_panel_payload(
+            {
+                "payload": {
+                    "rate_limit": {
+                        "allowed": True,
+                        "primary_window": {
+                            "used_percent": 25,
+                            "limit_window_seconds": 18000,
+                            "reset_after_seconds": 3600,
+                        },
+                        "secondary_window": {
+                            "used_percent": 16,
+                            "limit_window_seconds": 604800,
+                        },
+                    },
+                    "credits": {"has_credits": True, "balance": "$12.34"},
+                    "rate_limit_reset_credits": {"available_count": 1},
+                },
+                "fetched_at": datetime(2026, 5, 22, 15, 36),
+            },
+            "Updated 15:36 on 22 May",
+        )
+
+        self.assertEqual(payload["updated"], "Updated 15:36 on 22 May")
+        self.assertEqual(payload["credits_label"], "$12.34")
+        self.assertEqual(payload["reset_credit"]["label"], "Reset credit: 1")
+        self.assertEqual(payload["buckets"][0]["name"], "Codex")
+        stack = payload["buckets"][0]["stack"]
+        self.assertEqual(stack["primary_text"], "75%")
+        self.assertEqual(stack["weekly_text"], "84%")
+        self.assertIn("Resets", stack["primary_reset_text"])
+
     def test_compact_quota_html_selects_model_bucket(self) -> None:
         markup = render_compact_quota_html(
             {
@@ -362,6 +556,11 @@ class StoreTests(unittest.TestCase):
         )
         self.assertIn("10%", markup)
         self.assertIn("50%", markup)
+        weekly_pos = markup.find('<span class="control-compact-quota-weekly">50%</span>')
+        bar_pos = markup.find('<span class="control-compact-quota-bar"')
+        primary_pos = markup.find('<span class="control-compact-quota-primary">10%</span>')
+        self.assertLess(weekly_pos, bar_pos)
+        self.assertLess(bar_pos, primary_pos)
 
     def test_quota_html_renders_nonzero_credits_pill(self) -> None:
         markup = render_quota_html(
@@ -610,6 +809,8 @@ class StoreTests(unittest.TestCase):
                             {"id": "priority", "name": "Fast", "description": "faster"},
                         ],
                         "additional_speed_tiers": ["fast"],
+                        "minimal_client_version": "0.144.0",
+                        "priority": 1,
                         "availability_nux": {"message": "New model\n\nDetails"},
                     },
                     {
@@ -628,6 +829,50 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(catalog[0]["note"], "New model")
         self.assertEqual(catalog[0]["service_tiers"][0]["id"], "priority")
         self.assertEqual(catalog[0]["additional_speed_tiers"], ["fast"])
+        self.assertEqual(catalog[0]["minimal_client_version"], "0.144.0")
+        self.assertEqual(catalog[0]["priority"], 1)
+
+    def test_codex_model_catalog_accepts_effort_shape_and_future_values(self) -> None:
+        catalog = normalize_codex_model_catalog(
+            {
+                "data": [
+                    {
+                        "id": "gpt-future",
+                        "displayName": "gpt-future",
+                        "default_reasoning_effort": "future",
+                        "supported_reasoning_efforts": [
+                            {"name": "future"},
+                            "max",
+                        ],
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(catalog[0]["default_reasoning"], "future")
+        self.assertEqual(catalog[0]["reasoning"], ["future", "max"])
+
+    def test_default_model_catalog_tracks_codex_cli_0144_models(self) -> None:
+        fallback = {item["id"]: item for item in daemon_module.DEFAULT_MODEL_CATALOG}
+
+        self.assertEqual(daemon_module.DEFAULT_MODEL_ID, "gpt-5.6-sol")
+        self.assertEqual(fallback["gpt-5.6-sol"]["default_reasoning"], "low")
+        self.assertIn("max", fallback["gpt-5.6-sol"]["reasoning"])
+        self.assertIn("ultra", fallback["gpt-5.6-sol"]["reasoning"])
+        self.assertIn("ultra", fallback["gpt-5.6-terra"]["reasoning"])
+        self.assertIn("max", fallback["gpt-5.6-luna"]["reasoning"])
+        self.assertNotIn("ultra", fallback["gpt-5.6-luna"]["reasoning"])
+        self.assertEqual(fallback["gpt-5.6-sol"]["minimal_client_version"], "0.144.0")
+
+    def test_codex_restart_requirement_detects_cli_change_after_daemon_start(self) -> None:
+        requirement = daemon_module.codex_restart_requirement(
+            {"version": "0.144.0"},
+            {"version": "0.145.0"},
+        )
+
+        self.assertTrue(requirement["required"])
+        self.assertEqual(requirement["startup_version"], "0.144.0")
+        self.assertEqual(requirement["runtime_version"], "0.145.0")
 
     def test_codex_compatibility_payload_reads_version_and_catalog(self) -> None:
         original_run = daemon_module.subprocess.run
@@ -692,6 +937,8 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(payload["app_server"]["methods"]["rate_limit_reset_credit_consume"])
         self.assertTrue(payload["app_server"]["control_plane"]["read_only"])
         self.assertTrue(payload["app_server"]["control_plane"]["interactive"])
+        self.assertTrue(payload["app_server"]["control_plane"]["interactive_api"])
+        self.assertEqual(payload["app_server"]["control_plane"]["provision_interaction"], "pty")
         self.assertTrue(payload["app_server"]["control_plane"]["remote_control"])
 
     def test_codex_app_server_schema_probe_reads_usage_and_reset_credit_methods(self) -> None:
@@ -825,6 +1072,7 @@ class StoreTests(unittest.TestCase):
                             json.dumps({"id": 1, "result": {"serverInfo": {"name": "codex"}}}),
                             json.dumps({"id": 2, "result": {"rateLimits": {"limitId": "codex"}}}),
                             json.dumps({"id": 3, "result": {"summary": {"lifetimeTokens": 123}, "dailyUsageBuckets": []}}),
+                            json.dumps({"id": 4, "result": {"data": [{"id": "gpt-test"}]}}),
                             "",
                         ]
                     )
@@ -854,6 +1102,7 @@ class StoreTests(unittest.TestCase):
             with daemon_module.CodexAppServerClient(timeout=1) as client:
                 rate_limits = client.read_account_rate_limits()
                 usage = client.read_account_usage()
+                models = client.list_models()
         finally:
             daemon_module.subprocess.Popen = original_popen
 
@@ -863,8 +1112,10 @@ class StoreTests(unittest.TestCase):
         self.assertIn('"method":"initialized"', sent)
         self.assertIn('"method":"account/rateLimits/read"', sent)
         self.assertIn('"method":"account/usage/read"', sent)
+        self.assertIn('"method":"model/list","id":4,"params":{}', sent)
         self.assertEqual(rate_limits["rateLimits"]["limitId"], "codex")
         self.assertEqual(usage["summary"]["lifetimeTokens"], 123)
+        self.assertEqual(models["data"][0]["id"], "gpt-test")
 
     def test_app_server_rate_limit_refresh_failure_logs_and_backs_off(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -938,6 +1189,37 @@ class StoreTests(unittest.TestCase):
             assert snapshot is not None
             self.assertEqual(snapshot["payload"]["rate_limit_reset_credits"]["available_count"], 1)
             self.assertFalse(server.schedule_app_server_rate_limit_refresh("default"))
+
+    def test_profile_model_catalog_uses_read_only_app_server_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "auth.json"
+            source.write_text(json.dumps({"OPENAI_API_KEY": "sk-test"}), encoding="utf-8")
+            paths = Paths(root / "home")
+            Store(paths).import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            original_run = server.run_app_server_for_profile
+            try:
+                server.run_app_server_for_profile = lambda _profile, _callback: {  # type: ignore[method-assign]
+                    "models": [
+                        {
+                            "id": "gpt-profile-only",
+                            "displayName": "Profile Only",
+                            "supportedReasoningEfforts": ["minimal", "high"],
+                            "defaultReasoningEffort": "high",
+                        }
+                    ]
+                }
+                server.refresh_profile_model_catalog("default")
+                snapshot = server.profile_model_catalog_snapshot("default")
+            finally:
+                server.run_app_server_for_profile = original_run  # type: ignore[method-assign]
+                server.server_close()
+
+            self.assertTrue(snapshot["available"])
+            self.assertEqual(snapshot["source"], "app-server")
+            self.assertEqual(snapshot["catalog"][0]["id"], "gpt-profile-only")
+            self.assertEqual(snapshot["catalog"][0]["reasoning"], ["minimal", "high"])
 
     def test_reset_credit_guard_blocks_duplicate_consume_before_upstream_call(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1429,6 +1711,252 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(candidates[0]["id"], "019abc")
             self.assertEqual(candidates[0]["label"], "Resume me")
 
+    def test_codex_history_turns_index_session_file_without_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session_dir = root / "sessions" / "2026" / "06" / "22"
+            session_dir.mkdir(parents=True)
+            session_file = session_dir / "rollout-2026-06-22T10-00-00-019history.jsonl"
+            rows = [
+                {
+                    "timestamp": "2026-06-22T10:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "019history",
+                        "timestamp": "2026-06-22T10:00:00Z",
+                        "cwd": "/workspace/provision",
+                    },
+                },
+                {
+                    "timestamp": "2026-06-22T10:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "# AGENTS.md instructions for /workspace/provision\nDo not use as a prompt.",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "timestamp": "2026-06-22T10:01:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "First historical prompt"}],
+                        "internal_chat_message_metadata_passthrough": {"turn_id": "turn-first"},
+                    },
+                },
+                {
+                    "timestamp": "2026-06-22T10:01:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "First historical answer"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-06-22T10:02:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Find the hidden ladder reference"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-06-22T10:02:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "The ladder first appears here."}],
+                    },
+                },
+            ]
+            session_file.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            turns = codex_history_turn_index_for_cwd(
+                "/workspace/provision",
+                codex_home=root,
+            )
+
+            self.assertEqual([turn["label"] for turn in turns], [
+                "First historical prompt",
+                "Find the hidden ladder reference",
+            ])
+            self.assertTrue(all(turn["source"] == "history" for turn in turns))
+            self.assertTrue(all("transcript" not in turn for turn in turns))
+            self.assertEqual(turns[0]["turn_id"], "turn-first")
+            self.assertIn("ladder", turns[1]["search_text"])
+
+    def test_codex_history_turn_payload_lazy_loads_selected_turn_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session_dir = root / "sessions" / "2026" / "06" / "22"
+            session_dir.mkdir(parents=True)
+            session_file = session_dir / "rollout-2026-06-22T10-00-00-019history.jsonl"
+            rows = [
+                {
+                    "timestamp": "2026-06-22T10:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "019history",
+                        "timestamp": "2026-06-22T10:00:00Z",
+                        "cwd": "/workspace/provision",
+                    },
+                },
+                {
+                    "timestamp": "2026-06-22T10:01:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Earlier prompt"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-06-22T10:01:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Earlier answer"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-06-22T10:02:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Selected prompt"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-06-22T10:02:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "local_shell",
+                        "call_id": "call-history",
+                        "arguments": "{\"cmd\":\"pytest -q\"}",
+                        "status": "completed",
+                    },
+                },
+                {
+                    "timestamp": "2026-06-22T10:02:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Selected answer"}],
+                    },
+                },
+            ]
+            session_file.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            turns = codex_history_turn_index_for_cwd(
+                "/workspace/provision",
+                codex_home=root,
+            )
+
+            payload = codex_history_turn_payload_for_cwd(
+                "/workspace/provision",
+                turns[1]["key"],
+                codex_home=root,
+            )
+
+            self.assertIsNotNone(payload)
+            assert payload is not None
+            self.assertTrue(payload["turn"]["loaded"])
+            self.assertEqual(payload["turn"]["label"], "Selected prompt")
+            text = "\n".join(item["full_text"] for item in payload["transcript"])
+            self.assertIn("Selected prompt", text)
+            self.assertIn("Selected answer", text)
+            self.assertIn("Command: pytest -q", text)
+            self.assertNotIn("Earlier answer", text)
+
+    def test_codex_history_turns_include_archived_rollouts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            def write_session(directory: Path, session_id: str, timestamp: str, prompt: str) -> None:
+                directory.mkdir(parents=True, exist_ok=True)
+                rows = [
+                    {
+                        "timestamp": timestamp,
+                        "type": "session_meta",
+                        "payload": {
+                            "id": session_id,
+                            "timestamp": timestamp,
+                            "cwd": "/workspace/provision",
+                        },
+                    },
+                    {
+                        "timestamp": timestamp.replace("00Z", "01Z"),
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": prompt}],
+                        },
+                    },
+                    {
+                        "timestamp": timestamp.replace("00Z", "02Z"),
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": f"Answer to {prompt}"}],
+                        },
+                    },
+                ]
+                (directory / f"rollout-{session_id}.jsonl").write_text(
+                    "\n".join(json.dumps(row) for row in rows) + "\n",
+                    encoding="utf-8",
+                )
+
+            write_session(
+                root / "sessions" / "2026" / "06" / "22",
+                "active-history",
+                "2026-06-22T10:00:00Z",
+                "Active historical prompt",
+            )
+            write_session(
+                root / "archived_sessions" / "2026" / "06" / "21",
+                "archived-history",
+                "2026-06-21T10:00:00Z",
+                "Archived historical prompt",
+            )
+
+            turns = codex_history_turn_index_for_cwd("/workspace/provision", codex_home=root)
+
+            self.assertEqual(
+                [turn["label"] for turn in turns],
+                ["Archived historical prompt", "Active historical prompt"],
+            )
+            self.assertEqual([turn["archived"] for turn in turns], [True, False])
+            payload = codex_history_turn_payload_for_cwd(
+                "/workspace/provision",
+                turns[0]["key"],
+                codex_home=root,
+            )
+            self.assertIsNotNone(payload)
+            assert payload is not None
+            self.assertTrue(payload["turn"]["archived"])
+            self.assertIn("Archived historical prompt", payload["transcript"][0]["full_text"])
+
     def test_request_body_session_reads_turn_metadata_workspace(self) -> None:
         body = json.dumps(
             {
@@ -1905,6 +2433,27 @@ class StoreTests(unittest.TestCase):
             [{"role": "user", "text": "Initial observed prompt"}],
         )
 
+    def test_goal_context_uses_objective_as_turn_label(self) -> None:
+        prompt = (
+            '<codex_internal_context source="goal">\n'
+            "Continue working toward the active thread goal.\n\n"
+            "<objective>\n"
+            "Address the release blockers.\n"
+            "</objective>\n\n"
+            "Continuation behavior:\n"
+            "Keep the full objective intact.\n"
+            "</codex_internal_context>"
+        )
+
+        self.assertEqual(
+            daemon_module.user_transcript_entries(prompt),
+            [{"role": "user", "text": "Goal: Address the release blockers."}],
+        )
+        self.assertEqual(
+            daemon_module.observed_turn_label_from_text(prompt),
+            "Goal: Address the release blockers.",
+        )
+
     def test_websocket_terminal_event_keeps_pending_for_tool_output(self) -> None:
         self.assertTrue(
             websocket_terminal_event_keeps_work_pending(
@@ -2174,6 +2723,80 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(rewritten["model"], "gpt-5.4-mini")
             self.assertEqual(rewritten["reasoning"]["effort"], "high")
 
+    def test_image_generation_proxy_forwards_body_without_response_rewrites(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            auth = {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": fake_jwt({"email": "user@example.test"}),
+                    "access_token": fake_jwt({"exp": 9999999999}),
+                    "refresh_token": "rt_test",
+                },
+            }
+            source = root / "auth.json"
+            source.write_text(json.dumps(auth), encoding="utf-8")
+            paths = Paths(root / "home")
+            Store(paths).import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            captured: dict[str, object] = {}
+            original = Handler._proxy_to_upstream_once
+
+            def fake_proxy(
+                handler: Handler,
+                method: str,
+                parsed: urllib.parse.ParseResult,
+                *,
+                body: bytes | None,
+                retry_on_401: bool,
+                route: str,
+                profile: str,
+            ) -> tuple[int, int]:
+                captured.update(
+                    method=method,
+                    path=parsed.path,
+                    body=body,
+                    route=route,
+                    profile=profile,
+                )
+                handler.send_json({"ok": True})
+                return 200, len(b'{\n  "ok": true\n}')
+
+            Handler._proxy_to_upstream_once = fake_proxy
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                body = b'{"model":"gpt-image-1","prompt":"a small blue square"}'
+                conn = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    server.server_address[1],
+                    timeout=2,
+                )
+                conn.request(
+                    "POST",
+                    "/v1/images/generations",
+                    body=body,
+                    headers={
+                        "authorization": f"Bearer {server.proxy_token}",
+                        "content-type": "application/json",
+                    },
+                )
+                response = conn.getresponse()
+                response.read()
+                conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                Handler._proxy_to_upstream_once = original
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(captured["method"], "POST")
+            self.assertEqual(captured["path"], "/v1/images/generations")
+            self.assertEqual(captured["route"], UpstreamRoute.CODEX_API)
+            self.assertEqual(captured["profile"], "default")
+            self.assertEqual(captured["body"], body)
+
     def test_stats_summary_aggregates_usage_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -2361,6 +2984,279 @@ class StoreTests(unittest.TestCase):
             self.assertTrue(
                 any("Token usage" in event["summary"] for event in session["events"])
             )
+
+    def test_control_plane_history_metadata_loads_on_demand(self) -> None:
+        previous_codex_home = os.environ.get("CODEX_HOME")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codex_home = root / "codex"
+            session_dir = codex_home / "sessions" / "2026" / "06" / "22"
+            session_dir.mkdir(parents=True)
+            session_file = session_dir / "rollout-2026-06-22T10-00-00-019history.jsonl"
+            session_file.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        {
+                            "timestamp": "2026-06-22T10:00:00Z",
+                            "type": "session_meta",
+                            "payload": {
+                                "id": "019history",
+                                "timestamp": "2026-06-22T10:00:00Z",
+                                "cwd": "/workspace/provision",
+                            },
+                        },
+                        {
+                            "timestamp": "2026-06-22T10:01:00Z",
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "Historical prompt"}],
+                            },
+                        },
+                        {
+                            "timestamp": "2026-06-22T10:01:03Z",
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": "Historical answer body"}],
+                            },
+                        },
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            os.environ["CODEX_HOME"] = str(codex_home)
+            paths = Paths(root / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                session_key = server.observe_session("/workspace/provision", "default")
+                payload = server.control_plane_sessions()
+                session = next(item for item in payload["sessions"] if item["key"] == session_key)
+                self.assertNotIn("history_turns", session)
+                self.assertEqual(session["transcript"], [])
+
+                history_turns = server.history_turn_index_for_session(session_key)
+                self.assertEqual(len(history_turns), 1)
+                self.assertEqual(history_turns[0]["label"], "Historical prompt")
+                self.assertIn("Historical answer body", history_turns[0]["search_text"])
+
+                history_payload = server.history_turn_payload_for_session(
+                    session_key,
+                    history_turns[0]["key"],
+                )
+                self.assertIn("Historical answer body", history_payload["transcript"][1]["full_text"])
+            finally:
+                server.server_close()
+                if previous_codex_home is None:
+                    os.environ.pop("CODEX_HOME", None)
+                else:
+                    os.environ["CODEX_HOME"] = previous_codex_home
+
+    def test_history_turn_index_cache_is_singleflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            started = threading.Event()
+            release = threading.Event()
+            calls = 0
+            calls_lock = threading.Lock()
+            results: list[list[dict[str, Any]]] = []
+            errors: list[BaseException] = []
+            original = daemon_module.codex_history_turn_index_for_cwd
+
+            def index(_cwd: str) -> list[dict[str, Any]]:
+                nonlocal calls
+                with calls_lock:
+                    calls += 1
+                started.set()
+                release.wait(1.0)
+                return [{"key": "history:one"}]
+
+            def load() -> None:
+                try:
+                    results.append(server.history_turns_for_cwd("/workspace/provision"))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            daemon_module.codex_history_turn_index_for_cwd = index
+            try:
+                first = threading.Thread(target=load)
+                second = threading.Thread(target=load)
+                first.start()
+                self.assertTrue(started.wait(1.0))
+                second.start()
+                time.sleep(0.02)
+                release.set()
+                first.join(1.0)
+                second.join(1.0)
+                self.assertFalse(first.is_alive())
+                self.assertFalse(second.is_alive())
+                self.assertEqual(calls, 1)
+                self.assertEqual(errors, [])
+                self.assertEqual(results, [[{"key": "history:one"}], [{"key": "history:one"}]])
+            finally:
+                daemon_module.codex_history_turn_index_for_cwd = original
+                server.server_close()
+
+    def test_history_turn_index_excludes_observed_turn_duplicates(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.active_lock = threading.Lock()
+        session_key = "/workspace/provision"
+        server.observed_sessions = {session_key: {"cwd": session_key}}
+        server.control_transcripts = {
+            session_key: [
+                {
+                    "role": "user",
+                    "turn_id": "turn-observed",
+                    "ts": "2026-06-22T10:01:00Z",
+                    "updated_at": "2026-06-22T10:01:00Z",
+                    "text": "Observed prompt",
+                    "full_text": "Observed prompt",
+                },
+                {
+                    "role": "assistant",
+                    "turn_id": "turn-observed",
+                    "ts": "2026-06-22T10:01:03Z",
+                    "updated_at": "2026-06-22T10:01:03Z",
+                    "text": "Observed answer",
+                    "full_text": "Observed answer",
+                },
+            ]
+        }
+        server.history_turns_for_cwd = lambda _cwd: [  # type: ignore[method-assign]
+            {
+                "key": "history:exact",
+                "turn_id": "turn-observed",
+                "label": "Observed prompt",
+                "timestamp": "2026-06-22T10:01:00Z",
+            },
+            {
+                "key": "history:legacy",
+                "turn_id": "history:legacy",
+                "label": "Observed prompt",
+                "timestamp": "2026-06-22T10:01:06Z",
+            },
+            {
+                "key": "history:distinct",
+                "turn_id": "turn-distinct",
+                "label": "Observed prompt",
+                "timestamp": "2026-06-22T10:01:00Z",
+            },
+        ]
+
+        turns = server.history_turn_index_for_session(session_key)
+
+        self.assertEqual([turn["key"] for turn in turns], ["history:distinct"])
+
+    def test_observe_session_heartbeat_does_not_dirty_ui_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                server.observe_session("/workspace/provision", "default")
+                revision = server.ui_state_revision()
+                server.observe_session("/workspace/provision", "default")
+                self.assertEqual(server.ui_state_revision(), revision)
+            finally:
+                server.server_close()
+
+    def test_status_payload_reuses_sessions_for_control_plane(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            snapshots = [{"key": "session-one", "cwd": "/workspace/one"}]
+            snapshot_calls = 0
+            control_calls: list[list[dict[str, Any]] | None] = []
+            original_compatibility = daemon_module.codex_compatibility_payload
+
+            def session_snapshots() -> list[dict[str, Any]]:
+                nonlocal snapshot_calls
+                snapshot_calls += 1
+                return snapshots
+
+            def control_plane_sessions(
+                supplied: list[dict[str, Any]] | None = None,
+            ) -> dict[str, Any]:
+                control_calls.append(supplied)
+                return {"sessions": supplied or []}
+
+            server.session_snapshots = session_snapshots  # type: ignore[method-assign]
+            server.control_plane_sessions = control_plane_sessions  # type: ignore[method-assign]
+            daemon_module.codex_compatibility_payload = lambda: {}
+            try:
+                payload = handler.status_payload(include_profiles=True)
+                self.assertIs(payload["sessions"], snapshots)
+                self.assertEqual(snapshot_calls, 1)
+                self.assertEqual(control_calls, [snapshots])
+            finally:
+                daemon_module.codex_compatibility_payload = original_compatibility
+                server.server_close()
+
+    def test_ui_delta_reuses_full_profile_snapshot_for_control_plane(self) -> None:
+        handler = Handler.__new__(Handler)
+        calls: list[bool] = []
+        handler.status_payload = lambda **_kwargs: {"base": True}  # type: ignore[method-assign]
+
+        def full_status(*, include_control_plane: bool = True, **_kwargs: Any) -> dict[str, Any]:
+            calls.append(include_control_plane)
+            return {
+                "sessions": [{"key": "session-one"}],
+                "profiles": [{"name": "default"}],
+                "control_plane": {"sessions": [{"key": "session-one"}]},
+            }
+
+        handler.ui_status_payload = full_status  # type: ignore[method-assign]
+        payload = handler.ui_status_delta_payload({"profiles", "control_plane"})
+
+        self.assertEqual(calls, [True])
+        self.assertEqual(payload["sessions"], [{"key": "session-one"}])
+        self.assertEqual(payload["control_plane"], {"sessions": [{"key": "session-one"}]})
+
+    def test_render_ui_handles_no_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                self.assertIn("<!doctype html>", handler.render_ui())
+            finally:
+                server.server_close()
+
+    def test_discussion_ui_keeps_messages_content_sized(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                html = handler.render_ui()
+            finally:
+                server.server_close()
+
+        self.assertIn(
+            ".control-modal.discussion-view .control-content {\n"
+            "      align-content: start;\n"
+            "      grid-auto-rows: max-content;",
+            html,
+        )
+        self.assertIn(
+            ".control-transcript {\n"
+            "\t      display: grid;\n"
+            "\t      gap: 8px;\n"
+            "\t      min-width: 0;\n"
+            "\t      align-content: start;\n"
+            "\t      grid-auto-rows: max-content;",
+            html,
+        )
+        self.assertIn(".control-message {", html)
+        self.assertIn("\t      align-self: start;", html)
 
     def test_session_tabs_keep_observed_order_and_persist_reorder(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2919,6 +3815,34 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn("stable- [x]", complete_task_list_text)
         self.assertNotIn("activity - [ ]", complete_task_list_text)
 
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="Spark was run past the normal floor:",
+            turn_id="turn-numeric-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="-55 live doctrine-lens scripture-summary packets succeeded this turn.",
+            turn_id="turn-numeric-list",
+            append=True,
+        )
+        server.append_control_transcript(
+            session_key=session_key,
+            role="assistant_progress",
+            text="-0 failed attempts.",
+            turn_id="turn-numeric-list",
+            append=True,
+        )
+
+        numeric_list_text = transcript[-1]["text"]
+        self.assertIn("floor:\n-55 live doctrine-lens", numeric_list_text)
+        self.assertIn("turn.\n-0 failed attempts.", numeric_list_text)
+        self.assertNotIn("floor:-55", numeric_list_text)
+        self.assertNotIn("turn.-0", numeric_list_text)
+
         long_text = "x" * (daemon_module.CONTROL_TRANSCRIPT_TEXT_LIMIT + 25)
         server.append_control_transcript(
             session_key=session_key,
@@ -2931,6 +3855,22 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(transcript[-1]["truncated"])
         self.assertEqual(transcript[-1]["full_text"], long_text)
         self.assertIn("...[truncated]", transcript[-1]["text"])
+
+    def test_transcript_stream_separator_preserves_hyphenated_chunks(self) -> None:
+        self.assertEqual(
+            ProvisionServer.transcript_stream_separator(
+                "The private-L",
+                "AN profile, no page errors.",
+            ),
+            "",
+        )
+        self.assertEqual(
+            ProvisionServer.transcript_stream_separator(
+                "The private-",
+                "LAN profile, no page errors.",
+            ),
+            "",
+        )
 
     def test_apply_patch_tool_entry_keeps_input_patch_body(self) -> None:
         entry = daemon_module.tool_activity_entry_from_value(
@@ -2964,6 +3904,302 @@ class StoreTests(unittest.TestCase):
         self.assertIn("Tool: apply_patch", command_shaped["text"])
         self.assertIn("Input:", command_shaped["text"])
         self.assertNotIn("Command: *** Begin Patch", command_shaped["text"])
+
+    def test_image_generation_tool_result_has_concise_completion_entry(self) -> None:
+        image_bytes = "a" * 10_000
+        payload = {
+            "type": "function_call_output",
+            "call_id": "call_image_wait",
+            "output": [
+                {"type": "input_text", "text": "Script completed\n"},
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{image_bytes}",
+                },
+                {
+                    "type": "input_text",
+                    "text": "Generated images are saved to /tmp/images/test.png by default.",
+                },
+            ],
+        }
+
+        entry = daemon_module.tool_activity_entry_from_value(payload)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["role"], "tool")
+        self.assertEqual(entry["call_id"], "call_image_wait")
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(
+            entry["text"],
+            "Tool: Image generation (status completed)\n"
+            "Result:\nImage generated successfully.",
+        )
+        self.assertNotIn(image_bytes, entry["text"])
+
+        history_entries = daemon_module.codex_history_entries_from_response_item(
+            payload,
+            "2026-07-11T04:38:28.403Z",
+        )
+        self.assertEqual(len(history_entries), 1)
+        self.assertEqual(history_entries[0]["text"], entry["text"])
+
+        direct_entry = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "image_generation_call",
+                "call_id": "call_direct_image",
+                "status": "completed",
+                "result": image_bytes,
+            }
+        )
+        self.assertIsNotNone(direct_entry)
+        assert direct_entry is not None
+        self.assertEqual(direct_entry["text"], entry["text"])
+        self.assertEqual(direct_entry["call_id"], "call_direct_image")
+
+    def test_custom_programmatic_tool_call_formats_command_and_completion(self) -> None:
+        call_id = "call_programmatic_exec"
+        started = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_0123456789abcdef",
+                "call_id": call_id,
+                "name": "exec",
+                "status": "completed",
+                "input": (
+                    'const r = await tools.exec_command({"cmd":"git status --short",'
+                    '"workdir":"/workspace/provision"});\ntext(r.output);'
+                ),
+            }
+        )
+        completed = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "custom_tool_call_output",
+                "call_id": call_id,
+                "output": [
+                    {"type": "input_text", "text": "Script completed\n"},
+                    {"type": "input_text", "text": " M src/provision/daemon.py\n"},
+                ],
+            }
+        )
+
+        self.assertIsNotNone(started)
+        self.assertIsNotNone(completed)
+        assert started is not None
+        assert completed is not None
+        self.assertIn("Command: git status --short (status completed)", started["text"])
+        self.assertNotIn("const r = await", started["text"])
+        self.assertIn("Output:\nScript completed", completed["text"])
+        self.assertNotIn('[{"type"', completed["text"])
+
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.control_transcripts = {}
+        server.append_control_transcript(
+            session_key="/workspace/provision",
+            role="tool",
+            text=started["text"],
+            call_id=call_id,
+        )
+        server.append_control_transcript(
+            session_key="/workspace/provision",
+            role="tool",
+            text=completed["text"],
+            call_id=call_id,
+        )
+        transcript = server.control_transcripts["/workspace/provision"]
+        self.assertEqual(len(transcript), 1)
+        self.assertIn("Command: git status --short", transcript[0]["text"])
+        self.assertIn("M src/provision/daemon.py", transcript[0]["text"])
+        self.assertNotIn("Tool: call_", transcript[0]["text"])
+
+        plan_entry = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_programmatic_plan",
+                "name": "exec",
+                "input": (
+                    'const r = await tools.update_plan({"explanation":"Parser pass",plan:['
+                    '{step:"Extract commands","status":"completed"},'
+                    '{step:"Render output","status":"in_progress"}]});\n'
+                    'text(JSON.stringify(r));'
+                ),
+            }
+        )
+        self.assertIsNotNone(plan_entry)
+        assert plan_entry is not None
+        self.assertIn("Tool: update_plan", plan_entry["text"])
+        self.assertIn('"step": "Extract commands"', plan_entry["text"])
+        self.assertIn('"status": "in_progress"', plan_entry["text"])
+        self.assertNotIn("const r = await", plan_entry["text"])
+
+    def test_ws_prefixed_tool_calls_render_as_web_search(self) -> None:
+        entry = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "function_call",
+                "call_id": "ws_search_1",
+                "name": "ws_search_1",
+                "status": "completed",
+                "arguments": json.dumps({"query": "Codex CLI release notes"}),
+            }
+        )
+
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["role"], "tool")
+        self.assertEqual(entry["call_id"], "ws_search_1")
+        self.assertIn("Tool: Web Search (status completed)", entry["text"])
+        self.assertIn("Query:\nCodex CLI release notes", entry["text"])
+        self.assertNotIn("Tool: ws_search_1", entry["text"])
+        self.assertNotIn("Arguments:", entry["text"])
+
+        entries = websocket_message_tool_entries(
+            0x1,
+            json.dumps(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "web_search_call",
+                        "id": "ws_search_2",
+                        "status": "completed",
+                        "action": {"query": "Provision account dashboard"},
+                    },
+                }
+            ).encode("utf-8"),
+        )
+        self.assertEqual(len(entries), 1)
+        self.assertIn("Tool: Web Search (status completed)", entries[0]["text"])
+        self.assertIn("Query:\nProvision account dashboard", entries[0]["text"])
+
+    def test_app_server_ws_prefixed_items_render_as_web_search(self) -> None:
+        entry = daemon_module.app_server_tool_entry_from_item(
+            {
+                "type": "mcpToolCall",
+                "id": "ws_search_3",
+                "tool": "ws_search_3",
+                "status": "completed",
+                "arguments": {"query": "Codex CLI quota reset credits"},
+                "result": {"summary": "Found matching documentation."},
+            }
+        )
+
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry["call_id"], "ws_search_3")
+        self.assertIn("Tool: Web Search (status completed)", entry["text"])
+        self.assertIn("Query:\nCodex CLI quota reset credits", entry["text"])
+        self.assertIn("Result:", entry["text"])
+        self.assertNotIn("Tool: ws_search_3", entry["text"])
+
+    def test_programmatic_tool_call_response_items_are_tool_activity(self) -> None:
+        entries = websocket_message_tool_entries(
+            0x1,
+            json.dumps(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "program",
+                        "call_id": "prog-1",
+                        "status": "completed",
+                        "code": "const result = await tools.lookup();",
+                        "fingerprint": "fp-test",
+                    },
+                }
+            ).encode("utf-8"),
+        )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["call_id"], "prog-1")
+        self.assertIn("Tool: Programmatic Tool Calling (status completed)", entries[0]["text"])
+        self.assertIn("Code:", entries[0]["text"])
+        self.assertIn("Fingerprint:", entries[0]["text"])
+        self.assertNotIn("Command:", entries[0]["text"])
+
+        output_entry = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "program_output",
+                "call_id": "prog-1",
+                "status": "completed",
+                "result": {"rows": 2},
+            }
+        )
+        self.assertIsNotNone(output_entry)
+        assert output_entry is not None
+        self.assertIn("Tool: Programmatic Tool Calling output", output_entry["text"])
+        self.assertIn("Result:", output_entry["text"])
+
+    def test_app_server_canonical_tool_items_render_readably(self) -> None:
+        dynamic_entry = daemon_module.app_server_tool_entry_from_item(
+            {
+                "type": "dynamicToolCall",
+                "id": "dyn-1",
+                "namespace": "functions",
+                "tool": "update_plan",
+                "status": "completed",
+                "arguments": {"plan": [{"step": "Patch parser", "status": "completed"}]},
+                "contentItems": [{"type": "text", "text": "Plan updated"}],
+            }
+        )
+
+        self.assertIsNotNone(dynamic_entry)
+        assert dynamic_entry is not None
+        self.assertIn("Tool: functions/update_plan (status completed)", dynamic_entry["text"])
+        self.assertIn("Arguments:", dynamic_entry["text"])
+        self.assertIn("Content:", dynamic_entry["text"])
+
+        collab_entry = daemon_module.app_server_tool_entry_from_item(
+            {
+                "type": "collabAgentToolCall",
+                "id": "agent-1",
+                "tool": "spawn_agent",
+                "status": "in_progress",
+                "prompt": "Inspect the failing fixture.",
+                "receiver_thread_ids": ["thread-1"],
+            }
+        )
+
+        self.assertIsNotNone(collab_entry)
+        assert collab_entry is not None
+        self.assertIn("Tool: agent spawn_agent (status in_progress)", collab_entry["text"])
+        self.assertIn("Prompt:", collab_entry["text"])
+        self.assertIn("Receiver threads:", collab_entry["text"])
+
+    def test_plan_and_goal_tool_entries_preserve_structured_arguments(self) -> None:
+        plan_entry = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "function_call",
+                "call_id": "call-plan",
+                "name": "update_plan",
+                "arguments": json.dumps(
+                    {
+                        "explanation": "Narrow parser pass.",
+                        "plan": [
+                            {"step": "Mine TUI examples", "status": "completed"},
+                            {"step": "Patch renderer", "status": "in_progress"},
+                        ],
+                    }
+                ),
+            }
+        )
+
+        self.assertIsNotNone(plan_entry)
+        assert plan_entry is not None
+        self.assertIn("Tool: update_plan", plan_entry["text"])
+        self.assertIn("Arguments:", plan_entry["text"])
+        self.assertIn('"step": "Mine TUI examples"', plan_entry["text"])
+        self.assertIn('"status": "in_progress"', plan_entry["text"])
+
+        goal_entry = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "function_call",
+                "call_id": "call-goal",
+                "name": "update_goal",
+                "arguments": json.dumps({"status": "complete"}),
+            }
+        )
+
+        self.assertIsNotNone(goal_entry)
+        assert goal_entry is not None
+        self.assertIn("Tool: update_goal", goal_entry["text"])
+        self.assertIn("status: complete", goal_entry["text"])
 
     def test_control_tool_call_entries_are_suppressed(self) -> None:
         control_entry = daemon_module.tool_activity_entry_from_value(
@@ -3100,6 +4336,34 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(turns[0]["turn_id"], "turn-1")
         self.assertEqual(turns[0]["start_index"], 0)
         self.assertEqual(turns[0]["end_index"], 3)
+
+    def test_control_transcript_retains_extended_turn_window(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.control_transcripts = {}
+        session_key = "/workspace/provision"
+        turn_count = 40
+
+        for index in range(turn_count):
+            turn_id = f"turn-{index}"
+            server.append_control_transcript(
+                session_key=session_key,
+                role="user",
+                text=f"Prompt {index}",
+                turn_id=turn_id,
+            )
+            server.append_control_transcript(
+                session_key=session_key,
+                role="assistant",
+                text=f"Answer {index}",
+                turn_id=turn_id,
+            )
+
+        transcript = server.control_transcript_snapshot(session_key)
+        turns = server.control_turns_from_transcript(transcript)
+
+        self.assertEqual(len(turns), turn_count)
+        self.assertEqual(turns[0]["label"], "Prompt 0")
+        self.assertEqual(turns[-1]["label"], f"Prompt {turn_count - 1}")
 
     def test_resumed_context_replay_is_suppressed_with_marker(self) -> None:
         server = ProvisionServer.__new__(ProvisionServer)
@@ -4200,6 +5464,62 @@ class StoreTests(unittest.TestCase):
         self.assertIn("unarchive", launcher_module.CODEX_PASSTHROUGH_COMMANDS)
         self.assertIn("exec-server", launcher_module.CODEX_PASSTHROUGH_COMMANDS)
 
+    def test_profiled_passthrough_uses_active_profile_auth_and_syncs_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "auth.json"
+            source.write_text(json.dumps({"OPENAI_API_KEY": "sk-original"}), encoding="utf-8")
+            store = Store(Paths(root / "home"))
+            store.import_auth_file("work", source, set_active=True)
+            captured: dict[str, Any] = {}
+            original_run = launcher_module.subprocess.run
+            original_codex_home = launcher_module.default_codex_home
+            stock_codex_home = root / "stock-codex"
+            stock_codex_home.mkdir()
+            (stock_codex_home / "config.toml").write_text('model = "gpt-test"\n', encoding="utf-8")
+
+            class Result:
+                returncode = 17
+
+            def fake_run(argv: list[str], **kwargs: Any) -> Result:
+                captured["argv"] = argv
+                env = kwargs["env"]
+                codex_home = Path(env["CODEX_HOME"])
+                captured["codex_home"] = codex_home
+                captured["config"] = (codex_home / "config.toml").read_text(encoding="utf-8")
+                captured["auth"] = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
+                (codex_home / "config.toml").write_text(
+                    captured["config"] + '\n[mcp_servers.test]\ncommand = "test"\n',
+                    encoding="utf-8",
+                )
+                (codex_home / "auth.json").write_text(
+                    json.dumps({"OPENAI_API_KEY": "sk-refreshed"}),
+                    encoding="utf-8",
+                )
+                return Result()
+
+            try:
+                launcher_module.subprocess.run = fake_run
+                launcher_module.default_codex_home = lambda: stock_codex_home
+                result = launcher_module.run_profiled_passthrough_codex(
+                    store,
+                    "work",
+                    ["codex", "app-server"],
+                    {"OPENAI_PROJECT": "provision-test"},
+                    command="app-server",
+                )
+            finally:
+                launcher_module.subprocess.run = original_run
+                launcher_module.default_codex_home = original_codex_home
+
+            self.assertEqual(result, 17)
+            self.assertEqual(captured["argv"], ["codex", "app-server"])
+            self.assertEqual(captured["auth"]["OPENAI_API_KEY"], "sk-original")
+            self.assertIn('cli_auth_credentials_store = "file"', captured["config"])
+            refreshed = json.loads(store.auth_path("work").read_text(encoding="utf-8"))
+            self.assertEqual(refreshed["OPENAI_API_KEY"], "sk-refreshed")
+            self.assertIn("[mcp_servers.test]", (stock_codex_home / "config.toml").read_text(encoding="utf-8"))
+
     def test_ensure_daemon_passes_wildcard_host_without_port(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = Paths(Path(temp) / "home")
@@ -4234,6 +5554,8 @@ class StoreTests(unittest.TestCase):
             self.assertIn("--host", argv)
             self.assertIn("0.0.0.0", argv)
             self.assertNotIn("--port", argv)
+            self.assertIs(captured["kwargs"]["stdout"], captured["kwargs"]["stderr"])
+            self.assertTrue(captured["kwargs"]["stdout"].closed)
 
     def test_ensure_daemon_passes_wildcard_host_with_port(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -4322,6 +5644,36 @@ class StoreTests(unittest.TestCase):
             self.assertIn("codex on PATH (0.141.0)", output.getvalue())
             self.assertIn("Codex model catalog readable (5 models from codex)", output.getvalue())
             self.assertIn("Codex app-server read-only control-plane schema readable", output.getvalue())
+
+    def test_cmd_status_detects_legacy_daemon_codex_version_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            paths = Paths(root / "home")
+            store = Store(paths)
+            source = root / "auth.json"
+            source.write_text(json.dumps({"OPENAI_API_KEY": "sk-test"}), encoding="utf-8")
+            store.import_auth_file("default", source)
+            original_compat = cli_module.codex_compatibility_payload
+            original_running = cli_module.daemon_running
+            try:
+                cli_module.codex_compatibility_payload = lambda: {"cli": {"version": "0.144.0"}}
+                cli_module.daemon_running = lambda _paths: {
+                    "pid": 123,
+                    "host": "127.0.0.1",
+                    "port": 4888,
+                    "codex": {"cli": {"version": "0.141.0"}},
+                }
+                output = StringIO()
+                with redirect_stdout(output):
+                    result = cli_module.cmd_status(paths, store)
+            finally:
+                cli_module.codex_compatibility_payload = original_compat
+                cli_module.daemon_running = original_running
+
+            self.assertEqual(result, 0)
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["daemon_restart_required"]["required"])
+            self.assertEqual(payload["daemon_restart_required"]["startup_version"], "0.141.0")
 
     def test_codex_client_id_is_discovered_from_auth_context(self) -> None:
         payload = (

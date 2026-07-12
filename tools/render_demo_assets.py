@@ -21,6 +21,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from provision.daemon import (  # noqa: E402
+    DEFAULT_MODEL_CATALOG,
     Handler,
     compact_session_path,
     logo_asset_bytes,
@@ -231,9 +232,10 @@ class DemoServer:
     def session_snapshots(self) -> list[dict[str, Any]]:
         return [dict(session) for session in self.sessions]
 
-    def control_plane_sessions(self) -> dict[str, Any]:
+    def control_plane_sessions(self, session_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        session_rows = self.sessions if session_rows is None else session_rows
         sessions: list[dict[str, Any]] = []
-        for session in self.sessions:
+        for session in session_rows:
             key = str(session.get("key") or "")
             transcript = [
                 {
@@ -367,6 +369,16 @@ class DemoServer:
             "note": "",
         }
 
+    def profile_model_catalog_snapshot(self, profile: str) -> dict[str, Any]:
+        return {
+            "catalog": [dict(item) for item in DEFAULT_MODEL_CATALOG],
+            "source": "demo",
+            "available": True,
+            "loading": False,
+            "error": "",
+            "updated_at": datetime.now().isoformat(),
+        }
+
     def profile_login_required(self, profile: str) -> dict[str, Any]:
         return {"required": profile == "sandbox", "error": "Refresh login required.", "error_at": ""}
 
@@ -451,10 +463,15 @@ class DemoServer:
             ],
         }
 
-    def pinned_sessions_for_profile(self, profile: str) -> list[dict[str, Any]]:
+    def pinned_sessions_for_profile(
+        self,
+        profile: str,
+        sessions: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        sessions = self.sessions if sessions is None else sessions
         return [
             dict(session)
-            for session in self.sessions
+            for session in sessions
             if session.get("pinned_profile") == profile
         ]
 

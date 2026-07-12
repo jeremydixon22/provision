@@ -99,6 +99,9 @@ RESET_CREDIT_COOLDOWN_SECONDS = 86400.0
 WEBSOCKET_SWITCH_IDLE_SECONDS = 10.0
 WEBSOCKET_COMPLETION_FALLBACK_SECONDS = 180.0
 WEBSOCKET_TOOL_COMPLETION_FALLBACK_SECONDS = 600.0
+UI_STATE_CHECK_SECONDS = 1.0
+UI_HEARTBEAT_SECONDS = 15.0
+UI_SAFETY_SNAPSHOT_SECONDS = 60.0
 WEBSOCKET_APPLICATION_OPCODES = {0x0, 0x1, 0x2}
 WEBSOCKET_RESPONSE_START_EVENT_TYPES = {
     "response.create",
@@ -130,14 +133,22 @@ WEBSOCKET_RESPONSE_CLEAR_STATUSES = WEBSOCKET_TERMINAL_STATUSES - {"completed"}
 WEBSOCKET_TOOL_OUTPUT_TYPES = {
     "apply_patch_call",
     "code_interpreter_call",
+    "collab_agent_tool_call",
     "computer_call",
+    "command_execution",
     "custom_tool_call",
+    "dynamic_tool_call",
     "file_search_call",
     "function_call",
     "function_call_output",
+    "hook_prompt",
+    "image_generation_call",
     "local_shell_call",
     "mcp_call",
+    "program",
+    "program_output",
     "shell_call",
+    "sub_agent_activity",
     "tool_call",
     "web_search_call",
 }
@@ -156,13 +167,21 @@ FAST_SERVICE_TIER_VALUES = {"fast", FAST_SERVICE_TIER}
 STATS_MAX_EVENTS = 2000
 CONTROL_PLANE_EVENT_LIMIT = 240
 CONTROL_PLANE_SESSION_EVENT_LIMIT = 32
-CONTROL_TRANSCRIPT_MAX_ITEMS = 120
+CONTROL_TRANSCRIPT_MAX_ITEMS = 600
 CONTROL_TRANSCRIPT_TEXT_LIMIT = 12000
 CONTROL_TRANSCRIPT_EVENT_TEXT_LIMIT = 4000
 CONTROL_CONTEXT_WINDOW_TOKENS = 256000
+UI_DIRTY_LOG_LIMIT = 512
+CONTROL_HISTORY_CACHE_SECONDS = 5.0
+CONTROL_HISTORY_TURN_SEARCH_TEXT_LIMIT = 1600
+CONTROL_HISTORY_SESSION_LIMIT = 24
+CONTROL_HISTORY_TURN_LIMIT = 120
 RESUME_CANDIDATE_LIMIT = 12
 RESUME_CANDIDATE_SCAN_LIMIT = 800
 RESUME_CANDIDATE_CACHE_SECONDS = 10.0
+APP_SERVER_MODEL_CATALOG_CACHE_SECONDS = 300.0
+APP_SERVER_MODEL_CATALOG_ERROR_BACKOFF_SECONDS = 60.0
+CODEX_RUNTIME_VERSION_RECHECK_SECONDS = 60.0
 UI_LAUNCHER_PERMISSION_PRESETS = {
     "read-only": ("--sandbox", "read-only", "--ask-for-approval", "on-request"),
     "workspace-write": ("--sandbox", "workspace-write", "--ask-for-approval", "on-request"),
@@ -189,6 +208,7 @@ CODEX_HISTORY_BRIDGE_NAMES = (
     "memories",
     "rules",
     "skills",
+    "plugins",
     "cache",
     "import-state",
     "generated_images",
@@ -199,15 +219,35 @@ CODEX_HISTORY_BRIDGE_NAMES = (
 )
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\a]*(?:\a|\x1b\\)")
 ENVIRONMENT_CONTEXT_RE = re.compile(r"\s*<environment_context>.*?</environment_context>\s*", re.DOTALL)
+CODEX_GOAL_CONTEXT_RE = re.compile(
+    r"<codex_internal_context\b(?=[^>]*\bsource\s*=\s*[\"']goal[\"'])[^>]*>.*?</codex_internal_context>",
+    re.IGNORECASE | re.DOTALL,
+)
+CODEX_GOAL_OBJECTIVE_RE = re.compile(r"<objective>\s*(.*?)\s*</objective>", re.IGNORECASE | re.DOTALL)
 CONTROL_TRANSCRIPT_EDGE_RE = re.compile(r"^[\s\ufeff\u200b\u200c\u200d]+|[\s\ufeff\u200b\u200c\u200d]+$")
 LOGIN_URL_RE = re.compile(r"https?://[^\s<>]+")
 DEVICE_CODE_RE = re.compile(r"\b[A-Z0-9]{4,}(?:-[A-Z0-9]{4,})+\b")
 CONTROL_TOOL_CALL_RE = re.compile(r"^ctc_[a-f0-9]{16,}$", re.IGNORECASE)
+WEB_SEARCH_TOOL_CALL_RE = re.compile(r"^ws_[A-Za-z0-9_-]+$", re.IGNORECASE)
+PROGRAMMATIC_TOOL_INVOCATION_RE = re.compile(r"\btools\.([A-Za-z_][A-Za-z0-9_.]*)\s*\(")
+PROGRAMMATIC_TOOL_COMMAND_RE = re.compile(r"[\"']cmd[\"']\s*:\s*(\"(?:\\.|[^\"\\])*\")", re.DOTALL)
+PROGRAMMATIC_TOOL_PATCH_RE = re.compile(
+    r"\b(?:const|let|var)\s+patch\s*=\s*(\"(?:\\.|[^\"\\])*\")",
+    re.DOTALL,
+)
+PROGRAMMATIC_TOOL_PLAN_STEP_RE = re.compile(
+    r"(?:[\"']step[\"']|\bstep)\s*:\s*(\"(?:\\.|[^\"\\])*\")\s*,\s*"
+    r"(?:[\"']status[\"']|\bstatus)\s*:\s*(\"(?:\\.|[^\"\\])*\")",
+    re.DOTALL,
+)
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 PROFILE_MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
 REASONING_LEVEL_PATTERN = re.compile(r"^[a-z0-9_-]{1,32}$")
-REASONING_LEVELS = ("low", "medium", "high", "xhigh")
-DEFAULT_MODEL_ID = "gpt-5.5"
+REASONING_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+GPT_56_REASONING_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
+GPT_56_LUNA_REASONING_LEVELS = ("low", "medium", "high", "xhigh", "max")
+LEGACY_REASONING_LEVELS = ("low", "medium", "high", "xhigh")
+DEFAULT_MODEL_ID = "gpt-5.6-sol"
 DEFAULT_REASONING_EFFORT = "medium"
 CODEX_MODEL_CATALOG_TIMEOUT_SECONDS = 2.0
 CODEX_VERSION_TIMEOUT_SECONDS = 2.0
@@ -218,39 +258,80 @@ APP_SERVER_RATE_LIMIT_CACHE_SECONDS = 300.0
 APP_SERVER_RATE_LIMIT_FAILURE_BACKOFF_SECONDS = 900.0
 DEFAULT_MODEL_CATALOG = [
     {
-        "id": "gpt-5.5",
-        "display": "gpt-5.5",
-        "reasoning": list(REASONING_LEVELS),
+        "id": "gpt-5.6-sol",
+        "display": "GPT-5.6-Sol",
+        "reasoning": list(GPT_56_REASONING_LEVELS),
+        "default_reasoning": "low",
+        "note": "Latest frontier agentic coding model. Requires Codex CLI 0.144.0 or newer.",
+        "minimal_client_version": "0.144.0",
+        "service_tiers": [
+            {"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"},
+        ],
+        "additional_speed_tiers": ["fast"],
+    },
+    {
+        "id": "gpt-5.6-terra",
+        "display": "GPT-5.6-Terra",
+        "reasoning": list(GPT_56_REASONING_LEVELS),
         "default_reasoning": "medium",
-        "note": "Newest bundled Codex CLI model metadata in this Provision build.",
+        "note": "Balanced agentic coding model for everyday work. Requires Codex CLI 0.144.0 or newer.",
+        "minimal_client_version": "0.144.0",
+        "service_tiers": [
+            {"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"},
+        ],
+        "additional_speed_tiers": ["fast"],
+    },
+    {
+        "id": "gpt-5.6-luna",
+        "display": "GPT-5.6-Luna",
+        "reasoning": list(GPT_56_LUNA_REASONING_LEVELS),
+        "default_reasoning": "medium",
+        "note": "Fast and affordable agentic coding model. Requires Codex CLI 0.144.0 or newer.",
+        "minimal_client_version": "0.144.0",
+        "service_tiers": [
+            {"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"},
+        ],
+        "additional_speed_tiers": ["fast"],
+    },
+    {
+        "id": "gpt-5.5",
+        "display": "GPT-5.5",
+        "reasoning": list(LEGACY_REASONING_LEVELS),
+        "default_reasoning": "medium",
+        "note": "Frontier model for complex coding, research, and real-world work.",
+        "minimal_client_version": "0.124.0",
+        "service_tiers": [
+            {"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"},
+        ],
+        "additional_speed_tiers": ["fast"],
     },
     {
         "id": "gpt-5.4",
-        "display": "gpt-5.4",
-        "reasoning": list(REASONING_LEVELS),
+        "display": "GPT-5.4",
+        "reasoning": list(LEGACY_REASONING_LEVELS),
         "default_reasoning": "medium",
-        "note": "",
+        "note": "Strong model for everyday coding.",
+        "minimal_client_version": "0.98.0",
+        "service_tiers": [
+            {"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"},
+        ],
+        "additional_speed_tiers": ["fast"],
     },
     {
         "id": "gpt-5.4-mini",
-        "display": "gpt-5.4-mini",
-        "reasoning": list(REASONING_LEVELS),
+        "display": "GPT-5.4-Mini",
+        "reasoning": list(LEGACY_REASONING_LEVELS),
         "default_reasoning": "medium",
-        "note": "",
-    },
-    {
-        "id": "gpt-5.3-codex",
-        "display": "gpt-5.3-codex",
-        "reasoning": list(REASONING_LEVELS),
-        "default_reasoning": "medium",
-        "note": "",
+        "note": "Small, fast, and cost-efficient model for simpler coding tasks.",
+        "minimal_client_version": "0.98.0",
     },
     {
         "id": "gpt-5.2",
-        "display": "gpt-5.2",
-        "reasoning": list(REASONING_LEVELS),
+        "display": "GPT-5.2",
+        "reasoning": list(LEGACY_REASONING_LEVELS),
         "default_reasoning": "medium",
-        "note": "",
+        "note": "Optimized for professional work and long-running agents.",
+        "minimal_client_version": "0.0.1",
     },
 ]
 LOGIN_REQUIRED_MARKERS = (
@@ -397,6 +478,8 @@ def normalize_codex_model_catalog_item(value: Any) -> dict[str, Any] | None:
 
     raw_levels = value.get("supported_reasoning_levels")
     if raw_levels is None:
+        raw_levels = value.get("supported_reasoning_efforts")
+    if raw_levels is None:
         raw_levels = value.get("supportedReasoningEfforts")
     reasoning: list[str] = []
     if isinstance(raw_levels, list):
@@ -407,6 +490,8 @@ def normalize_codex_model_catalog_item(value: Any) -> dict[str, Any] | None:
                     raw_level.get("effort")
                     or raw_level.get("reasoning_effort")
                     or raw_level.get("reasoningEffort")
+                    or raw_level.get("id")
+                    or raw_level.get("name")
                 )
             level = normalize_reasoning_level(effort)
             if level and level not in reasoning:
@@ -416,7 +501,9 @@ def normalize_codex_model_catalog_item(value: Any) -> dict[str, Any] | None:
 
     default_reasoning = (
         value.get("default_reasoning_level")
+        or value.get("default_reasoning_effort")
         or value.get("defaultReasoningEffort")
+        or value.get("defaultReasoningLevel")
         or DEFAULT_REASONING_EFFORT
     )
     default_reasoning = normalize_reasoning_level(default_reasoning)
@@ -443,6 +530,8 @@ def normalize_codex_model_catalog_item(value: Any) -> dict[str, Any] | None:
         "note": codex_model_note(value),
         "service_tiers": [tier for tier in service_tiers if isinstance(tier, dict)],
         "additional_speed_tiers": [tier for tier in additional_speed_tiers if isinstance(tier, str)],
+        "minimal_client_version": first_string_value(value, ("minimal_client_version", "minimalClientVersion")),
+        "priority": value.get("priority") if isinstance(value.get("priority"), int) else None,
     }
 
 
@@ -478,8 +567,7 @@ def subprocess_error_message(error: BaseException) -> str:
     return str(error)
 
 
-@functools.lru_cache(maxsize=1)
-def codex_cli_version() -> dict[str, Any]:
+def codex_cli_version_probe() -> dict[str, Any]:
     try:
         result = subprocess.run(
             ["codex", "--version"],
@@ -506,6 +594,45 @@ def codex_cli_version() -> dict[str, Any]:
         "version": version or None,
         "raw": raw,
         "error": "" if version else "empty version output",
+    }
+
+
+@functools.lru_cache(maxsize=1)
+def codex_cli_version() -> dict[str, Any]:
+    return codex_cli_version_probe()
+
+
+_codex_runtime_version_lock = threading.Lock()
+_codex_runtime_version_cache: tuple[float, dict[str, Any]] | None = None
+
+
+def codex_runtime_version() -> dict[str, Any]:
+    global _codex_runtime_version_cache
+    now = time.monotonic()
+    with _codex_runtime_version_lock:
+        cached = _codex_runtime_version_cache
+        if cached and now - cached[0] < CODEX_RUNTIME_VERSION_RECHECK_SECONDS:
+            return dict(cached[1])
+    value = codex_cli_version_probe()
+    with _codex_runtime_version_lock:
+        _codex_runtime_version_cache = (now, dict(value))
+    return value
+
+
+def codex_restart_requirement(
+    startup: dict[str, Any],
+    runtime: dict[str, Any],
+) -> dict[str, Any]:
+    startup_version = startup.get("version") if isinstance(startup.get("version"), str) else None
+    runtime_version = runtime.get("version") if isinstance(runtime.get("version"), str) else None
+    required = bool(startup_version and runtime_version and startup_version != runtime_version)
+    return {
+        "required": required,
+        "startup_version": startup_version,
+        "runtime_version": runtime_version,
+        "reason": "Codex CLI changed after this Provision daemon started; restart Provision when active work is idle."
+        if required
+        else "",
     }
 
 
@@ -663,7 +790,9 @@ def app_server_control_plane_status(methods: dict[str, bool]) -> dict[str, Any]:
     return {
         "available": not read_only_missing,
         "read_only": not read_only_missing,
+        "interactive_api": not interactive_missing,
         "interactive": not interactive_missing,
+        "provision_interaction": "pty",
         "remote_control": not remote_missing,
         "missing": {
             "read_only": read_only_missing,
@@ -904,6 +1033,9 @@ class CodexAppServerClient:
         }
         return self.request("thread/list", params)
 
+    def list_models(self) -> Any:
+        return self.request("model/list", {})
+
     def start_turn(
         self,
         *,
@@ -1138,34 +1270,55 @@ def codex_session_meta_from_file(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def codex_resume_candidates_for_cwd(
+def codex_session_files_for_cwd(
     cwd: str,
     *,
     codex_home: Path | None = None,
-    limit: int = RESUME_CANDIDATE_LIMIT,
-) -> list[dict[str, str]]:
+    scan_limit: int = RESUME_CANDIDATE_SCAN_LIMIT,
+    include_archived: bool = False,
+) -> list[tuple[Path, dict[str, Any]]]:
     target = normalized_path_text(cwd)
     if not target:
         return []
-    root = (codex_home or default_codex_home()).expanduser() / "sessions"
-    if not root.exists():
-        return []
+    home = (codex_home or default_codex_home()).expanduser()
+    roots = [home / "sessions"]
+    if include_archived:
+        roots.append(home / "archived_sessions")
     try:
         files = sorted(
-            (path for path in root.rglob("rollout-*.jsonl") if path.is_file()),
+            (
+                path
+                for root in roots
+                if root.exists()
+                for path in root.rglob("rollout-*.jsonl")
+                if path.is_file()
+            ),
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )
     except OSError:
         return []
-    candidates: list[dict[str, str]] = []
-    for path in files[:RESUME_CANDIDATE_SCAN_LIMIT]:
+    matches: list[tuple[Path, dict[str, Any]]] = []
+    for path in files[:scan_limit]:
         meta = codex_session_meta_from_file(path)
         if not meta:
             continue
         session_cwd = str(meta.get("cwd") or "")
         if normalized_path_text(session_cwd) != target:
             continue
+        matches.append((path, meta))
+    return matches
+
+
+def codex_resume_candidates_for_cwd(
+    cwd: str,
+    *,
+    codex_home: Path | None = None,
+    limit: int = RESUME_CANDIDATE_LIMIT,
+) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    for path, meta in codex_session_files_for_cwd(cwd, codex_home=codex_home):
+        session_cwd = str(meta.get("cwd") or "")
         session_id = str(meta.get("id") or "")
         if not session_id:
             continue
@@ -1185,10 +1338,377 @@ def codex_resume_candidates_for_cwd(
     return candidates
 
 
+def codex_history_user_text_is_prompt(text: str) -> bool:
+    cleaned = transcript_identity_text(ENVIRONMENT_CONTEXT_RE.sub("\n", text)).lower()
+    if not cleaned:
+        return False
+    if cleaned.startswith("<user_instructions>"):
+        return False
+    return resume_candidate_text_is_useful(text)
+
+
+def codex_history_summary_text(value: Any) -> str:
+    if isinstance(value, str):
+        return clean_transcript_text(value)
+    if isinstance(value, list):
+        pieces = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    pieces.append(text)
+                elif isinstance(item.get("summary_text"), str):
+                    pieces.append(str(item["summary_text"]))
+            elif isinstance(item, str):
+                pieces.append(item)
+        return clean_transcript_text("\n".join(pieces))
+    return ""
+
+
+def codex_history_source_turn_id(payload: dict[str, Any]) -> str:
+    direct = payload.get("turn_id") or payload.get("turnId")
+    if isinstance(direct, str) and direct:
+        return direct
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    if not isinstance(metadata, dict):
+        metadata = payload.get("internalChatMessageMetadataPassthrough")
+    if not isinstance(metadata, dict):
+        return ""
+    turn_id = metadata.get("turn_id") or metadata.get("turnId")
+    return turn_id if isinstance(turn_id, str) else ""
+
+
+def codex_history_entry(
+    role: str,
+    text: str,
+    timestamp: str,
+    *,
+    turn_id: str = "",
+    call_id: str = "",
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {"role": role, "text": text, "ts": timestamp}
+    if turn_id:
+        entry["turn_id"] = turn_id
+    if call_id:
+        entry["call_id"] = call_id
+    return entry
+
+
+def codex_history_entries_from_response_item(payload: dict[str, Any], timestamp: str) -> list[dict[str, Any]]:
+    item_type = str(payload.get("type") or "")
+    source_turn_id = codex_history_source_turn_id(payload)
+    if item_type == "message":
+        role = str(payload.get("role") or "")
+        text = transcript_text_from_content(payload.get("content"), preserve_edges=role != "user")
+        if not text:
+            return []
+        if role == "user":
+            return [
+                codex_history_entry(
+                    str(entry.get("role") or "user"),
+                    str(entry.get("text") or ""),
+                    timestamp,
+                    turn_id=source_turn_id,
+                )
+                for entry in user_transcript_entries(text)
+                if entry.get("text")
+            ]
+        if role == "assistant":
+            return [codex_history_entry("assistant", text, timestamp, turn_id=source_turn_id)]
+        return []
+    if item_type == "reasoning":
+        text = codex_history_summary_text(payload.get("summary") or payload.get("content"))
+        return [
+            codex_history_entry("assistant_progress", text, timestamp, turn_id=source_turn_id)
+        ] if text else []
+    tool_entry = tool_activity_entry_from_value(payload)
+    if tool_entry:
+        return [
+            codex_history_entry(
+                "tool",
+                str(tool_entry.get("text") or ""),
+                timestamp,
+                turn_id=source_turn_id,
+                call_id=str(tool_entry.get("call_id") or ""),
+            )
+        ]
+    return []
+
+
+def codex_history_entries_from_event_msg(payload: dict[str, Any], timestamp: str) -> list[dict[str, Any]]:
+    event_type = str(payload.get("type") or "")
+    source_turn_id = codex_history_source_turn_id(payload)
+    if event_type == "agent_reasoning":
+        text = clean_transcript_text(str(payload.get("text") or ""))
+        return [
+            codex_history_entry("assistant_progress", text, timestamp, turn_id=source_turn_id)
+        ] if text else []
+    if event_type in {"agent_message", "assistant_message"}:
+        text = clean_transcript_text(str(payload.get("message") or payload.get("text") or ""))
+        return [codex_history_entry("assistant", text, timestamp, turn_id=source_turn_id)] if text else []
+    return []
+
+
+def codex_history_entries_from_session_row(row: dict[str, Any]) -> list[dict[str, Any]]:
+    timestamp = str(row.get("timestamp") or "")
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    row_type = str(row.get("type") or "")
+    if row_type == "response_item":
+        return codex_history_entries_from_response_item(payload, timestamp)
+    if row_type == "event_msg":
+        return codex_history_entries_from_event_msg(payload, timestamp)
+    return []
+
+
+def codex_history_display_text(text: str) -> tuple[str, bool]:
+    cleaned = clean_transcript_text(text, preserve_edges=True)
+    if len(cleaned) <= CONTROL_TRANSCRIPT_TEXT_LIMIT:
+        return cleaned, False
+    return cleaned[:CONTROL_TRANSCRIPT_TEXT_LIMIT].rstrip() + "\n...[truncated]", True
+
+
+def codex_history_transcript_item(
+    entry: dict[str, Any],
+    *,
+    turn_key: str,
+    profile: str = "",
+) -> dict[str, Any]:
+    text = str(entry.get("text") or "")
+    display, truncated = codex_history_display_text(text)
+    item = {
+        "role": str(entry.get("role") or "message"),
+        "text": display,
+        "full_text": text,
+        "truncated": truncated,
+        "ts": str(entry.get("ts") or ""),
+        "updated_at": str(entry.get("ts") or ""),
+        "turn_id": turn_key,
+        "profile": profile,
+        "source": "history",
+    }
+    call_id = entry.get("call_id")
+    if isinstance(call_id, str) and call_id:
+        item["call_id"] = call_id
+    return item
+
+
+def codex_history_turns_from_session_file(path: Path) -> list[dict[str, Any]]:
+    meta = codex_session_meta_from_file(path)
+    if not meta:
+        return []
+    session_id = str(meta.get("id") or path.stem.replace("rollout-", ""))
+    session_timestamp = str(meta.get("timestamp") or "")
+    turns: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    pending_context: list[dict[str, Any]] = []
+
+    def finish_current() -> None:
+        nonlocal current
+        if current is None:
+            return
+        transcript = current.get("transcript")
+        if isinstance(transcript, list):
+            for index, item in enumerate(transcript):
+                item["control_index"] = index
+            current["search_text"] = transcript_identity_text(
+                " ".join(str(item.get("full_text") or item.get("text") or "") for item in transcript)
+            )[:CONTROL_HISTORY_TURN_SEARCH_TEXT_LIMIT]
+            current["end_index"] = max(0, len(transcript) - 1)
+        turns.append(current)
+        current = None
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                try:
+                    row = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                for entry in codex_history_entries_from_session_row(row):
+                    role = str(entry.get("role") or "")
+                    text = str(entry.get("text") or "")
+                    if role == "resume":
+                        if current is None:
+                            pending_context.append(entry)
+                        else:
+                            current["transcript"].append(
+                                codex_history_transcript_item(entry, turn_key=str(current["key"]))
+                            )
+                        continue
+                    if role == "user":
+                        if not codex_history_user_text_is_prompt(text):
+                            pending_context = []
+                            continue
+                        finish_current()
+                        turn_index = len(turns)
+                        turn_key = f"history:{session_id}:{turn_index}"
+                        source_turn_id = str(entry.get("turn_id") or "")
+                        label = observed_turn_label_from_text(text) or f"Turn {turn_index + 1}"
+                        current = {
+                            "key": turn_key,
+                            "turn_id": source_turn_id or turn_key,
+                            "source": "history",
+                            "session_id": session_id,
+                            "session_timestamp": session_timestamp,
+                            "session_file": path.name,
+                            "pending": False,
+                            "start_index": 0,
+                            "end_index": 0,
+                            "timestamp": str(entry.get("ts") or session_timestamp),
+                            "updated_at": str(entry.get("ts") or session_timestamp),
+                            "label": label,
+                            "transcript": [],
+                        }
+                        for context_entry in pending_context:
+                            current["transcript"].append(
+                                codex_history_transcript_item(
+                                    context_entry,
+                                    turn_key=turn_key,
+                                )
+                            )
+                        pending_context = []
+                        current["transcript"].append(codex_history_transcript_item(entry, turn_key=turn_key))
+                        continue
+                    if current is None:
+                        continue
+                    current["transcript"].append(
+                        codex_history_transcript_item(entry, turn_key=str(current["key"]))
+                    )
+                    if entry.get("ts"):
+                        current["updated_at"] = str(entry.get("ts") or "")
+    except OSError:
+        return []
+    finish_current()
+    return turns
+
+
+def codex_history_turn_metadata(turn: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "key": str(turn.get("key") or ""),
+        "turn_id": str(turn.get("turn_id") or turn.get("key") or ""),
+        "source": "history",
+        "session_id": str(turn.get("session_id") or ""),
+        "session_timestamp": str(turn.get("session_timestamp") or ""),
+        "session_file": str(turn.get("session_file") or ""),
+        "archived": bool(turn.get("archived")),
+        "pending": False,
+        "start_index": 0,
+        "end_index": max(0, int(turn.get("end_index") or 0)),
+        "timestamp": str(turn.get("timestamp") or ""),
+        "updated_at": str(turn.get("updated_at") or ""),
+        "label": str(turn.get("label") or "Historical turn"),
+        "search_text": str(turn.get("search_text") or ""),
+        "loaded": False,
+    }
+
+
+def control_turn_timestamp(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def history_turn_duplicates_observed(history_turn: dict[str, Any], observed_turn: dict[str, Any]) -> bool:
+    history_id = str(history_turn.get("turn_id") or "")
+    observed_id = str(observed_turn.get("turn_id") or "")
+    if history_id and observed_id and not history_id.startswith("history:"):
+        return history_id == observed_id
+    history_label = transcript_identity_text(str(history_turn.get("label") or "")).lower()
+    observed_label = transcript_identity_text(str(observed_turn.get("label") or "")).lower()
+    if not history_label or history_label != observed_label:
+        return False
+    history_timestamp = control_turn_timestamp(history_turn.get("timestamp"))
+    observed_timestamp = control_turn_timestamp(observed_turn.get("timestamp"))
+    return (
+        history_timestamp is not None
+        and observed_timestamp is not None
+        and abs(history_timestamp - observed_timestamp) <= 15
+    )
+
+
+def codex_history_turn_index_for_cwd(
+    cwd: str,
+    *,
+    codex_home: Path | None = None,
+) -> list[dict[str, Any]]:
+    home = (codex_home or default_codex_home()).expanduser()
+    files = codex_session_files_for_cwd(
+        cwd,
+        codex_home=home,
+        include_archived=True,
+    )
+    turns: list[dict[str, Any]] = []
+    archived_root = home / "archived_sessions"
+    for path, _meta in files[:CONTROL_HISTORY_SESSION_LIMIT]:
+        try:
+            archived = path.is_relative_to(archived_root)
+        except ValueError:
+            archived = False
+        for turn in codex_history_turns_from_session_file(path):
+            turn["archived"] = archived
+            turns.append(turn)
+    turns.sort(
+        key=lambda turn: (
+            str(turn.get("timestamp") or turn.get("session_timestamp") or ""),
+            str(turn.get("updated_at") or ""),
+            str(turn.get("key") or ""),
+        )
+    )
+    if len(turns) > CONTROL_HISTORY_TURN_LIMIT:
+        turns = turns[-CONTROL_HISTORY_TURN_LIMIT:]
+    return [codex_history_turn_metadata(turn) for turn in turns]
+
+
+def codex_history_turn_payload_for_cwd(
+    cwd: str,
+    turn_key: str,
+    *,
+    codex_home: Path | None = None,
+) -> dict[str, Any] | None:
+    if not turn_key:
+        return None
+    home = (codex_home or default_codex_home()).expanduser()
+    for path, _meta in codex_session_files_for_cwd(
+        cwd,
+        codex_home=home,
+        include_archived=True,
+    )[:CONTROL_HISTORY_SESSION_LIMIT]:
+        try:
+            archived = path.is_relative_to(home / "archived_sessions")
+        except ValueError:
+            archived = False
+        for turn in codex_history_turns_from_session_file(path):
+            if str(turn.get("key") or "") != turn_key:
+                continue
+            turn["archived"] = archived
+            metadata = codex_history_turn_metadata(turn)
+            metadata["loaded"] = True
+            transcript = [dict(item) for item in turn.get("transcript") or [] if isinstance(item, dict)]
+            for index, item in enumerate(transcript):
+                item["control_index"] = index
+            return {
+                "turn": metadata,
+                "transcript": transcript,
+                "source": "history",
+            }
+    return None
+
+
 def codex_compatibility_payload() -> dict[str, Any]:
     catalog = codex_model_catalog_probe()
+    startup_cli = codex_cli_version()
+    runtime_cli = codex_runtime_version()
     return {
-        "cli": codex_cli_version(),
+        "cli": startup_cli,
+        "runtime_cli": runtime_cli,
+        "restart_required": codex_restart_requirement(startup_cli, runtime_cli),
         "model_catalog": {
             "source": catalog.get("source"),
             "available": catalog.get("available"),
@@ -1227,6 +1747,16 @@ def model_catalog_entry(model: str | None) -> dict[str, Any] | None:
     return None
 
 
+def default_model_from_catalog() -> str:
+    for item in load_codex_model_catalog():
+        if not isinstance(item, dict):
+            continue
+        model = sanitize_model_id(item.get("id"))
+        if model:
+            return model
+    return DEFAULT_MODEL_ID
+
+
 def sanitize_model_id(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -1248,7 +1778,11 @@ def reasoning_levels_for_model(model: str | None) -> list[str]:
     entry = model_catalog_entry(model)
     levels = entry.get("reasoning") if entry else None
     if isinstance(levels, list):
-        cleaned = [level for level in levels if isinstance(level, str) and level in REASONING_LEVELS]
+        cleaned = []
+        for level in levels:
+            effort = normalize_reasoning_level(level)
+            if effort and effort not in cleaned:
+                cleaned.append(effort)
         if cleaned:
             return cleaned
     return list(REASONING_LEVELS)
@@ -1295,8 +1829,9 @@ def read_stock_codex_model_setting() -> tuple[str, str]:
         with path.open("rb") as handle:
             config = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError):
-        return DEFAULT_MODEL_ID, DEFAULT_REASONING_EFFORT
-    model = sanitize_model_id(config.get("model")) or DEFAULT_MODEL_ID
+        model = default_model_from_catalog()
+        return model, default_reasoning_for_model(model)
+    model = sanitize_model_id(config.get("model")) or default_model_from_catalog()
     reasoning = sanitize_reasoning_effort(config.get("model_reasoning_effort"), model)
     return model, reasoning or default_reasoning_for_model(model)
 
@@ -2029,7 +2564,19 @@ def websocket_message_user_entries(opcode: int, payload: bytes) -> list[dict[str
     return response_create_payload_user_entries(value) if value is not None else []
 
 
+def goal_context_display_text(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        objective = CODEX_GOAL_OBJECTIVE_RE.search(match.group(0))
+        if not objective:
+            return ""
+        text = clean_control_user_text(objective.group(1))
+        return f"Goal: {text}" if text else ""
+
+    return CODEX_GOAL_CONTEXT_RE.sub(replace, value)
+
+
 def user_transcript_entries(text: str) -> list[dict[str, str]]:
+    text = goal_context_display_text(text)
     matches = list(ENVIRONMENT_CONTEXT_RE.finditer(text))
     if not matches:
         cleaned = clean_control_user_text(text)
@@ -2157,6 +2704,15 @@ def compact_tool_detail(value: Any) -> str:
         except (TypeError, ValueError):
             return clean_transcript_text(str(value))
     if isinstance(value, list):
+        content_text = [
+            item.get("text")
+            for item in value
+            if isinstance(item, dict)
+            and isinstance(item.get("text"), str)
+            and str(item.get("type") or "").lower() in {"input_text", "output_text", "text"}
+        ]
+        if content_text and len(content_text) == len(value):
+            return clean_transcript_text("\n".join(content_text))
         if all(item is None or isinstance(item, (str, int, float, bool)) for item in value):
             return clean_transcript_text("\n".join(str(item) for item in value if item is not None))
         try:
@@ -2178,6 +2734,71 @@ def parse_jsonish_string(value: str) -> Any | None:
         return json.loads(stripped)
     except json.JSONDecodeError:
         return None
+
+
+def decoded_javascript_string_literal(value: str) -> str:
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return ""
+    return decoded if isinstance(decoded, str) else ""
+
+
+def programmatic_tool_string_property(source: str, name: str) -> str:
+    match = re.search(
+        rf"(?:[\"']{re.escape(name)}[\"']|\b{re.escape(name)})\s*:\s*(\"(?:\\.|[^\"\\])*\")",
+        source,
+        re.DOTALL,
+    )
+    return decoded_javascript_string_literal(match.group(1)) if match else ""
+
+
+def programmatic_tool_input_details(name: str, source: str) -> str:
+    payload: dict[str, Any] = {}
+    if name == "update_plan":
+        plan = [
+            {
+                "step": decoded_javascript_string_literal(match.group(1)),
+                "status": decoded_javascript_string_literal(match.group(2)),
+            }
+            for match in PROGRAMMATIC_TOOL_PLAN_STEP_RE.finditer(source)
+        ]
+        if plan:
+            payload["plan"] = plan
+        explanation = programmatic_tool_string_property(source, "explanation")
+        if explanation:
+            payload["explanation"] = explanation
+    elif name == "update_goal":
+        status = programmatic_tool_string_property(source, "status")
+        if status:
+            payload["status"] = status
+    elif name == "create_goal":
+        objective = programmatic_tool_string_property(source, "objective")
+        if objective:
+            payload["objective"] = objective
+    return json.dumps(payload, ensure_ascii=False, indent=2) if payload else ""
+
+
+def programmatic_tool_call_details(value: dict[str, Any]) -> dict[str, str] | None:
+    source = first_string_value(value, ("input", "arguments", "code"))
+    if not source:
+        return None
+    match = PROGRAMMATIC_TOOL_INVOCATION_RE.search(source)
+    if not match:
+        return None
+    name = match.group(1).rsplit(".", 1)[-1]
+    details = {"name": name, "command": "", "input": ""}
+    if name == "exec_command":
+        command = PROGRAMMATIC_TOOL_COMMAND_RE.search(source)
+        if command:
+            details["command"] = decoded_javascript_string_literal(command.group(1))
+    elif name == "apply_patch":
+        patch = PROGRAMMATIC_TOOL_PATCH_RE.search(source)
+        if patch:
+            details["input"] = decoded_javascript_string_literal(patch.group(1))
+    else:
+        details["input"] = programmatic_tool_input_details(name, source)
+    return details
 
 
 def shell_join(value: list[Any]) -> str:
@@ -2327,6 +2948,86 @@ def is_control_tool_call_name(value: Any) -> bool:
     return isinstance(value, str) and bool(CONTROL_TOOL_CALL_RE.match(value.strip()))
 
 
+def is_web_search_tool_call_name(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip().lower()
+    return text in {"web_search", "web_search_call", "websearch"} or bool(
+        WEB_SEARCH_TOOL_CALL_RE.match(text)
+    )
+
+
+def web_search_query_detail(value: Any) -> str:
+    if isinstance(value, str):
+        parsed = parse_jsonish_string(value)
+        if parsed is not None:
+            return web_search_query_detail(parsed)
+        return ""
+    if isinstance(value, list):
+        queries = [web_search_query_detail(item) for item in value]
+        return "\n".join(query for query in queries if query)
+    if not isinstance(value, dict):
+        return ""
+    direct = first_string_value(value, ("query", "q", "search_query", "searchQuery"))
+    if direct:
+        return direct
+    for key in ("queries", "input", "arguments", "params", "content", "action"):
+        query = web_search_query_detail(value.get(key))
+        if query:
+            return query
+    return ""
+
+
+def image_generation_tool_status(value: dict[str, Any]) -> str:
+    """Return a terminal image-generation status for tool result payloads."""
+    normalized = str(value.get("type") or "").lower()
+    if normalized == "image_generation_call":
+        status = first_string_value(value, ("status", "state")).lower()
+        if status in {"completed", "failed", "canceled", "cancelled"}:
+            return status
+        result = value.get("result")
+        if isinstance(result, str) and result:
+            return "completed"
+        return ""
+    if normalized != "function_call_output":
+        return ""
+
+    output = value.get("output")
+    if not isinstance(output, list):
+        return ""
+    has_image = False
+    has_generated_image_notice = False
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").lower()
+        if item_type == "input_image":
+            has_image = True
+        if item_type in {"input_text", "output_text", "text"}:
+            text = item.get("text")
+            if isinstance(text, str) and "generated images are saved to" in text.lower():
+                has_generated_image_notice = True
+    return "completed" if has_image and has_generated_image_notice else ""
+
+
+def image_generation_tool_entry(value: dict[str, Any]) -> dict[str, Any] | None:
+    status = image_generation_tool_status(value)
+    if not status:
+        return None
+    if status == "completed":
+        result = "Image generated successfully."
+    elif status in {"canceled", "cancelled"}:
+        result = "Image generation was canceled."
+    else:
+        result = "Image generation failed."
+    return {
+        "role": "tool",
+        "text": f"Tool: Image generation (status {status})\nResult:\n{result}",
+        "call_id": tool_call_identifier(value),
+        "status": status,
+    }
+
+
 def tool_activity_entry_from_value(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -2342,14 +3043,37 @@ def tool_activity_entry_from_value(value: Any) -> dict[str, Any] | None:
         return None
 
     call_id = tool_call_identifier(value)
+    image_entry = image_generation_tool_entry(value)
+    if image_entry:
+        return image_entry
+    programmatic_details = programmatic_tool_call_details(value) if normalized == "custom_tool_call" else None
     name = first_string_value(value, ("name", "tool_name", "server_label")) or call_id or normalized
+    if programmatic_details:
+        name = programmatic_details["name"] or name
     if is_control_tool_call_name(name) or is_control_tool_call_name(call_id):
         return None
+    is_web_search = (
+        normalized == "web_search_call"
+        or is_web_search_tool_call_name(name)
+        or is_web_search_tool_call_name(call_id)
+    )
+    is_programmatic = normalized in {"program", "program_output"}
     status = first_string_value(value, ("status", "state"))
     exit_code = first_string_value(value, ("exit_code", "exitCode", "returncode"))
     command = nested_command_value(value)
+    if programmatic_details and programmatic_details["command"]:
+        command = programmatic_details["command"]
     detail_sections: list[tuple[str, str]] = []
     seen_detail_text: set[tuple[str, str]] = set()
+    if programmatic_details and programmatic_details["input"]:
+        programmatic_input = programmatic_details["input"]
+        seen_detail_text.add(("Input", programmatic_input))
+        detail_sections.append(("Input", programmatic_input))
+    if is_web_search:
+        query = web_search_query_detail(value)
+        if query:
+            seen_detail_text.add(("Query", query))
+            detail_sections.append(("Query", query))
     if "apply_patch" in name.lower() or normalized == "apply_patch_call":
         for key in ("cmd", "command"):
             text = compact_tool_detail(value.get(key))
@@ -2359,8 +3083,11 @@ def tool_activity_entry_from_value(value: Any) -> dict[str, Any] | None:
     for key, label in (
         ("arguments", "Arguments"),
         ("input", "Input"),
+        ("code", "Code"),
         ("patch", "Patch"),
         ("content", "Content"),
+        ("caller", "Caller"),
+        ("fingerprint", "Fingerprint"),
         ("params", "Parameters"),
         ("output", "Output"),
         ("stdout", "Stdout"),
@@ -2369,13 +3096,36 @@ def tool_activity_entry_from_value(value: Any) -> dict[str, Any] | None:
         ("message", "Message"),
         ("summary", "Summary"),
     ):
+        if programmatic_details and key in {"arguments", "input", "code"}:
+            continue
         text = compact_tool_detail(value.get(key))
+        if (
+            is_web_search
+            and query
+            and label in {"Arguments", "Input", "Parameters"}
+            and transcript_identity_text(text).lower()
+            in {
+                transcript_identity_text(query).lower(),
+                f"query: {transcript_identity_text(query)}".lower(),
+                f"q: {transcript_identity_text(query)}".lower(),
+                f"search_query: {transcript_identity_text(query)}".lower(),
+            }
+        ):
+            continue
         detail_key = (label, text)
         if text and detail_key not in seen_detail_text:
             seen_detail_text.add(detail_key)
             detail_sections.append((label, text))
-    if normalized in {"local_shell_call", "shell_call"} or command:
+    if normalized in {"local_shell_call", "shell_call", "command_execution"} or (
+        command and not is_programmatic
+    ):
         header = f"Command: {command or name}"
+    elif is_web_search:
+        header = "Tool: Web Search"
+    elif normalized == "program":
+        header = "Tool: Programmatic Tool Calling"
+    elif normalized == "program_output":
+        header = "Tool: Programmatic Tool Calling output"
     else:
         header = f"Tool: {name}"
     details = [header]
@@ -2468,11 +3218,26 @@ def app_server_error_text(value: Any) -> str:
 
 def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | None:
     item_type = str(item.get("type") or "")
+    item_type_key = re.sub(r"[_-]", "", item_type).lower()
     call_id = first_string_value(item, ("id", "itemId", "item_id", "call_id", "callId"))
+    name = first_string_value(item, ("name", "tool"))
     status = first_string_value(item, ("status", "state"))
-    if is_control_tool_call_name(call_id) or is_control_tool_call_name(first_string_value(item, ("name", "tool"))):
+    if is_control_tool_call_name(call_id) or is_control_tool_call_name(name):
         return None
-    if item_type == "commandExecution":
+    if item_type_key == "websearch" or is_web_search_tool_call_name(call_id) or is_web_search_tool_call_name(name):
+        suffix = f" (status {status})" if status else ""
+        details = [f"Tool: Web Search{suffix}"]
+        query = web_search_query_detail(item)
+        result = compact_tool_detail(item.get("result") or item.get("output"))
+        error = compact_tool_detail(item.get("error"))
+        if query:
+            details.append(f"Query:\n{query}")
+        if result:
+            details.append(f"Result:\n{result}")
+        if error:
+            details.append(f"Error:\n{error}")
+        return {"role": "tool", "text": "\n".join(details), "call_id": call_id, "status": status}
+    if item_type_key == "commandexecution":
         command = nested_command_value(item) or first_string_value(item, ("command",))
         exit_code = first_string_value(item, ("exitCode", "exit_code"))
         suffixes = []
@@ -2483,10 +3248,34 @@ def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | No
         header = f"Command: {command or call_id or 'command'}"
         if suffixes:
             header = f"{header} ({', '.join(suffixes)})"
-        output = compact_tool_detail(item.get("aggregatedOutput") or item.get("output"))
+        output = compact_tool_detail(
+            item.get("aggregatedOutput")
+            or item.get("aggregated_output")
+            or item.get("formattedOutput")
+            or item.get("formatted_output")
+            or item.get("output")
+        )
         text = header if not output else f"{header}\nOutput:\n{output}"
         return {"role": "tool", "text": text, "call_id": call_id, "status": status}
-    if item_type == "mcpToolCall":
+    if item_type_key == "dynamictoolcall":
+        namespace = first_string_value(item, ("namespace",))
+        tool = first_string_value(item, ("tool", "name"))
+        name = "/".join(part for part in (namespace, tool) if part) or call_id or "dynamic tool"
+        suffix = f" (status {status})" if status else ""
+        details = [f"Tool: {name}{suffix}"]
+        for key, label in (
+            ("arguments", "Arguments"),
+            ("contentItems", "Content"),
+            ("content_items", "Content"),
+            ("result", "Result"),
+            ("output", "Output"),
+            ("error", "Error"),
+        ):
+            text = compact_tool_detail(item.get(key))
+            if text:
+                details.append(f"{label}:\n{text}")
+        return {"role": "tool", "text": "\n".join(details), "call_id": call_id, "status": status}
+    if item_type_key == "mcptoolcall":
         server = first_string_value(item, ("server",))
         tool = first_string_value(item, ("tool", "name"))
         name = "/".join(part for part in (server, tool) if part) or call_id or "mcp tool"
@@ -2502,7 +3291,7 @@ def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | No
         if error:
             details.append(f"Error:\n{error}")
         return {"role": "tool", "text": "\n".join(details), "call_id": call_id, "status": status}
-    if item_type == "fileChange":
+    if item_type_key == "filechange":
         changes = item.get("changes")
         paths = []
         if isinstance(changes, list):
@@ -2511,15 +3300,75 @@ def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | No
                     path = first_string_value(change, ("path",))
                     kind = first_string_value(change, ("kind",))
                     paths.append(f"{kind}: {path}" if kind and path else path or kind)
+        if isinstance(changes, dict):
+            for path, change in changes.items():
+                kind = ""
+                if isinstance(change, dict):
+                    kind = first_string_value(change, ("kind", "type"))
+                path_text = str(path)
+                paths.append(f"{kind}: {path_text}" if kind else path_text)
         suffix = f" (status {status})" if status else ""
         detail = "\n".join(path for path in paths if path)
         text = f"Tool: file changes{suffix}" if not detail else f"Tool: file changes{suffix}\n{detail}"
         return {"role": "tool", "text": text, "call_id": call_id, "status": status}
-    if item_type in {"webSearch", "imageView", "collabToolCall"}:
+    if item_type_key == "collabagenttoolcall":
+        tool = first_string_value(item, ("tool", "name")) or "agent"
+        suffix = f" (status {status})" if status else ""
+        details = [f"Tool: agent {tool}{suffix}"]
+        for key, label in (
+            ("prompt", "Prompt"),
+            ("model", "Model"),
+            ("reasoningEffort", "Reasoning"),
+            ("reasoning_effort", "Reasoning"),
+            ("receiverAgents", "Receiver agents"),
+            ("receiver_agents", "Receiver agents"),
+            ("receiverThreadIds", "Receiver threads"),
+            ("receiver_thread_ids", "Receiver threads"),
+            ("agentsStates", "Agent states"),
+            ("agents_states", "Agent states"),
+        ):
+            text = compact_tool_detail(item.get(key))
+            if text:
+                details.append(f"{label}:\n{text}")
+        return {"role": "tool", "text": "\n".join(details), "call_id": call_id, "status": status}
+    if item_type_key == "subagentactivity":
+        kind = first_string_value(item, ("kind",)) or "activity"
+        suffix = f" (status {status})" if status else ""
+        details = [f"Tool: sub-agent {kind}{suffix}"]
+        for key, label in (
+            ("agentPath", "Agent path"),
+            ("agent_path", "Agent path"),
+            ("agentThreadId", "Agent thread"),
+            ("agent_thread_id", "Agent thread"),
+        ):
+            text = compact_tool_detail(item.get(key))
+            if text:
+                details.append(f"{label}:\n{text}")
+        return {"role": "tool", "text": "\n".join(details), "call_id": call_id, "status": status}
+    if item_type_key == "hookprompt":
+        suffix = f" (status {status})" if status else ""
+        details = [f"Tool: hook prompt{suffix}"]
+        fragments = compact_tool_detail(item.get("fragments"))
+        if fragments:
+            details.append(f"Fragments:\n{fragments}")
+        return {"role": "tool", "text": "\n".join(details), "call_id": call_id, "status": status}
+    if item_type_key in {
+        "imageview",
+        "imagegeneration",
+        "collabtoolcall",
+        "enteredreviewmode",
+        "exitedreviewmode",
+        "contextcompaction",
+        "sleep",
+    }:
         label = {
-            "webSearch": "web search",
             "imageView": "image view",
+            "imageGeneration": "image generation",
             "collabToolCall": "collab tool",
+            "enteredReviewMode": "review mode started",
+            "exitedReviewMode": "review mode completed",
+            "contextCompaction": "context compaction",
+            "sleep": "sleep",
         }.get(item_type, item_type)
         suffix = f" (status {status})" if status else ""
         detail = compact_tool_detail(item)
@@ -4340,12 +5189,12 @@ def render_compact_quota_bucket_html(bucket: dict[str, Any], *, secondary: bool 
     return f"""
       <span class="control-compact-quota{special_class}{secondary_class}" title="{html.escape(title)}">
         <span class="control-compact-quota-name">{html.escape(name)}</span>
-        <span class="control-compact-quota-primary">{html.escape(primary_text)}</span>
+        <span class="control-compact-quota-weekly">{html.escape(weekly_text)}</span>
         <span class="control-compact-quota-bar" role="img" aria-label="{html.escape(aria)}">
           <span class="control-compact-quota-weekly-fill" style="width: {weekly_style:.2f}%"></span>
           <span class="control-compact-quota-primary-fill" style="width: {primary_style:.2f}%"></span>
         </span>
-        <span class="control-compact-quota-weekly">{html.escape(weekly_text)}</span>
+        <span class="control-compact-quota-primary">{html.escape(primary_text)}</span>
       </span>
     """
 
@@ -4543,6 +5392,133 @@ def render_quota_html(
     )
 
 
+def quota_count_window_payload(window: Any, fallback: str) -> dict[str, Any] | None:
+    if not isinstance(window, dict):
+        return None
+    reset = quota_reset_label(window)
+    remaining = window.get("remaining")
+    if isinstance(remaining, (int, float)):
+        value = f"{remaining:g}"
+    else:
+        allowed = window.get("allowed")
+        if isinstance(allowed, bool):
+            value = "available" if allowed else "not available"
+        else:
+            return None
+    return {
+        "label": quota_window_label(window, fallback),
+        "value": value,
+        "reset": reset,
+    }
+
+
+def quota_stack_payload(rate_limit: dict[str, Any]) -> dict[str, Any]:
+    context = quota_stack_context(rate_limit)
+    if context.get("count_html"):
+        rows = [
+            quota_count_window_payload(rate_limit.get("primary_window"), "5h"),
+            quota_count_window_payload(rate_limit.get("secondary_window"), "Weekly"),
+        ]
+        return {
+            "count_rows": [row for row in rows if row],
+            "title_placeholder": True,
+        }
+    payload: dict[str, Any] = {}
+    for key in (
+        "primary_reset_text",
+        "weekly_status",
+        "primary_style",
+        "weekly_style",
+        "primary_text",
+        "weekly_text",
+        "primary_empty",
+        "aria",
+        "special",
+    ):
+        if key in context:
+            payload[key] = context.get(key)
+    return payload
+
+
+def quota_bucket_payload(bucket: dict[str, Any]) -> dict[str, Any] | None:
+    rate_limit = bucket.get("rate_limit")
+    if not isinstance(rate_limit, dict):
+        return None
+    name = str(bucket.get("name") or "Quota bucket")
+    feature = str(bucket.get("metered_feature") or "")
+    return {
+        "name": name,
+        "metered_feature": feature,
+        "title": f"Metered feature: {feature}" if feature and feature != "codex" else "",
+        "stack": quota_stack_payload(rate_limit),
+    }
+
+
+def reset_credit_control_payload(payload: Any, reset_credit: Any = None) -> dict[str, Any] | None:
+    if isinstance(reset_credit, dict) and reset_credit.get("blocks"):
+        return {
+            "label": str(reset_credit.get("label") or "Reset pending"),
+            "message": str(reset_credit.get("message") or "Reset-credit use is temporarily disabled."),
+            "disabled": True,
+        }
+    count = quota_payload_reset_credit_count(payload)
+    if count <= 0:
+        return None
+    return {
+        "label": f"Reset credit: {count}" if count == 1 else f"Reset credits: {count}",
+        "message": "Use one rate-limit reset credit for this Codex CLI profile?",
+        "disabled": False,
+        "count": count,
+    }
+
+
+def quota_panel_payload(
+    entry: dict[str, Any] | None,
+    updated_label: str | None = None,
+) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "updated": updated_label or "",
+        "buckets": [],
+        "state": None,
+        "empty": "No quota cached",
+        "refresh_error": "",
+        "refresh_error_billing": False,
+        "credits_label": "",
+        "reset_credit": None,
+    }
+    if not entry:
+        return data
+    payload = entry.get("payload")
+    error = entry.get("error")
+    if updated_label is None:
+        data["updated"] = quota_updated_label(entry)
+    if not isinstance(payload, dict):
+        if error:
+            if state := usage_payload_state(error):
+                data["state"] = state
+                data["empty"] = ""
+            else:
+                data["empty"] = quota_refresh_error_message(error)
+                data["refresh_error_billing"] = error_requires_billing(error)
+        return data
+
+    buckets = [item for item in (quota_bucket_payload(bucket) for bucket in quota_bucket_rows(payload)) if item]
+    if buckets:
+        data["buckets"] = buckets
+        data["empty"] = ""
+    elif state := usage_payload_state(payload):
+        data["state"] = state
+        data["empty"] = ""
+    else:
+        data["empty"] = "Quota payload has no bucket details"
+    if error:
+        data["refresh_error"] = quota_refresh_error_message(error)
+        data["refresh_error_billing"] = error_requires_billing(error)
+    data["credits_label"] = credit_balance_label(quota_payload_credits(payload))
+    data["reset_credit"] = reset_credit_control_payload(payload, entry.get("reset_credit"))
+    return data
+
+
 def quota_updated_label(entry: dict[str, Any] | None) -> str:
     if not entry:
         return ""
@@ -4661,6 +5637,9 @@ class ProvisionServer(ThreadingHTTPServer):
         self.next_websocket_id = 0
         self.observed_sessions: dict[str, dict[str, Any]] = {}
         self.control_transcripts: dict[str, list[dict[str, Any]]] = {}
+        self.control_history_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self.control_history_cache_lock = threading.Lock()
+        self.control_history_inflight: dict[str, threading.Event] = {}
         self.profile_settings: dict[str, dict[str, Any]] = self.load_profile_settings()
         self.profile_settings_lock = threading.Lock()
         self.pinned_sessions: dict[str, str] = self.load_pinned_sessions()
@@ -4680,11 +5659,18 @@ class ProvisionServer(ThreadingHTTPServer):
         self.login_jobs_lock = threading.Lock()
         self.app_server_rate_limit_cache: dict[str, dict[str, Any]] = {}
         self.app_server_rate_limit_lock = threading.Lock()
+        self.app_server_model_catalog_cache: dict[str, dict[str, Any]] = {}
+        self.app_server_model_catalog_lock = threading.Lock()
         self.stats_lock = threading.Lock()
         self.ui_launchers: dict[int, dict[str, Any]] = {}
         self.ui_launchers_lock = threading.Lock()
+        self.ui_state_lock = threading.Lock()
+        self.ui_state_version = 0
+        self.ui_state_dirty_reasons: dict[str, int] = {}
+        self.ui_state_dirty_log: list[tuple[int, str]] = []
         self.resume_candidates_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
         self.resume_candidates_lock = threading.Lock()
+        self.resume_candidates_inflight: dict[str, threading.Event] = {}
 
     def log_message(self, format: str, *args: Any) -> None:
         message = format % args
@@ -4696,6 +5682,84 @@ class ProvisionServer(ThreadingHTTPServer):
                 message,
             )
         )
+
+    def mark_ui_dirty(self, reason: str = "state") -> int:
+        lock = getattr(self, "ui_state_lock", None)
+        if lock is None:
+            return 0
+        key = reason or "state"
+        with lock:
+            self.ui_state_version = int(getattr(self, "ui_state_version", 0)) + 1
+            version = self.ui_state_version
+            reasons = getattr(self, "ui_state_dirty_reasons", None)
+            if isinstance(reasons, dict):
+                reasons[key] = int(reasons.get(key) or 0) + 1
+            dirty_log = getattr(self, "ui_state_dirty_log", None)
+            if not isinstance(dirty_log, list):
+                dirty_log = []
+                setattr(self, "ui_state_dirty_log", dirty_log)
+            dirty_log.append((version, key))
+            if len(dirty_log) > UI_DIRTY_LOG_LIMIT:
+                del dirty_log[: len(dirty_log) - UI_DIRTY_LOG_LIMIT]
+            return version
+
+    def ui_state_revision(self) -> int:
+        lock = getattr(self, "ui_state_lock", None)
+        if lock is None:
+            return int(getattr(self, "ui_state_version", 0) or 0)
+        with lock:
+            return int(getattr(self, "ui_state_version", 0) or 0)
+
+    def ui_state_dirty_reasons_since(self, revision: int) -> set[str]:
+        lock = getattr(self, "ui_state_lock", None)
+        current = int(getattr(self, "ui_state_version", 0) or 0)
+        if revision >= current:
+            return set()
+        if lock is None:
+            return {"state"}
+        with lock:
+            current = int(getattr(self, "ui_state_version", 0) or 0)
+            if revision >= current:
+                return set()
+            dirty_log = getattr(self, "ui_state_dirty_log", None)
+            if not isinstance(dirty_log, list) or not dirty_log:
+                return {"state"}
+            first_revision = int(dirty_log[0][0] or 0)
+            if first_revision > revision + 1:
+                return {"state"}
+            reasons = {str(reason or "state") for version, reason in dirty_log if int(version or 0) > revision}
+            return reasons or {"state"}
+
+    def ui_state_liveness_signature(self) -> tuple[Any, ...]:
+        with self.active_lock:
+            self.expire_websocket_work_locked()
+            now = time.monotonic()
+            request_rows = tuple(
+                sorted(
+                    (
+                        str(request.get("profile") or ""),
+                        str(request.get("session_key") or ""),
+                    )
+                    for request in self.active_requests.values()
+                )
+            )
+            tunnel_rows = tuple(
+                sorted(
+                    (
+                        str(tunnel.get("profile") or ""),
+                        str(tunnel.get("session_key") or ""),
+                        int(tunnel.get("pending_work") or 0),
+                        str(tunnel.get("turn_id") or ""),
+                        str(tunnel.get("thread_id") or ""),
+                        bool(
+                            now - float(tunnel.get("last_data_activity_monotonic") or 0.0)
+                            < WEBSOCKET_SWITCH_IDLE_SECONDS
+                        ),
+                    )
+                    for tunnel in self.active_websockets.values()
+                )
+            )
+        return request_rows, tunnel_rows
 
     def ui_launcher_permission_args(self, permission: str) -> list[str]:
         key = permission if permission in UI_LAUNCHER_PERMISSION_PRESETS else "workspace-write"
@@ -4770,6 +5834,7 @@ class ProvisionServer(ThreadingHTTPServer):
                     record["last_seen_monotonic"] = time.monotonic()
                     record["last_seen_at"] = datetime.now().astimezone()
             self.log_message("UI-launched provision session %s exited with status %s", session_key, exit_code)
+            self.mark_ui_dirty("ui_launcher_exit")
 
     def launch_ui_session(
         self,
@@ -4861,6 +5926,7 @@ class ProvisionServer(ThreadingHTTPServer):
             mode,
             permission,
         )
+        self.mark_ui_dirty("ui_launcher_start")
         return {
             "ok": True,
             "pid": child_pid,
@@ -4939,6 +6005,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 path.unlink()
             except OSError:
                 pass
+        self.mark_ui_dirty("session_forget")
 
     def load_profile_settings(self) -> dict[str, dict[str, Any]]:
         try:
@@ -4984,15 +6051,120 @@ class ProvisionServer(ThreadingHTTPServer):
         key = normalized_path_text(cwd)
         if not key:
             return []
-        now = time.monotonic()
-        with self.resume_candidates_lock:
-            cached = self.resume_candidates_cache.get(key)
-            if cached and now - cached[0] < RESUME_CANDIDATE_CACHE_SECONDS:
-                return [dict(item) for item in cached[1]]
-        candidates = codex_resume_candidates_for_cwd(cwd, limit=RESUME_CANDIDATE_LIMIT)
-        with self.resume_candidates_lock:
-            self.resume_candidates_cache[key] = (now, [dict(item) for item in candidates])
+        lock = getattr(self, "resume_candidates_lock", None)
+        cache = getattr(self, "resume_candidates_cache", None)
+        inflight = getattr(self, "resume_candidates_inflight", None)
+        if lock is None or not isinstance(cache, dict) or not isinstance(inflight, dict):
+            return codex_resume_candidates_for_cwd(cwd, limit=RESUME_CANDIDATE_LIMIT)
+
+        owner = False
+        event: threading.Event
+        while True:
+            now = time.monotonic()
+            with lock:
+                cached = cache.get(key)
+                if cached and now - cached[0] < RESUME_CANDIDATE_CACHE_SECONDS:
+                    return [dict(item) for item in cached[1]]
+                existing = inflight.get(key)
+                if existing is None:
+                    event = threading.Event()
+                    inflight[key] = event
+                    owner = True
+                    break
+                event = existing
+            event.wait()
+
+        assert owner
+        try:
+            candidates = codex_resume_candidates_for_cwd(cwd, limit=RESUME_CANDIDATE_LIMIT)
+        except BaseException:
+            with lock:
+                inflight.pop(key, None)
+                event.set()
+            raise
+        with lock:
+            cache[key] = (time.monotonic(), [dict(item) for item in candidates])
+            inflight.pop(key, None)
+            event.set()
         return candidates
+
+    def resume_candidates_for_session(self, session_key: str) -> list[dict[str, str]]:
+        with self.active_lock:
+            record = self.observed_sessions.get(session_key)
+            if not isinstance(record, dict):
+                raise StoreError("unknown session")
+            cwd = str(record.get("cwd") or session_key)
+        return self.resume_candidates_for_cwd(cwd)
+
+    def history_turns_for_cwd(self, cwd: str) -> list[dict[str, Any]]:
+        key = normalized_path_text(cwd)
+        if not key:
+            return []
+        lock = getattr(self, "control_history_cache_lock", None)
+        cache = getattr(self, "control_history_cache", None)
+        inflight = getattr(self, "control_history_inflight", None)
+        if lock is None or not isinstance(cache, dict) or not isinstance(inflight, dict):
+            return codex_history_turn_index_for_cwd(cwd)
+
+        owner = False
+        event: threading.Event
+        while True:
+            now = time.monotonic()
+            with lock:
+                cached = cache.get(key)
+                if cached and now - cached[0] < CONTROL_HISTORY_CACHE_SECONDS:
+                    return [dict(item) for item in cached[1]]
+                existing = inflight.get(key)
+                if existing is None:
+                    event = threading.Event()
+                    inflight[key] = event
+                    owner = True
+                    break
+                event = existing
+            event.wait()
+
+        assert owner
+        try:
+            turns = codex_history_turn_index_for_cwd(cwd)
+        except BaseException:
+            with lock:
+                inflight.pop(key, None)
+                event.set()
+            raise
+        with lock:
+            # Cache from completion, not from before the potentially expensive scan.
+            cache[key] = (time.monotonic(), [dict(item) for item in turns])
+            inflight.pop(key, None)
+            event.set()
+        return turns
+
+    def history_turn_index_for_session(self, session_key: str) -> list[dict[str, Any]]:
+        with self.active_lock:
+            record = self.observed_sessions.get(session_key)
+            if not isinstance(record, dict):
+                raise StoreError("unknown session")
+            cwd = str(record.get("cwd") or session_key)
+            observed_turns = self.control_turns_from_transcript(
+                self.control_transcript_snapshot(session_key)
+            )
+        history_turns = self.history_turns_for_cwd(cwd)
+        return [
+            turn
+            for turn in history_turns
+            if not any(history_turn_duplicates_observed(turn, observed) for observed in observed_turns)
+        ]
+
+    def history_turn_payload_for_session(self, session_key: str, turn_key: str) -> dict[str, Any]:
+        with self.active_lock:
+            record = self.observed_sessions.get(session_key)
+            if not isinstance(record, dict):
+                raise StoreError("unknown session")
+            cwd = str(record.get("cwd") or session_key)
+        payload = codex_history_turn_payload_for_cwd(cwd, turn_key)
+        if not payload:
+            raise StoreError("historical turn was not found for this session")
+        payload["session_key"] = session_key
+        return payload
 
     def save_profile_settings_locked(self) -> None:
         try:
@@ -5065,6 +6237,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 "reasoning_effort": reasoning,
             }
         )
+        self.mark_ui_dirty("profile_model")
 
     def mark_profile_login_required(self, profile: str, error: BaseException | str) -> None:
         store = getattr(self, "store", None)
@@ -5078,6 +6251,7 @@ class ProvisionServer(ThreadingHTTPServer):
             settings["login_error"] = message[:500]
             settings["login_error_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             self.save_profile_settings_locked()
+        self.mark_ui_dirty("login_required")
 
     def clear_profile_login_required(self, profile: str) -> None:
         store = getattr(self, "store", None)
@@ -5091,6 +6265,8 @@ class ProvisionServer(ThreadingHTTPServer):
             changed = bool(settings.pop("login_error_at", None)) or changed
             if changed:
                 self.save_profile_settings_locked()
+        if changed:
+            self.mark_ui_dirty("login_required_clear")
 
     def profile_login_required(self, profile: str) -> dict[str, Any]:
         lock = getattr(self, "profile_settings_lock", None)
@@ -5159,6 +6335,7 @@ class ProvisionServer(ThreadingHTTPServer):
             settings["billing_error"] = message[:500]
             settings["billing_error_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             self.save_profile_settings_locked()
+        self.mark_ui_dirty("billing_required")
 
     def clear_profile_billing_required(self, profile: str) -> None:
         store = getattr(self, "store", None)
@@ -5172,6 +6349,8 @@ class ProvisionServer(ThreadingHTTPServer):
             changed = bool(settings.pop("billing_error_at", None)) or changed
             if changed:
                 self.save_profile_settings_locked()
+        if changed:
+            self.mark_ui_dirty("billing_required_clear")
 
     def profile_billing_required(self, profile: str) -> dict[str, Any]:
         lock = getattr(self, "profile_settings_lock", None)
@@ -5208,6 +6387,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 "enabled": bool(enabled),
             }
         )
+        self.mark_ui_dirty("profile_fast_mode")
 
     def toggle_profile_fast_mode(self, profile: str) -> bool:
         enabled = not self.profile_fast_mode(profile)
@@ -5383,6 +6563,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 state["before_payload"] = before_payload
             self.reset_credit_state[profile] = state
             self.save_reset_credit_state_locked()
+        self.mark_ui_dirty("reset_credit_begin")
 
     def mark_reset_credit_attempt_error(
         self,
@@ -5399,6 +6580,7 @@ class ProvisionServer(ThreadingHTTPServer):
             state["error"] = str(error)[:500]
             state["guard_until"] = utc_timestamp(now + timedelta(seconds=RESET_CREDIT_ERROR_GUARD_SECONDS))
             self.save_reset_credit_state_locked()
+        self.mark_ui_dirty("reset_credit_error")
 
     def mark_reset_credit_outcome(
         self,
@@ -5427,6 +6609,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 state["status"] = outcome or "unknown"
                 state["guard_until"] = utc_timestamp(now + timedelta(seconds=RESET_CREDIT_ERROR_GUARD_SECONDS))
             self.save_reset_credit_state_locked()
+        self.mark_ui_dirty("reset_credit_outcome")
         if outcome == "reset":
             self.schedule_reset_credit_verification(
                 profile,
@@ -5471,6 +6654,7 @@ class ProvisionServer(ThreadingHTTPServer):
             }
             self.append_reset_credit_event(event)
             self.append_stats_event(event)
+            self.mark_ui_dirty("reset_credit_verified")
         return verified
 
     def reset_credit_profiles_needing_verification(self) -> list[str]:
@@ -5657,6 +6841,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 ordered += 1
             self.next_session_tab_order = ordered
             self.save_session_tab_order_locked()
+        self.mark_ui_dirty("session_reorder")
 
     def observe_session(
         self,
@@ -5697,6 +6882,7 @@ class ProvisionServer(ThreadingHTTPServer):
         now = time.monotonic()
         self.ensure_session_tab_order_state()
         new_tab_order = key not in self.session_tab_order
+        new_session = key not in self.observed_sessions
         record = self.observed_sessions.setdefault(
             key,
             {
@@ -5708,6 +6894,11 @@ class ProvisionServer(ThreadingHTTPServer):
                 "tab_order": self.session_tab_order_for_key_locked(key),
             },
         )
+        previous_cwd = str(record.get("cwd") or "")
+        previous_profile = str(record.get("last_profile") or "")
+        previous_control_path = str(record.get("control_path") or "")
+        previous_pty_managed = bool(record.get("pty_managed"))
+        previous_launcher_pid = record.get("launcher_pid")
         record["tab_order"] = self.session_tab_order_for_key_locked(key)
         record["cwd"] = cwd
         record["display"] = compact_session_path(cwd)
@@ -5728,6 +6919,17 @@ class ProvisionServer(ThreadingHTTPServer):
             record.pop("launcher_pid", None)
         if new_tab_order:
             self.save_session_tab_order_locked()
+        state_changed = (
+            new_session
+            or new_tab_order
+            or previous_cwd != str(record.get("cwd") or "")
+            or previous_profile != str(record.get("last_profile") or "")
+            or previous_control_path != str(record.get("control_path") or "")
+            or previous_pty_managed != bool(record.get("pty_managed"))
+            or previous_launcher_pid != record.get("launcher_pid")
+        )
+        if state_changed:
+            self.mark_ui_dirty("session_observe")
 
     def session_pinned_locked(self, session_key: str | None) -> bool:
         return bool(session_key and session_key in self.pinned_sessions)
@@ -5766,6 +6968,7 @@ class ProvisionServer(ThreadingHTTPServer):
             record["last_seen_monotonic"] = time.monotonic()
             record["last_seen_at"] = datetime.now().astimezone()
             self.save_pinned_sessions_locked()
+        self.mark_ui_dirty("session_pin")
 
     def unpin_session(self, session_key: str, profile: str | None = None) -> None:
         with self.active_lock:
@@ -5779,6 +6982,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 record["last_seen_monotonic"] = time.monotonic()
                 record["last_seen_at"] = datetime.now().astimezone()
             self.save_pinned_sessions_locked()
+        self.mark_ui_dirty("session_unpin")
 
     def active_profile_for_session_locked(self, session_key: str) -> str | None:
         self.expire_websocket_work_locked()
@@ -5805,12 +7009,16 @@ class ProvisionServer(ThreadingHTTPServer):
                 "session_key": session_key,
                 "started_monotonic": time.monotonic(),
             }
-            return request_id
+        self.mark_ui_dirty("request_begin")
+        return request_id
 
     def end_request(self, request_id: int | None) -> None:
+        changed = False
         with self.active_lock:
             if request_id is not None:
-                self.active_requests.pop(request_id, None)
+                changed = self.active_requests.pop(request_id, None) is not None
+        if changed:
+            self.mark_ui_dirty("request_end")
 
     def request_count(self, *, blocking_only: bool = False) -> int:
         with self.active_lock:
@@ -5848,7 +7056,8 @@ class ProvisionServer(ThreadingHTTPServer):
                 "messages_down": 0,
                 "service_tier": None,
             }
-            return tunnel_id
+        self.mark_ui_dirty("websocket_begin")
+        return tunnel_id
 
     def attach_websocket_session(
         self,
@@ -5863,6 +7072,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 tunnel["session_key"] = session_key
                 profile = profile or str(tunnel.get("profile") or "")
             self.observe_session_locked(session_key, cwd, profile)
+        self.mark_ui_dirty("websocket_session")
 
     def attach_websocket_upstream(self, tunnel_id: int, upstream: socket.socket) -> None:
         with self.active_lock:
@@ -5885,12 +7095,14 @@ class ProvisionServer(ThreadingHTTPServer):
                     record["thread_id"] = thread_id
                     record["last_seen_monotonic"] = time.monotonic()
                     record["last_seen_at"] = datetime.now().astimezone()
+        self.mark_ui_dirty("websocket_thread")
 
     def touch_websocket_data(self, tunnel_id: int) -> None:
         with self.active_lock:
             tunnel = self.active_websockets.get(tunnel_id)
             if tunnel is not None:
                 tunnel["last_data_activity_monotonic"] = time.monotonic()
+        self.mark_ui_dirty("websocket_data")
 
     def note_websocket_traffic(
         self,
@@ -5911,6 +7123,7 @@ class ProvisionServer(ThreadingHTTPServer):
             tunnel[message_key] = int(tunnel.get(message_key) or 0) + max(0, message_count)
             if service_tier:
                 tunnel["service_tier"] = service_tier
+        self.mark_ui_dirty("websocket_traffic")
 
     def websocket_service_tier(self, tunnel_id: int) -> str | None:
         with self.active_lock:
@@ -5947,7 +7160,7 @@ class ProvisionServer(ThreadingHTTPServer):
         if existing.endswith(("\n", "\r")):
             return ""
         if (
-            re.match(r"\s*(?:[-*+]\s+|\d+\.\s+|#{1,6}\s+|>\s?|```)", text)
+            re.match(r"\s*(?:[-*+]\s+|-\d+\s+|\d+\.\s+|#{1,6}\s+|>\s?|```)", text)
             and not cls.transcript_line_has_open_markdown_span(existing_line)
         ):
             return "\n"
@@ -6163,6 +7376,7 @@ class ProvisionServer(ThreadingHTTPServer):
             text = clean_control_user_text(text)
         if not session_key or not text:
             return
+        self.mark_ui_dirty("transcript")
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         transcript = self.control_transcripts.setdefault(session_key, [])
         if role == "user" and not turn_id and not append:
@@ -6408,6 +7622,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 tunnel["saw_tool_output"] = False
                 tunnel["completion_deadline_monotonic"] = None
                 tunnel["last_data_activity_monotonic"] = time.monotonic()
+        self.mark_ui_dirty("websocket_work_begin")
 
     def mark_websocket_tool_output(self, tunnel_id: int) -> None:
         with self.active_lock:
@@ -6415,6 +7630,7 @@ class ProvisionServer(ThreadingHTTPServer):
             if tunnel is not None and int(tunnel.get("pending_work") or 0) > 0:
                 tunnel["saw_tool_output"] = True
                 tunnel["last_data_activity_monotonic"] = time.monotonic()
+        self.mark_ui_dirty("websocket_tool_output")
 
     def complete_websocket_response(
         self,
@@ -6437,6 +7653,7 @@ class ProvisionServer(ThreadingHTTPServer):
             tunnel["saw_tool_output"] = has_tool_output
             tunnel["completion_deadline_monotonic"] = now + fallback
             tunnel["last_data_activity_monotonic"] = now
+        self.mark_ui_dirty("websocket_work_complete")
 
     def finish_websocket_work(self, tunnel_id: int) -> None:
         with self.active_lock:
@@ -6447,6 +7664,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 tunnel["saw_tool_output"] = False
                 tunnel["completion_deadline_monotonic"] = None
                 tunnel["last_data_activity_monotonic"] = time.monotonic()
+        self.mark_ui_dirty("websocket_work_finish")
 
     def finish_websocket_work_for_turn(self, turn_id: str) -> int:
         finished = 0
@@ -6460,6 +7678,8 @@ class ProvisionServer(ThreadingHTTPServer):
                 tunnel["completion_deadline_monotonic"] = None
                 tunnel["last_data_activity_monotonic"] = time.monotonic()
                 finished += 1
+        if finished:
+            self.mark_ui_dirty("websocket_work_finish")
         return finished
 
     def session_for_turn_ids(self, turn_ids: list[str]) -> dict[str, str] | None:
@@ -6491,8 +7711,11 @@ class ProvisionServer(ThreadingHTTPServer):
                 tunnel["completion_deadline_monotonic"] = None
 
     def end_websocket(self, tunnel_id: int) -> None:
+        changed = False
         with self.active_lock:
-            self.active_websockets.pop(tunnel_id, None)
+            changed = self.active_websockets.pop(tunnel_id, None) is not None
+        if changed:
+            self.mark_ui_dirty("websocket_end")
 
     def websocket_count(self, *, blocking_only: bool = False) -> int:
         with self.active_lock:
@@ -6565,6 +7788,8 @@ class ProvisionServer(ThreadingHTTPServer):
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+        if count:
+            self.mark_ui_dirty("websocket_close")
         return count
 
     def control_transcript_snapshot(self, session_key: str) -> list[dict[str, Any]]:
@@ -6744,11 +7969,11 @@ class ProvisionServer(ThreadingHTTPServer):
                 quota_snapshot,
                 str(model_setting.get("model") or ""),
             )
-            snapshot["resume_candidates"] = self.resume_candidates_for_cwd(str(snapshot.get("cwd") or ""))
         return snapshots
 
-    def control_plane_sessions(self) -> dict[str, Any]:
-        sessions = self.session_snapshots()
+    def control_plane_sessions(self, sessions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        if sessions is None:
+            sessions = self.session_snapshots()
         by_key = {
             str(session.get("key") or ""): dict(session, events=[], active_details={})
             for session in sessions
@@ -6833,19 +8058,27 @@ class ProvisionServer(ThreadingHTTPServer):
             "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "interaction": {
                 "available": pty_available,
-                "app_server_interactive": bool(
-                    isinstance(control_status, dict) and control_status.get("interactive")
+                "mode": "pty",
+                "app_server_interactive_api": bool(
+                    isinstance(control_status, dict) and control_status.get("interactive_api")
                 ),
+                "app_server_turn_control": False,
                 "reason": "PTY-managed Codex CLI input is available."
                 if pty_available
                 else "Launch or resume a Codex CLI session with `provision` in an interactive terminal to enable live UI input.",
             },
         }
 
-    def pinned_sessions_for_profile(self, profile: str) -> list[dict[str, Any]]:
+    def pinned_sessions_for_profile(
+        self,
+        profile: str,
+        sessions: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        if sessions is None:
+            sessions = self.session_snapshots()
         return [
             session
-            for session in self.session_snapshots()
+            for session in sessions
             if session.get("pinned_profile") == profile
         ]
 
@@ -6934,6 +8167,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 stale_payload = entry.get("payload")
                 stale_fetched_at = entry.get("fetched_at")
                 fetch_event.set()
+            self.mark_ui_dirty("usage_error")
             if isinstance(stale_payload, dict):
                 return stale_payload, stale_fetched_at, "stale"
             raise
@@ -6949,6 +8183,7 @@ class ProvisionServer(ThreadingHTTPServer):
             entry.pop("billing_required", None)
             entry["event"] = None
             fetch_event.set()
+        self.mark_ui_dirty("usage_fetch")
         self.clear_profile_login_required(profile)
         self.clear_profile_billing_required(profile)
         self.append_stats_event(
@@ -6986,6 +8221,7 @@ class ProvisionServer(ThreadingHTTPServer):
             entry.pop("billing_required", None)
             entry["source"] = source
             current_payload = entry.get("payload")
+        self.mark_ui_dirty("usage_observation")
         self.clear_profile_login_required(profile)
         self.clear_profile_billing_required(profile)
         if isinstance(current_payload, dict):
@@ -7068,6 +8304,70 @@ class ProvisionServer(ThreadingHTTPServer):
             if auth_target.exists():
                 self.store.import_auth_file(profile, auth_target, overwrite=True, set_active=False)
             return result
+
+    def profile_model_catalog_snapshot(self, profile: str) -> dict[str, Any]:
+        """Return the latest read-only model/list result and refresh it when stale."""
+        fallback = model_catalog()
+        now = time.monotonic()
+        should_refresh = False
+        with self.app_server_model_catalog_lock:
+            entry = self.app_server_model_catalog_cache.setdefault(profile, {})
+            fetched = entry.get("fetched_monotonic")
+            failed = entry.get("failed_monotonic")
+            fresh = isinstance(fetched, (int, float)) and now - fetched < APP_SERVER_MODEL_CATALOG_CACHE_SECONDS
+            recent_failure = isinstance(failed, (int, float)) and now - failed < APP_SERVER_MODEL_CATALOG_ERROR_BACKOFF_SECONDS
+            if not fresh and not recent_failure and not entry.get("in_flight"):
+                entry["in_flight"] = True
+                should_refresh = True
+            cached_catalog = entry.get("catalog")
+            catalog = [dict(item) for item in cached_catalog] if isinstance(cached_catalog, tuple) else fallback
+            snapshot = {
+                "catalog": catalog,
+                "source": str(entry.get("source") or "bundled-fallback"),
+                "available": bool(entry.get("available")),
+                "loading": bool(entry.get("in_flight")),
+                "error": str(entry.get("error") or ""),
+                "updated_at": str(entry.get("updated_at") or ""),
+            }
+        if should_refresh:
+            threading.Thread(
+                target=self.refresh_profile_model_catalog,
+                args=(profile,),
+                name=f"provision-app-server-model-list-{profile}",
+                daemon=True,
+            ).start()
+        return snapshot
+
+    def refresh_profile_model_catalog(self, profile: str) -> None:
+        try:
+            result = self.run_app_server_for_profile(profile, lambda client: client.list_models())
+            catalog = normalize_codex_model_catalog(result)
+            if not catalog:
+                raise CodexAppServerError("model/list returned no visible models")
+        except (StoreError, CodexAppServerError, OSError, json.JSONDecodeError) as exc:
+            with self.app_server_model_catalog_lock:
+                entry = self.app_server_model_catalog_cache.setdefault(profile, {})
+                entry["in_flight"] = False
+                entry["failed_monotonic"] = time.monotonic()
+                entry["error"] = str(exc)
+            self.log_message("app-server model/list for profile %s failed: %s", profile, exc)
+            self.mark_ui_dirty("profile_model_catalog")
+            return
+        with self.app_server_model_catalog_lock:
+            entry = self.app_server_model_catalog_cache.setdefault(profile, {})
+            entry.update(
+                {
+                    "catalog": tuple(dict(item) for item in catalog),
+                    "source": "app-server",
+                    "available": True,
+                    "error": "",
+                    "fetched_monotonic": time.monotonic(),
+                    "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "in_flight": False,
+                }
+            )
+            entry.pop("failed_monotonic", None)
+        self.mark_ui_dirty("profile_model_catalog")
 
     def control_profile_for_session(self, session_key: str) -> str:
         pinned = self.pinned_profile_for_session(session_key)
@@ -7212,99 +8512,6 @@ class ProvisionServer(ThreadingHTTPServer):
             "ok": True,
             "mode": "pty",
         }
-
-    def run_session_prompt_turn(
-        self,
-        *,
-        session_key: str,
-        profile: str,
-        cwd: str,
-        thread_id: str,
-        prompt: str,
-        model: str,
-        effort: str,
-        service_tier: str | None,
-    ) -> None:
-        started_turn_id = ""
-
-        def send(client: CodexAppServerClient) -> Any:
-            nonlocal started_turn_id
-            fork = client.fork_thread(thread_id=thread_id, cwd=cwd)
-            forked_thread_id = thread_id_from_app_server_value(fork) or thread_id
-            result = client.start_turn(
-                thread_id=forked_thread_id,
-                text=prompt,
-                cwd=cwd,
-                model=model,
-                effort=effort,
-                service_tier=service_tier,
-            )
-            started_turn_id = turn_id_from_app_server_value(result) or ""
-            self.append_control_transcript(
-                session_key=session_key,
-                role="user",
-                text=prompt,
-                turn_id=started_turn_id,
-                profile=profile,
-            )
-            self.capture_app_server_turn(
-                client,
-                session_key=session_key,
-                profile=profile,
-                turn_id=started_turn_id,
-            )
-            return result
-
-        try:
-            self.run_app_server_for_profile(profile, send, include_history=True)
-        except (StoreError, CodexAppServerError, AuthError, OSError, json.JSONDecodeError) as exc:
-            self.log_message("session prompt background turn failed for %s: %s", session_key, exc)
-            self.append_control_transcript(
-                session_key=session_key,
-                role="error",
-                text=f"Session interaction failed: {exc}",
-                turn_id=started_turn_id,
-                profile=profile,
-            )
-
-    def capture_app_server_turn(
-        self,
-        client: CodexAppServerClient,
-        *,
-        session_key: str,
-        profile: str,
-        turn_id: str,
-    ) -> None:
-        deadline = time.monotonic() + CODEX_APP_SERVER_TURN_TIMEOUT_SECONDS
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self.append_control_transcript(
-                    session_key=session_key,
-                    role="error",
-                    text="Session interaction timed out before Codex reported turn completion.",
-                    turn_id=turn_id,
-                    profile=profile,
-                )
-                return
-            message = client.read_message(min(1.0, remaining))
-            if message is None:
-                continue
-            for entry in app_server_transcript_entries_from_message(message):
-                self.append_control_transcript(
-                    session_key=session_key,
-                    role=str(entry.get("role") or "message"),
-                    text=str(entry.get("text") or ""),
-                    turn_id=str(entry.get("turn_id") or turn_id),
-                    profile=profile,
-                    append=bool(entry.get("append")),
-                    call_id=str(entry.get("call_id") or ""),
-                )
-            method = app_server_message_method(message)
-            if method == "turn/completed":
-                completed_turn_id = app_server_message_turn_id(message)
-                if not turn_id or not completed_turn_id or completed_turn_id == turn_id:
-                    return
 
     def consume_profile_rate_limit_reset_credit(
         self,
@@ -7479,6 +8686,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 paths.stats.chmod(0o600)
             except OSError:
                 return
+        self.mark_ui_dirty("stats")
 
     def record_http_stats(
         self,
@@ -7749,6 +8957,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 "message": LOGIN_BROWSER_REMOTE_NOTE if not device_auth else "",
                 "cancel_requested": False,
             }
+        self.mark_ui_dirty("login_start")
         thread = threading.Thread(
             target=self.run_profile_login,
             args=(profile, capture, device_auth),
@@ -7868,6 +9077,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 job["auth_url"] = auth_url
             if user_code:
                 job["user_code"] = user_code
+        self.mark_ui_dirty("login_output")
 
     def finish_profile_login(self, profile: str, status: str, message: str) -> None:
         with self.login_jobs_lock:
@@ -7879,6 +9089,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 job["error"] = message
             else:
                 job["message"] = message
+        self.mark_ui_dirty("login_finish")
 
     def cancel_profile_login(self, profile: str) -> None:
         if not self.store.profile_exists(profile):
@@ -7892,6 +9103,7 @@ class ProvisionServer(ThreadingHTTPServer):
             job["cancel_requested"] = True
             job["message"] = "Cancel requested."
             process = self.login_processes.get(profile)
+        self.mark_ui_dirty("login_cancel")
         if process is None:
             return
         if process.poll() is None:
@@ -8105,7 +9317,11 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/pin-session":
             self.handle_pin_session()
             return
-        if parsed.path in ("/v1/responses", "/v1/responses/compact"):
+        if parsed.path in (
+            "/v1/responses",
+            "/v1/responses/compact",
+            "/v1/images/generations",
+        ):
             self.proxy_to_upstream("POST", parsed)
             return
         if self.is_chatgpt_backend_proxy_path(parsed.path):
@@ -8141,6 +9357,7 @@ class Handler(BaseHTTPRequestHandler):
         except StoreError as exc:
             self.send_json({"error": str(exc)}, status=400)
             return
+        self.server.mark_ui_dirty("profile_switch")
         self.server.close_websocket_tunnels(blocking_only=True)
         self.redirect_ui()
 
@@ -8360,19 +9577,46 @@ class Handler(BaseHTTPRequestHandler):
 
         self.accept_websocket(key)
         self.close_connection = True
-        self.connection.settimeout(1.0)
-        self.send_ui_state()
+        self.connection.settimeout(UI_STATE_CHECK_SECONDS)
+        last_sent_version = self.send_ui_state()
+        last_liveness_signature = self.server.ui_state_liveness_signature()
+        last_safety_snapshot = time.monotonic()
+        last_heartbeat = last_safety_snapshot
         try:
             while True:
                 try:
                     message = self.read_websocket_json()
                 except socket.timeout:
-                    self.send_ui_state()
+                    (
+                        last_sent_version,
+                        last_liveness_signature,
+                        last_safety_snapshot,
+                        last_heartbeat,
+                    ) = self.send_ui_state_if_needed(
+                        last_sent_version=last_sent_version,
+                        last_liveness_signature=last_liveness_signature,
+                        last_safety_snapshot=last_safety_snapshot,
+                        last_heartbeat=last_heartbeat,
+                    )
                     continue
                 if message is None:
-                    self.send_ui_state()
+                    (
+                        last_sent_version,
+                        last_liveness_signature,
+                        last_safety_snapshot,
+                        last_heartbeat,
+                    ) = self.send_ui_state_if_needed(
+                        last_sent_version=last_sent_version,
+                        last_liveness_signature=last_liveness_signature,
+                        last_safety_snapshot=last_safety_snapshot,
+                        last_heartbeat=last_heartbeat,
+                    )
                     continue
                 self.handle_ui_websocket_action(message)
+                last_sent_version = self.server.ui_state_revision()
+                last_liveness_signature = self.server.ui_state_liveness_signature()
+                last_safety_snapshot = time.monotonic()
+                last_heartbeat = last_safety_snapshot
         except WebSocketClosed:
             return
         except (BrokenPipeError, ConnectionResetError, OSError) as exc:
@@ -8405,6 +9649,7 @@ class Handler(BaseHTTPRequestHandler):
             except StoreError as exc:
                 self.send_ui_state(message=str(exc))
                 return
+            self.server.mark_ui_dirty("profile_switch")
             self.server.close_websocket_tunnels(blocking_only=True)
             self.send_ui_state()
             return
@@ -8560,6 +9805,78 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_ui_state()
             return
+        if action == "load_history_turn":
+            session_key = str(message.get("session_key") or "")
+            turn_key = str(message.get("turn_key") or "")
+            try:
+                payload = self.server.history_turn_payload_for_session(session_key, turn_key)
+            except StoreError as exc:
+                self.send_websocket_json(
+                    {
+                        "type": "history_turn",
+                        "ok": False,
+                        "session_key": session_key,
+                        "turn_key": turn_key,
+                        "error": str(exc),
+                    }
+                )
+                return
+            self.send_websocket_json(
+                {
+                    "type": "history_turn",
+                    "ok": True,
+                    "session_key": session_key,
+                    "turn_key": turn_key,
+                    "payload": payload,
+                }
+            )
+            return
+        if action == "load_history_index":
+            session_key = str(message.get("session_key") or "")
+            try:
+                turns = self.server.history_turn_index_for_session(session_key)
+            except StoreError as exc:
+                self.send_websocket_json(
+                    {
+                        "type": "history_index",
+                        "ok": False,
+                        "session_key": session_key,
+                        "error": str(exc),
+                    }
+                )
+                return
+            self.send_websocket_json(
+                {
+                    "type": "history_index",
+                    "ok": True,
+                    "session_key": session_key,
+                    "turns": turns,
+                }
+            )
+            return
+        if action == "load_resume_candidates":
+            session_key = str(message.get("session_key") or "")
+            try:
+                candidates = self.server.resume_candidates_for_session(session_key)
+            except StoreError as exc:
+                self.send_websocket_json(
+                    {
+                        "type": "resume_candidates",
+                        "ok": False,
+                        "session_key": session_key,
+                        "error": str(exc),
+                    }
+                )
+                return
+            self.send_websocket_json(
+                {
+                    "type": "resume_candidates",
+                    "ok": True,
+                    "session_key": session_key,
+                    "candidates": candidates,
+                }
+            )
+            return
         self.send_ui_state(message=f"Unknown action: {action}")
 
     def send_ui_state(
@@ -8568,16 +9885,179 @@ class Handler(BaseHTTPRequestHandler):
         message: str | None = None,
         pending_action: str | None = None,
         pending_profile: str | None = None,
-    ) -> None:
+    ) -> int:
+        version = self.server.ui_state_revision()
         self.send_websocket_json(
             {
                 "type": "state",
                 "message": message,
                 "pending_action": pending_action,
                 "pending_profile": pending_profile,
+                "ui_state_version": version,
                 "status": self.ui_status_payload(),
             }
         )
+        return version
+
+    def ui_delta_sections_for_reasons(
+        self,
+        reasons: set[str],
+        *,
+        liveness_changed: bool = False,
+    ) -> set[str]:
+        clean = {str(reason or "state") for reason in reasons}
+        if "state" in clean:
+            return {"full"}
+        sections = {"base"}
+        if liveness_changed:
+            sections.update({"profiles", "control_plane"})
+
+        for reason in clean:
+            if reason in {
+                "profile_switch",
+                "profile_model",
+                "profile_fast_mode",
+                "login_required",
+                "login_required_clear",
+                "billing_required",
+                "billing_required_clear",
+                "usage_error",
+                "usage_fetch",
+                "usage_observation",
+                "reset_credit_begin",
+                "reset_credit_error",
+                "reset_credit_outcome",
+                "reset_credit_verified",
+                "login_start",
+                "login_output",
+                "login_finish",
+                "login_cancel",
+            }:
+                sections.add("profiles")
+                continue
+            if reason in {
+                "request_begin",
+                "request_end",
+                "websocket_begin",
+                "websocket_end",
+                "websocket_close",
+                "websocket_work_begin",
+                "websocket_work_complete",
+                "websocket_work_finish",
+            }:
+                sections.update({"profiles", "control_plane"})
+                continue
+            if reason in {
+                "session_observe",
+                "session_pin",
+                "session_unpin",
+                "session_reorder",
+                "session_forget",
+                "ui_launcher_start",
+                "ui_launcher_exit",
+                "websocket_session",
+                "websocket_thread",
+                "websocket_data",
+                "websocket_traffic",
+                "websocket_tool_output",
+                "transcript",
+            }:
+                sections.add("control_plane")
+                if reason in {"session_observe", "session_pin", "session_unpin", "session_reorder", "session_forget"}:
+                    sections.add("profiles")
+                continue
+            if reason == "stats":
+                sections.add("stats")
+                continue
+            return {"full"}
+        return sections
+
+    def ui_status_delta_payload(self, sections: set[str]) -> dict[str, Any]:
+        if "full" in sections:
+            return self.ui_status_payload()
+        status = self.status_payload(include_profiles=False)
+        full_status: dict[str, Any] | None = None
+        if "profiles" in sections:
+            full_status = self.ui_status_payload(
+                include_control_plane="control_plane" in sections,
+            )
+            status["sessions"] = full_status.get("sessions", [])
+            status["profiles"] = full_status.get("profiles", [])
+        if "control_plane" in sections:
+            status["control_plane"] = (
+                full_status.get("control_plane", {})
+                if full_status is not None
+                else self.server.control_plane_sessions()
+            )
+        if "stats" in sections:
+            status["stats"] = self.server.stats_summary()
+        if "model_catalog" in sections:
+            status["model_catalog"] = model_catalog()
+        return status
+
+    def send_ui_delta(
+        self,
+        *,
+        reasons: set[str],
+        liveness_changed: bool = False,
+    ) -> int:
+        sections = self.ui_delta_sections_for_reasons(reasons, liveness_changed=liveness_changed)
+        if "full" in sections:
+            return self.send_ui_state()
+        version = self.server.ui_state_revision()
+        self.send_websocket_json(
+            {
+                "type": "state_delta",
+                "ui_state_version": version,
+                "sections": sorted(sections),
+                "reasons": sorted(reasons),
+                "status": self.ui_status_delta_payload(sections),
+            }
+        )
+        return version
+
+    def send_ui_heartbeat(self) -> None:
+        self.send_websocket_json(
+            {
+                "type": "heartbeat",
+                "ui_state_version": self.server.ui_state_revision(),
+                "live_busy": bool(self.status_payload().get("live_busy")),
+                "sent_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+        )
+
+    def send_ui_state_if_needed(
+        self,
+        *,
+        last_sent_version: int,
+        last_liveness_signature: tuple[Any, ...],
+        last_safety_snapshot: float,
+        last_heartbeat: float,
+    ) -> tuple[int, tuple[Any, ...], float, float]:
+        now = time.monotonic()
+        current_version = self.server.ui_state_revision()
+        current_liveness_signature = self.server.ui_state_liveness_signature()
+        safety_due = now - last_safety_snapshot >= UI_SAFETY_SNAPSHOT_SECONDS
+        liveness_changed = current_liveness_signature != last_liveness_signature
+        state_due = (
+            current_version != last_sent_version
+            or liveness_changed
+            or safety_due
+        )
+        if state_due:
+            if safety_due:
+                sent_version = self.send_ui_state()
+            else:
+                reasons = self.server.ui_state_dirty_reasons_since(last_sent_version)
+                sent_version = self.send_ui_delta(
+                    reasons=reasons,
+                    liveness_changed=liveness_changed,
+                )
+            return sent_version, current_liveness_signature, now, now
+        if now - last_heartbeat >= UI_HEARTBEAT_SECONDS:
+            self.send_ui_heartbeat()
+            return last_sent_version, last_liveness_signature, last_safety_snapshot, now
+        return last_sent_version, last_liveness_signature, last_safety_snapshot, last_heartbeat
 
     def read_websocket_json(self) -> dict[str, Any] | None:
         frame = self.read_websocket_frame()
@@ -9396,7 +10876,12 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return False
 
-    def status_payload(self, *, include_profiles: bool = False) -> dict[str, Any]:
+    def status_payload(
+        self,
+        *,
+        include_profiles: bool = False,
+        include_control_plane: bool = True,
+    ) -> dict[str, Any]:
         active_requests = self.server.request_count()
         active_websockets = self.server.websocket_count()
         pending_work = self.server.pending_websocket_work_count()
@@ -9425,8 +10910,10 @@ class Handler(BaseHTTPRequestHandler):
             "switch_block_reason": self.server.switch_block_reason(),
         }
         if include_profiles:
-            payload["sessions"] = self.server.session_snapshots()
-            payload["control_plane"] = self.server.control_plane_sessions()
+            sessions = self.server.session_snapshots()
+            payload["sessions"] = sessions
+            if include_control_plane:
+                payload["control_plane"] = self.server.control_plane_sessions(sessions)
             profiles = []
             for profile in self.server.store.list_profiles():
                 item = dict(profile)
@@ -9439,8 +10926,16 @@ class Handler(BaseHTTPRequestHandler):
             payload["profiles"] = profiles
         return payload
 
-    def ui_status_payload(self) -> dict[str, Any]:
-        status = self.status_payload(include_profiles=True)
+    def ui_status_payload(
+        self,
+        *,
+        include_html: bool = False,
+        include_control_plane: bool = True,
+    ) -> dict[str, Any]:
+        status = self.status_payload(
+            include_profiles=True,
+            include_control_plane=include_control_plane,
+        )
         status["model_catalog"] = model_catalog()
         status["stats"] = self.server.stats_summary()
         for profile in status["profiles"]:
@@ -9460,16 +10955,15 @@ class Handler(BaseHTTPRequestHandler):
                 snapshot["reset_credit"] = reset_credit
             profile["fast_mode"] = self.server.profile_fast_mode(name)
             profile["model_setting"] = self.server.profile_model_setting(name)
+            profile_catalog = self.server.profile_model_catalog_snapshot(name)
+            profile["model_catalog"] = profile_catalog["catalog"]
+            profile["model_catalog_status"] = {
+                key: value for key, value in profile_catalog.items() if key != "catalog"
+            }
             profile["login_required"] = self.server.profile_login_required(name)
             profile["auth_health"] = self.server.profile_auth_health(name)
-            profile["auth_health_html"] = render_auth_health_html(profile["auth_health"])
             profile["billing_required"] = billing_required
             profile["login_status"] = self.server.login_status(name)
-            profile["login_status_html"] = render_login_status_html(
-                profile["login_status"],
-                name,
-                self.server.proxy_token,
-            )
             profile["quota_summary"] = usage_cache_summary(snapshot)
             profile["quota_updated"] = quota_updated_label(snapshot)
             profile["quota_has_payload"] = isinstance(payload, dict)
@@ -9477,22 +10971,36 @@ class Handler(BaseHTTPRequestHandler):
                 str(snapshot.get("error") or "") if isinstance(snapshot, dict) else ""
             )
             profile["reset_credit"] = reset_credit
-            profile["quota_html"] = render_quota_html(
-                snapshot,
-                profile["quota_updated"],
-                name,
-                self.server.proxy_token,
-            )
+            profile["quota"] = quota_panel_payload(snapshot, profile["quota_updated"])
             profile["switch_disabled_reason"] = self.switch_disabled_reason(profile, status)
             profile["switch_button_label"] = self.switch_button_label(profile, status)
-            profile["pinned_sessions"] = self.server.pinned_sessions_for_profile(name)
+            sessions = status.get("sessions")
+            profile["pinned_sessions"] = self.server.pinned_sessions_for_profile(
+                name,
+                sessions if isinstance(sessions, list) else None,
+            )
             profile["has_active_sessions"] = self.server.profile_has_active_sessions(name)
             profile["has_active_pinned_sessions"] = self.server.profile_has_active_sessions(
                 name,
                 pinned_only=True,
             )
+            profile["login_status_html"] = render_login_status_html(
+                profile["login_status"],
+                name,
+                self.server.proxy_token,
+            )
             profile["pin_menu_html"] = self.render_pin_menu(profile, status)
             profile["pinned_sessions_html"] = self.render_pinned_sessions(profile)
+            if include_html:
+                profile["auth_health_html"] = render_auth_health_html(profile["auth_health"])
+                profile["quota_html"] = render_quota_html(
+                    snapshot,
+                    profile["quota_updated"],
+                    name,
+                    self.server.proxy_token,
+                )
+            if profile.get("active"):
+                status["model_catalog"] = profile_catalog["catalog"]
         return status
 
     def switch_disabled_reason(self, profile: dict[str, Any], status: dict[str, Any]) -> str:
@@ -9702,14 +11210,20 @@ class Handler(BaseHTTPRequestHandler):
         token = html.escape(self.server.proxy_token)
         name = html.escape(profile_name)
         items: list[str] = []
-        for item in model_catalog():
+        profile_catalog = profile.get("model_catalog")
+        catalog = profile_catalog if isinstance(profile_catalog, list) and profile_catalog else model_catalog()
+        for item in catalog:
+            if not isinstance(item, dict):
+                continue
             model = str(item.get("id") or "")
             if not model:
                 continue
             display = str(item.get("display") or model)
             note = str(item.get("note") or "")
             selected_class = " selected" if model == current_model else ""
-            reasoning_levels = reasoning_levels_for_model(model)
+            reasoning_levels = item.get("reasoning")
+            if not isinstance(reasoning_levels, list) or not reasoning_levels:
+                reasoning_levels = reasoning_levels_for_model(model)
             reasoning_forms = []
             for reasoning in reasoning_levels:
                 reasoning_selected = model == current_model and reasoning == current_reasoning
@@ -9772,7 +11286,7 @@ class Handler(BaseHTTPRequestHandler):
         model_menu = self.render_model_menu(profile)
         token = html.escape(self.server.proxy_token)
         return f"""
-          <tr class="profile-row{active}" data-profile="{name}">
+          <tr class="profile-row{active}" data-profile="{name}" data-profile-key="{name}">
             <td class="profile-cell">
               <div class="profile-name">{name} <span class="profile-plan">({plan})</span></div>
               <div class="profile-email">{email}</div>
@@ -9795,7 +11309,7 @@ class Handler(BaseHTTPRequestHandler):
         """
 
     def render_ui(self) -> str:
-        status = self.ui_status_payload()
+        status = self.ui_status_payload(include_html=True)
         rows = self.render_profile_rows(status)
         active_profile = html.escape(str(status.get("active_profile") or "none"))
         active_requests = int(status.get("active_requests") or 0)
@@ -10840,6 +12354,10 @@ class Handler(BaseHTTPRequestHandler):
       display: grid;
       gap: 12px;
     }
+    .control-modal.discussion-view .control-content {
+      align-content: start;
+      grid-auto-rows: max-content;
+    }
     .control-modal.details-view .control-search,
     .control-modal.resume-view .control-search,
     .control-modal.details-view .control-compose,
@@ -10946,6 +12464,8 @@ class Handler(BaseHTTPRequestHandler):
 	      display: grid;
 	      gap: 8px;
 	      min-width: 0;
+	      align-content: start;
+	      grid-auto-rows: max-content;
 	    }
 	    .control-scroll-badge-row {
 	      position: sticky;
@@ -10992,6 +12512,7 @@ class Handler(BaseHTTPRequestHandler):
       background: var(--subtle);
       padding: 8px;
       min-width: 0;
+	      align-self: start;
     }
     .control-message.user {
       border-left: 3px solid var(--red);
@@ -11049,7 +12570,7 @@ class Handler(BaseHTTPRequestHandler):
       color: var(--ink);
       font-size: 13px;
       line-height: 1.45;
-      overflow-wrap: anywhere;
+      overflow-wrap: break-word;
       word-break: normal;
     }
     .control-message-text.plain {
@@ -11071,7 +12592,8 @@ class Handler(BaseHTTPRequestHandler):
       min-width: 0;
       max-width: 100%;
       margin: 0 0 8px;
-      overflow-wrap: anywhere;
+      overflow-wrap: break-word;
+      word-break: normal;
     }
     .control-message-text.markdown h1,
     .control-message-text.markdown h2,
@@ -11097,8 +12619,8 @@ class Handler(BaseHTTPRequestHandler):
       min-width: 0;
       max-width: 100%;
       margin: 3px 0;
-      overflow-wrap: anywhere;
-      word-break: break-word;
+      overflow-wrap: break-word;
+      word-break: normal;
       white-space: normal;
     }
     .control-message-text.markdown blockquote {
@@ -11256,20 +12778,75 @@ class Handler(BaseHTTPRequestHandler):
 	      color: var(--blue);
 	      background: rgba(59, 130, 214, 0.08);
 	    }
-	    .control-tool-command {
-	      min-width: 0;
-	      padding: 5px 7px;
-	      border: 1px solid var(--line);
-	      border-radius: 5px;
+		    .control-tool-command {
+		      min-width: 0;
+		      padding: 5px 7px;
+		      border: 1px solid var(--line);
+		      border-radius: 5px;
 	      background: var(--subtle);
 	      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-	      overflow-wrap: anywhere;
-	      white-space: pre-wrap;
-	    }
-	    .control-tool-sections {
+		      overflow-wrap: anywhere;
+		      white-space: pre-wrap;
+		    }
+	    .control-tool-special {
 	      display: grid;
 	      gap: 6px;
+	      padding: 7px;
+	      border: 1px solid var(--line);
+	      border-radius: 6px;
+	      background: color-mix(in srgb, var(--surface) 86%, var(--blue) 14%);
 	    }
+	    .control-tool-special-title {
+	      display: flex;
+	      align-items: center;
+	      justify-content: space-between;
+	      gap: 8px;
+	      font-size: 12px;
+	      font-weight: 850;
+	      color: var(--ink);
+	    }
+	    .control-tool-special-note {
+	      color: var(--muted);
+	      font-size: 12px;
+	    }
+	    .control-tool-plan-list {
+	      display: grid;
+	      gap: 4px;
+	    }
+	    .control-tool-plan-row {
+	      display: grid;
+	      grid-template-columns: 84px minmax(0, 1fr);
+	      gap: 7px;
+	      align-items: start;
+	      font-size: 12px;
+	    }
+	    .control-tool-plan-status {
+	      border: 1px solid var(--line);
+	      border-radius: 999px;
+	      padding: 1px 6px;
+	      color: var(--muted);
+	      background: var(--surface);
+	      text-align: center;
+	      font-size: 11px;
+	      font-weight: 800;
+	    }
+	    .control-tool-plan-status.completed {
+	      border-color: rgba(25, 135, 84, 0.34);
+	      color: var(--green);
+	      background: rgba(25, 135, 84, 0.08);
+	    }
+	    .control-tool-plan-status.in_progress {
+	      border-color: rgba(59, 130, 214, 0.34);
+	      color: var(--blue);
+	      background: rgba(59, 130, 214, 0.08);
+	    }
+	    .control-tool-plan-status.pending {
+	      color: var(--muted);
+	    }
+		    .control-tool-sections {
+		      display: grid;
+		      gap: 6px;
+		    }
 	    .control-tool-section {
 	      display: grid;
 	      gap: 3px;
@@ -11310,9 +12887,14 @@ class Handler(BaseHTTPRequestHandler):
       font-size: 12px;
       text-transform: uppercase;
     }
-    .control-tool-section.patch pre {
-      background: color-mix(in srgb, var(--surface) 88%, var(--blue) 12%);
-    }
+	    .control-tool-section.patch pre {
+	      background: color-mix(in srgb, var(--surface) 88%, var(--blue) 12%);
+	    }
+	    .control-tool-section.collapsed pre {
+	      max-height: none;
+	      overflow: hidden;
+	      color: var(--muted);
+	    }
     .tool-patch-line {
       display: block;
       min-height: 1.35em;
@@ -12295,6 +13877,7 @@ class Handler(BaseHTTPRequestHandler):
 	      <div class="top-meta">
 	        <span class="pill">Active <strong id="activeProfile">__ACTIVE_PROFILE__</strong></span>
 	        <span class="pill">Codex CLI <strong id="codexVersion">__CODEX_VERSION__</strong></span>
+	        <span id="codexRestartRequired" class="pill" hidden>Restart Provision</span>
 	        <span class="pill">Requests <strong id="activeRequests">__ACTIVE_REQUESTS__</strong></span>
 	        <span class="pill">Tunnels <strong id="activeTunnels">__ACTIVE_WEBSOCKETS__</strong></span>
 	        <span class="pill"><span id="proxyDot" class="dot"></span><span id="connectionState">Live (__BUSY__)</span></span>
@@ -12419,11 +14002,14 @@ class Handler(BaseHTTPRequestHandler):
 		    const CONTROL_TRANSCRIPT_WINDOW_STEP = 40;
 		    let socket = null;
 	    let reconnectTimer = null;
+	    let latestStatus = INITIAL.status || {};
 	    let latestLiveBusy = Boolean(INITIAL.status && INITIAL.status.live_busy);
 	    let latestStats = INITIAL.status && INITIAL.status.stats ? INITIAL.status.stats : { profiles: [], recent: [] };
 	    let latestModelCatalog = INITIAL.status && Array.isArray(INITIAL.status.model_catalog) ? INITIAL.status.model_catalog : [];
 	    let latestControlPlane = INITIAL.status && INITIAL.status.control_plane ? INITIAL.status.control_plane : { sessions: [] };
 	    let latestCodex = INITIAL.status && INITIAL.status.codex ? INITIAL.status.codex : {};
+	    let pendingRenderPacket = null;
+	    let pendingRenderFrame = null;
 	    let selectedControlSessionKey = "";
 		    let selectedLauncherSessionKey = "";
 		    let draggedSessionTabKey = "";
@@ -12442,10 +14028,17 @@ class Handler(BaseHTTPRequestHandler):
 		    let controlRenderDeferTimer = null;
 		    let controlTurnSelectInteracting = false;
 		    const controlScrollPositions = {};
-		    const controlInnerScrollPositions = {};
-		    const controlTranscriptWindows = {};
-		    const expandedControlMessages = {};
-		    const selectedControlTurnKeys = {};
+	    const controlInnerScrollPositions = {};
+	    const controlTranscriptWindows = {};
+	    const expandedControlMessages = {};
+	    const markdownRenderCache = new Map();
+	    const historyTurnCache = {};
+	    const historyTurnRequests = {};
+	    const historyTurnIndexes = {};
+	    const historyIndexRequests = {};
+	    const resumeCandidateIndexes = {};
+	    const resumeCandidateRequests = {};
+	    const selectedControlTurnKeys = {};
 		    const manuallySelectedControlTurnKeys = {};
 		    const latestObservedUserKeys = {};
 		    const followLatestTurnAfterUserInput = {};
@@ -12532,9 +14125,47 @@ class Handler(BaseHTTPRequestHandler):
 	      return restoreMarkdownTokens(html, inserts);
 	    }
 
-		    function repairStreamedMarkdownSource(value) {
-		      let source = String(value || "").replace(/\r\n?/g, "\n");
-		      source = source.replace(/\[\s*\n{2,}\s*([^\]\n]{1,160}?)\s*\]/g, (_match, label) => `[${label.trim()}]`);
+	    function parseJsonControlMessage(value) {
+	      const text = String(value || "").trim();
+	      if (!text || !/^[{[]/.test(text) || !/[}\]]$/.test(text)) return null;
+	      try {
+	        return JSON.parse(text);
+	      } catch {
+	        return null;
+	      }
+	    }
+
+	    function renderMarkdownCodeBlock(value, language = "") {
+	      const lang = language ? ` data-language="${escapeHtml(language)}"` : "";
+	      return `<pre${lang}><code>${escapeHtml(value)}</code></pre>`;
+	    }
+
+	    function renderJsonControlMessage(value) {
+	      const parsed = parseJsonControlMessage(value);
+	      if (parsed === null) return "";
+	      return renderMarkdownCodeBlock(JSON.stringify(parsed, null, 2), "json");
+	    }
+
+	    function cachedMarkdownRender(cacheKey, renderer) {
+	      if (markdownRenderCache.has(cacheKey)) {
+	        const value = markdownRenderCache.get(cacheKey);
+	        markdownRenderCache.delete(cacheKey);
+	        markdownRenderCache.set(cacheKey, value);
+	        return value;
+	      }
+	      const value = renderer();
+	      markdownRenderCache.set(cacheKey, value);
+	      while (markdownRenderCache.size > 600) {
+	        const first = markdownRenderCache.keys().next().value;
+	        markdownRenderCache.delete(first);
+	      }
+	      return value;
+	    }
+
+			    function repairStreamedMarkdownSource(value) {
+			      let source = String(value || "").replace(/\r\n?/g, "\n");
+			      source = source.replace(/^(\s*)~~~([A-Za-z0-9_.+-]*)\s*$/gm, "$1```$2");
+			      source = source.replace(/\[\s*\n{2,}\s*([^\]\n]{1,160}?)\s*\]/g, (_match, label) => `[${label.trim()}]`);
 		      source = source.replace(/\[([^\]\n]{1,120}?)\s*\n{2,}\s*([^\]\n]{1,120}?)\]/g, (_match, left, right) => {
 		        const label = `${left.trim()}${right.trim()}`;
 		        return label.length <= 180 ? `[${label}]` : _match;
@@ -12635,7 +14266,10 @@ class Handler(BaseHTTPRequestHandler):
 	        normalized = normalized.replace(/([^#\n])\s*(#{1,4}\s+\S)/g, "$1\n\n$2");
 	        normalized = normalized.replace(/([^\n])\s*([-*+]\s+\[[ xX]\]\s+\S)/g, "$1\n$2");
 	        normalized = normalized.replace(/([^\n])\s*([-*+]\s+\*\*\S)/g, "$1\n$2");
-	        normalized = normalized.replace(/([.!?:])\s*([-*+]\s+\S)/g, "$1\n$2");
+		        normalized = normalized.replace(/([.!?:])\s*([-*+]\s+\S)/g, "$1\n$2");
+		        normalized = normalized.replace(/([.!?:])\s*-(\d+)(\s+\S.*)$/g, "$1\n- $2$3");
+	        normalized = normalized.replace(/([A-Za-z0-9`)])-\s+([A-Z`])/g, "$1\n- $2");
+	        normalized = normalized.replace(/^(\s*)-(\d+)(\s+\S.*)$/g, "$1- $2$3");
 	        return normalized;
 	      };
 	      return lines.map((line) => {
@@ -12810,8 +14444,7 @@ class Handler(BaseHTTPRequestHandler):
 	            index += 1;
 	          }
 	          if (index < lines.length) index += 1;
-	          const lang = fence[1] ? ` data-language="${escapeHtml(fence[1])}"` : "";
-	          blocks.push(`<pre${lang}><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+	          blocks.push(renderMarkdownCodeBlock(codeLines.join("\n"), fence[1] || ""));
 	          continue;
 	        }
 	        const heading = line.match(/^\s{0,3}(#{1,4})\s+(.+)$/);
@@ -13347,11 +14980,10 @@ class Handler(BaseHTTPRequestHandler):
 	          return `<option value="${escapeHtml(key)}" ${key === selectedLauncherSessionKey ? "selected" : ""}>${escapeHtml(label)}</option>`;
 	        }).join("")
 		        : '<option value="">No observed workdirs</option>';
-		      select.disabled = !known.length;
-		      const selectedSession = known.find((session) => String(session.key || "") === selectedLauncherSessionKey) || null;
-		      const candidates = selectedSession && Array.isArray(selectedSession.resume_candidates)
-		        ? selectedSession.resume_candidates
-		        : [];
+	      select.disabled = !known.length;
+	      const selectedSession = known.find((session) => String(session.key || "") === selectedLauncherSessionKey) || null;
+	      if (selectedSession) requestResumeCandidates(selectedSession);
+	      const candidates = selectedSession ? resumeCandidatesForSession(selectedSession) : [];
 		      if (!launcherResumeSessionId || !candidates.some((candidate) => String(candidate.id || "") === launcherResumeSessionId)) {
 		        launcherResumeSessionId = candidates.length ? String(candidates[0].id || "") : "";
 		      }
@@ -13513,13 +15145,105 @@ class Handler(BaseHTTPRequestHandler):
 	      return String(turn && (turn.key || turn.turn_id || turn.start_index) || "");
 	    }
 
+	    function historyCacheKey(sessionKey, turnKey) {
+	      return `${sessionKey || ""}\u0001${turnKey || ""}`;
+	    }
+
+	    function historyTurnPayload(session, turn) {
+	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
+	      const turnKey = controlTurnKey(turn);
+	      return historyTurnCache[historyCacheKey(sessionKey, turnKey)] || null;
+	    }
+
+	    function requestHistoryTurn(session, turn) {
+	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
+	      const turnKey = controlTurnKey(turn);
+	      if (!sessionKey || !turnKey || !socket || socket.readyState !== WebSocket.OPEN) return false;
+	      const key = historyCacheKey(sessionKey, turnKey);
+	      if (historyTurnCache[key] || historyTurnRequests[key]) return false;
+	      historyTurnRequests[key] = true;
+	      socket.send(JSON.stringify({
+	        action: "load_history_turn",
+	        session_key: sessionKey,
+	        turn_key: turnKey,
+	        token: TOKEN
+	      }));
+	      return true;
+	    }
+
+	    function historyTurnsForSession(session) {
+	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
+	      if (Object.prototype.hasOwnProperty.call(historyTurnIndexes, sessionKey)) {
+	        return historyTurnIndexes[sessionKey];
+	      }
+	      return session && Array.isArray(session.history_turns) ? session.history_turns : [];
+	    }
+
+	    function requestHistoryIndex(session) {
+	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
+	      if (!sessionKey || !socket || socket.readyState !== WebSocket.OPEN) return false;
+	      if (
+	        Object.prototype.hasOwnProperty.call(historyTurnIndexes, sessionKey)
+	        || historyIndexRequests[sessionKey]
+	      ) return false;
+	      historyIndexRequests[sessionKey] = true;
+	      socket.send(JSON.stringify({
+	        action: "load_history_index",
+	        session_key: sessionKey,
+	        token: TOKEN
+	      }));
+	      return true;
+	    }
+
+	    function resumeCandidatesForSession(session) {
+	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
+	      if (Object.prototype.hasOwnProperty.call(resumeCandidateIndexes, sessionKey)) {
+	        return resumeCandidateIndexes[sessionKey];
+	      }
+	      return session && Array.isArray(session.resume_candidates) ? session.resume_candidates : [];
+	    }
+
+	    function requestResumeCandidates(session) {
+	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
+	      if (!sessionKey || !socket || socket.readyState !== WebSocket.OPEN) return false;
+	      if (
+	        Object.prototype.hasOwnProperty.call(resumeCandidateIndexes, sessionKey)
+	        || resumeCandidateRequests[sessionKey]
+	      ) return false;
+	      resumeCandidateRequests[sessionKey] = true;
+	      socket.send(JSON.stringify({
+	        action: "load_resume_candidates",
+	        session_key: sessionKey,
+	        token: TOKEN
+	      }));
+	      return true;
+	    }
+
 	    function controlTurns(session, transcript = null) {
-	      const turns = session && Array.isArray(session.turns) ? session.turns.slice() : [];
+	      const liveTurns = session && Array.isArray(session.turns)
+	        ? session.turns.map((turn) => ({ ...turn, source: turn.source || "live" }))
+	        : [];
+	      const historyTurns = historyTurnsForSession(session)
+	        .map((turn) => ({ ...turn, source: "history" }))
+	        .filter((historyTurn) => !liveTurns.some((liveTurn) => {
+	          const historyId = String(historyTurn.turn_id || "");
+	          const liveId = String(liveTurn.turn_id || "");
+	          if (historyId && liveId && !historyId.startsWith("history:")) return historyId === liveId;
+	          const historyLabel = String(historyTurn.label || "").trim().toLowerCase();
+	          const liveLabel = String(liveTurn.label || "").trim().toLowerCase();
+	          if (!historyLabel || historyLabel !== liveLabel) return false;
+	          const historyTime = Date.parse(String(historyTurn.timestamp || ""));
+	          const liveTime = Date.parse(String(liveTurn.timestamp || ""));
+	          return Number.isFinite(historyTime) && Number.isFinite(liveTime)
+	            && Math.abs(historyTime - liveTime) <= 15000;
+	        }));
+	      const turns = historyTurns.concat(liveTurns);
 	      if (turns.length) return turns;
 	      const rows = transcript || (session && Array.isArray(session.transcript) ? session.transcript : []);
 	      if (!rows.length) return [];
 	      return [{
 	        key: "observed-activity",
+	        source: "live",
 	        label: "Observed activity",
 	        start_index: 0,
 	        end_index: rows.length - 1,
@@ -13529,6 +15253,7 @@ class Handler(BaseHTTPRequestHandler):
 	    }
 
 	    function transcriptItemsForTurn(transcript, turn) {
+	      if (turn && turn.source === "history") return [];
 	      const start = Math.max(0, Number(turn && turn.start_index || 0));
 	      const end = Math.max(start, Number(turn && turn.end_index != null ? turn.end_index : start));
 	      return transcript.filter((item) => {
@@ -13537,23 +15262,35 @@ class Handler(BaseHTTPRequestHandler):
 	      });
 	    }
 
-	    function turnMatchesSearch(transcript, turn, query) {
+	    function turnTranscriptItems(session, transcript, turn) {
+	      if (turn && turn.source === "history") {
+	        const payload = historyTurnPayload(session, turn);
+	        return payload && Array.isArray(payload.transcript) ? payload.transcript : [];
+	      }
+	      return transcriptItemsForTurn(transcript, turn);
+	    }
+
+	    function turnMatchesSearch(transcript, turn, query, session = null) {
 	      if (!query) return true;
 	      const label = String(turn && turn.label || "").toLowerCase();
 	      const needle = query.toLowerCase();
 	      if (label.includes(needle)) return true;
-	      return transcriptItemsForTurn(transcript, turn).some((item) => controlTranscriptMatches(item, query));
+	      const searchText = String(turn && turn.search_text || "").toLowerCase();
+	      if (searchText.includes(needle)) return true;
+	      return turnTranscriptItems(session, transcript, turn).some((item) => controlTranscriptMatches(item, query));
 	    }
 
-	    function turnOptionLabel(turn, transcript, query) {
+	    function turnOptionLabel(turn, transcript, query, session = null) {
 	      const when = turn && turn.timestamp ? formatEventTime(turn.timestamp) : "";
 	      const label = String(turn && turn.label || turn && turn.turn_id || "Observed turn");
 	      let prefix = when ? `${when} - ` : "";
 	      let suffix = turn && turn.pending ? " (pending)" : "";
+	      if (turn && turn.source === "history") suffix += turn.archived ? " (archived)" : " (history)";
 	      if (query) {
-	        const matches = transcriptItemsForTurn(transcript, turn)
+	        const matches = turnTranscriptItems(session, transcript, turn)
 	          .filter((item) => controlTranscriptMatches(item, query)).length;
-	        if (matches > 0) suffix += ` (${matches} match${matches === 1 ? "" : "es"})`;
+	        if (matches > 0) suffix += ` (${matches} loaded match${matches === 1 ? "" : "es"})`;
+	        else if (String(turn && turn.search_text || "").toLowerCase().includes(query.toLowerCase())) suffix += " (match)";
 	      }
 	      return `${prefix}${label}${suffix}`;
 	    }
@@ -13600,7 +15337,7 @@ class Handler(BaseHTTPRequestHandler):
 	      const turns = controlTurns(session, transcript);
 	      if (!turns.length) return null;
 	      const query = controlSearchText.trim();
-	      const matchingTurns = query ? turns.filter((turn) => turnMatchesSearch(transcript, turn, query)) : turns;
+	      const matchingTurns = query ? turns.filter((turn) => turnMatchesSearch(transcript, turn, query, session)) : turns;
 	      const available = matchingTurns.length ? matchingTurns : turns;
 	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
 	      const selectedKey = selectedControlTurnKeys[sessionKey] || "";
@@ -13623,8 +15360,8 @@ class Handler(BaseHTTPRequestHandler):
 	      const selectedKey = controlTurnKey(selected);
 	      return turns.map((turn) => {
 	        const key = controlTurnKey(turn);
-	        const disabled = controlSearchText && !turnMatchesSearch(transcript, turn, controlSearchText) ? "disabled" : "";
-	        return `<option value="${escapeHtml(key)}" ${key === selectedKey ? "selected" : ""} ${disabled}>${escapeHtml(turnOptionLabel(turn, transcript, controlSearchText))}</option>`;
+	        const disabled = controlSearchText && !turnMatchesSearch(transcript, turn, controlSearchText, session) ? "disabled" : "";
+	        return `<option value="${escapeHtml(key)}" ${key === selectedKey ? "selected" : ""} ${disabled}>${escapeHtml(turnOptionLabel(turn, transcript, controlSearchText, session))}</option>`;
 	      }).join("");
 	    }
 
@@ -13639,6 +15376,12 @@ class Handler(BaseHTTPRequestHandler):
 	      if (item.ts || item.call_id || item.turn_id) return parts.join("|");
 	      parts.push(fallback || "");
 	      return parts.join("|");
+	    }
+
+	    function compactControlMessageNeedsExpansion(value) {
+	      const text = String(value || "");
+	      if (!text) return false;
+	      return text.split("\n").length > 4 || text.length > 360;
 	    }
 
 		    function splitToolStatusSuffix(value) {
@@ -13714,9 +15457,9 @@ class Handler(BaseHTTPRequestHandler):
 		      return ["arguments", "input", "patch", "content"].includes(label) && /^\*\*\* Begin Patch/m.test(text);
 		    }
 
-		    function renderPatchText(text) {
-		      return String(text || "").split("\n").map((line) => {
-		        let cls = "context";
+			    function renderPatchText(text) {
+			      return String(text || "").split("\n").map((line) => {
+			        let cls = "context";
 		        if (/^\*\*\* (Begin Patch|End Patch|Update File:|Add File:|Delete File:|Move to:)/.test(line) || /^@@/.test(line)) {
 		          cls = "meta";
 		        } else if (/^\+/.test(line)) {
@@ -13725,18 +15468,157 @@ class Handler(BaseHTTPRequestHandler):
 		          cls = "delete";
 		        }
 		        return `<span class="tool-patch-line ${cls}">${escapeHtml(line || " ")}</span>`;
-		      }).join("");
+			      }).join("");
+			    }
+
+			    function parseToolJsonText(value) {
+			      const text = String(value || "").trim();
+			      if (!text) return null;
+			      if (/^[{[]/.test(text)) {
+			        try {
+			          return JSON.parse(text);
+			        } catch {
+			          return null;
+			        }
+			      }
+			      const lines = text.split("\n");
+			      const simple = {};
+			      for (const line of lines) {
+			        const match = line.match(/^([A-Za-z_][A-Za-z0-9_.-]*):\s*(.*)$/);
+			        if (!match) return null;
+			        simple[match[1]] = match[2];
+			      }
+			      return Object.keys(simple).length ? simple : null;
+			    }
+
+			    function toolSectionByLabel(parsed, labels) {
+			      const wanted = new Set(labels.map((label) => label.toLowerCase()));
+			      return (parsed.sections || []).find((section) => wanted.has(String(section.label || "").toLowerCase())) || null;
+			    }
+
+			    function toolPayloadFromLabels(parsed, labels) {
+			      const section = toolSectionByLabel(parsed, labels);
+			      return section ? parseToolJsonText(section.text) : null;
+			    }
+
+			    function toolSectionIsCollapsible(section) {
+			      const label = String(section && section.label || "").toLowerCase();
+			      const text = String(section && section.text || "");
+			      return ["arguments", "input", "parameters", "params", "content", "patch"].includes(label)
+			        && (text.includes("\n") || text.length > 180);
+			    }
+
+		    function summarizeToolSection(section, parsed) {
+			      const text = String(section && section.text || "");
+			      const payload = parseToolJsonText(text);
+			      const name = String(parsed && parsed.name || "").toLowerCase();
+			      if (payload && name === "update_plan" && Array.isArray(payload.plan)) {
+			        return `${payload.plan.length} plan step${payload.plan.length === 1 ? "" : "s"}`;
+			      }
+			      if (payload && name === "create_goal" && payload.objective) {
+			        return `objective: ${payload.objective}`;
+			      }
+			      if (payload && name === "update_goal" && payload.status) {
+			        return `status: ${payload.status}`;
+			      }
+			      if (payload && typeof payload.cmd === "string" && payload.cmd.trim()) return payload.cmd.trim();
+			      if (payload && typeof payload.command === "string" && payload.command.trim()) return payload.command.trim();
+			      const first = text.split("\n").map((line) => line.trim()).find(Boolean) || "";
+		      return first.length > 220 ? `${first.slice(0, 220).trim()}...` : first;
 		    }
 
-		    function renderToolSection(section, ownerKey, sectionIndex) {
+		    function toolSectionNeedsExpansion(section, parsed) {
+		      if (!toolSectionIsCollapsible(section)) return false;
+		      return summarizeToolSection(section, parsed) !== String(section && section.text || "");
+		    }
+
+			    function renderPlanToolSummary(parsed) {
+			      const name = String(parsed.name || "").toLowerCase();
+			      const args = toolPayloadFromLabels(parsed, ["Arguments", "Input", "Parameters"]);
+			      const result = toolPayloadFromLabels(parsed, ["Result", "Output"]);
+			      if (name === "update_plan" && args && Array.isArray(args.plan)) {
+			        const explanation = args.explanation
+			          ? `<div class="control-tool-special-note">${escapeHtml(args.explanation)}</div>`
+			          : "";
+			        const rows = args.plan.map((item) => {
+			          const status = String(item && item.status || "pending");
+			          const statusClass = status.toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
+			          const label = status.replace(/_/g, " ");
+			          return `
+			            <div class="control-tool-plan-row">
+			              <span class="control-tool-plan-status ${escapeHtml(statusClass)}">${escapeHtml(label)}</span>
+			              <span>${escapeHtml(item && item.step || "")}</span>
+			            </div>
+			          `;
+			        }).join("");
+			        return `
+			          <div class="control-tool-special">
+			            <div class="control-tool-special-title">
+			              <span>Updated plan</span>
+			              <span>${escapeHtml(args.plan.length)} step${args.plan.length === 1 ? "" : "s"}</span>
+			            </div>
+			            ${explanation}
+			            <div class="control-tool-plan-list">${rows}</div>
+			          </div>
+			        `;
+			      }
+			      if (name === "create_goal" && args && args.objective) {
+			        const budget = args.token_budget || args.tokenBudget
+			          ? `<div class="control-tool-special-note">Budget: ${escapeHtml(args.token_budget || args.tokenBudget)} tokens</div>`
+			          : "";
+			        return `
+			          <div class="control-tool-special">
+			            <div class="control-tool-special-title"><span>Created goal</span></div>
+			            <div>${escapeHtml(args.objective)}</div>
+			            ${budget}
+			          </div>
+			        `;
+			      }
+			      if (name === "update_goal" && args && args.status) {
+			        const goal = result && result.goal && typeof result.goal === "object" ? result.goal : null;
+			        const usage = goal
+			          ? [
+			              goal.tokensUsed != null ? `Tokens: ${formatNumber(goal.tokensUsed)}` : "",
+			              goal.timeUsedSeconds != null ? `Time: ${formatAge(goal.timeUsedSeconds)}` : ""
+			            ].filter(Boolean).join(" / ")
+			          : "";
+			        return `
+			          <div class="control-tool-special">
+			            <div class="control-tool-special-title">
+			              <span>Goal status</span>
+			              <span>${escapeHtml(String(args.status))}</span>
+			            </div>
+			            ${goal && goal.objective ? `<div>${escapeHtml(goal.objective)}</div>` : ""}
+			            ${usage ? `<div class="control-tool-special-note">${escapeHtml(usage)}</div>` : ""}
+			          </div>
+			        `;
+			      }
+			      if (name === "get_goal" && result && result.goal) {
+			        const goal = result.goal;
+			        return `
+			          <div class="control-tool-special">
+			            <div class="control-tool-special-title">
+			              <span>Current goal</span>
+			              <span>${escapeHtml(goal.status || "active")}</span>
+			            </div>
+			            ${goal.objective ? `<div>${escapeHtml(goal.objective)}</div>` : ""}
+			          </div>
+			        `;
+			      }
+			      return "";
+			    }
+
+		    function renderToolSection(section, ownerKey, sectionIndex, expanded, parsed) {
 		      const isPatch = toolSectionIsPatch(section);
-		      const body = isPatch ? renderPatchText(section.text) : escapeHtml(section.text);
-		      const scrollKey = `${ownerKey}:section:${sectionIndex}:${section.label}`;
-		      return `
-		        <div class="control-tool-section${isPatch ? " patch" : ""}">
-		          <span class="control-tool-section-label">${escapeHtml(section.label)}</span>
-		          <pre data-control-inner-scroll="${escapeHtml(scrollKey)}">${body}</pre>
-		        </div>
+		      const collapsed = toolSectionNeedsExpansion(section, parsed) && !expanded;
+			      const displayText = collapsed ? summarizeToolSection(section, parsed) : section.text;
+			      const body = isPatch && !collapsed ? renderPatchText(displayText) : escapeHtml(displayText);
+			      const scrollKey = `${ownerKey}:section:${sectionIndex}:${section.label}`;
+			      return `
+			        <div class="control-tool-section${isPatch ? " patch" : ""}${collapsed ? " collapsed" : ""}">
+			          <span class="control-tool-section-label">${escapeHtml(section.label)}</span>
+			          <pre data-control-inner-scroll="${escapeHtml(scrollKey)}">${body}</pre>
+			        </div>
 		      `;
 		    }
 
@@ -13745,7 +15627,7 @@ class Handler(BaseHTTPRequestHandler):
 		      const displayText = String(item.text || "");
 		      const fullText = String(item.full_text || "");
 		      const compact = Boolean(options.compact);
-		      const hasMore = Boolean(compact || item.truncated || (fullText && fullText !== displayText));
+		      const hasMore = Boolean(item.truncated || (fullText && fullText !== displayText));
 		      const expanded = Boolean(expandedControlMessages[key]);
 		      const text = expanded && fullText ? fullText : displayText;
 		      const parsed = parseToolActivityText(text);
@@ -13765,26 +15647,29 @@ class Handler(BaseHTTPRequestHandler):
 		      const status = parsed.status || "observed";
 		      const statusClass = status.toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
 		      const summaryBits = [parsed.exit ? `exit ${parsed.exit}` : "", parsed.duration || ""].filter(Boolean);
-		      const summary = summaryBits.length ? `<span>${escapeHtml(summaryBits.join(" / "))}</span>` : "";
-		      const command = parsed.command
-		        ? `<div class="control-tool-command">${escapeHtml(parsed.command)}</div>`
-		        : "";
-		      const sections = parsed.sections.length
-		        ? `<div class="control-tool-sections">${parsed.sections.map((section, sectionIndex) => renderToolSection(section, key, sectionIndex)).join("")}</div>`
-		        : "";
-		      const button = hasMore
-		        ? `<button class="control-show-more" type="button" data-message-key="${escapeHtml(key)}">${expanded ? "Show less" : "Show more"}</button>`
-		        : "";
+			      const summary = summaryBits.length ? `<span>${escapeHtml(summaryBits.join(" / "))}</span>` : "";
+			      const special = renderPlanToolSummary(parsed);
+			      const command = parsed.command
+			        ? `<div class="control-tool-command">${escapeHtml(parsed.command)}</div>`
+			        : "";
+		      const hasCollapsedSections = parsed.sections.some((section) => toolSectionNeedsExpansion(section, parsed));
+			      const sections = parsed.sections.length
+			        ? `<div class="control-tool-sections">${parsed.sections.map((section, sectionIndex) => renderToolSection(section, key, sectionIndex, expanded, parsed)).join("")}</div>`
+			        : "";
+			      const button = hasMore || hasCollapsedSections
+			        ? `<button class="control-show-more" type="button" data-message-key="${escapeHtml(key)}">${expanded ? "Show less" : "Show more"}</button>`
+			        : "";
 		      return `
 		        <div class="control-tool-block">
 		          <div class="control-tool-summary">
 		            <span class="control-tool-title">${escapeHtml(parsed.kind === "command" ? "Command" : "Tool")} <code>${escapeHtml(parsed.name || parsed.command || "tool")}</code></span>
 		            <span class="control-tool-status ${escapeHtml(statusClass)}">${escapeHtml(status)}</span>
-		          </div>
-		          ${summary}
-		          ${command}
-		          ${sections}
-		          ${button}
+			          </div>
+			          ${summary}
+			          ${special}
+			          ${command}
+			          ${sections}
+			          ${button}
 		        </div>
 		      `;
 		    }
@@ -13795,12 +15680,21 @@ class Handler(BaseHTTPRequestHandler):
 	      const displayText = normalizeControlMessageTextForDisplay(item.text, role);
 	      const fullText = normalizeControlMessageTextForDisplay(item.full_text, role);
 	      const compact = Boolean(options.compact);
-	      const hasMore = Boolean(compact || item.truncated || (fullText && fullText !== displayText));
+	      const hasMore = Boolean(
+	        item.truncated
+	        || (fullText && fullText !== displayText)
+	        || (compact && compactControlMessageNeedsExpansion(displayText))
+	      );
 	      const expanded = Boolean(expandedControlMessages[key]);
 	      const text = expanded && fullText ? fullText : displayText;
 	      const useMarkdown = options.markdown !== false && role !== "tool" && role !== "error";
 	      const className = `control-message-text ${useMarkdown ? "markdown" : "plain"}${expanded ? " expanded" : ""}`;
-	      const body = useMarkdown ? renderMarkdown(text) : escapeHtml(text);
+	      const body = useMarkdown
+	        ? cachedMarkdownRender(`${role}\u0001${text}`, () => {
+	            const jsonBody = renderJsonControlMessage(text);
+	            return jsonBody || renderMarkdown(text);
+	          })
+	        : escapeHtml(text);
 	      const button = hasMore
 	        ? `<button class="control-show-more" type="button" data-message-key="${escapeHtml(key)}">${expanded ? "Show less" : "Show more"}</button>`
 	        : "";
@@ -13814,7 +15708,7 @@ class Handler(BaseHTTPRequestHandler):
 	        if (role === "assistant_progress" || role === "tool") {
 	          const turn = String(item.turn_id || "");
 	          const last = groups[groups.length - 1];
-	          if (last && last.kind === "assistant_activity" && String(last.turn_id || "") === turn) {
+	          if (turn && last && last.kind === "assistant_activity" && String(last.turn_id || "") === turn) {
 	            last.items.push(item);
 	            last.updated_at = item.updated_at || item.ts || last.updated_at;
 	          } else {
@@ -13889,19 +15783,32 @@ class Handler(BaseHTTPRequestHandler):
 
 	    function renderControlTranscript(session) {
 	      const transcript = Array.isArray(session.transcript) ? session.transcript.slice() : [];
-	      if (!transcript.length) {
+	      const turns = controlTurns(session, transcript);
+	      if (!transcript.length && !turns.length) {
 	        return '<div class="control-empty">No discussion text captured for this session yet</div>';
 	      }
 	      const turn = selectedTurnForSession(session, transcript);
 	      if (!turn) {
 	        return '<div class="control-empty">No observed turns for this session yet</div>';
 	      }
-	      if (controlSearchText && !turnMatchesSearch(transcript, turn, controlSearchText)) {
+	      if (controlSearchText && !turnMatchesSearch(transcript, turn, controlSearchText, session)) {
 	        return '<div class="control-empty">No observed turns match the current search</div>';
 	      }
-	      let visible = transcriptItemsForTurn(transcript, turn);
-	      const pending = transcript.filter((item) => String(item.role || "") === "user_pending" && !visible.includes(item));
-	      if (pending.length) visible = visible.concat(pending);
+	      let visible = [];
+	      let sourceNote = "";
+	      if (turn.source === "history") {
+	        const payload = historyTurnPayload(session, turn);
+	        if (!payload) {
+	          requestHistoryTurn(session, turn);
+	          return '<div class="control-empty">Loading Codex session history for the selected turn...</div>';
+	        }
+	        visible = Array.isArray(payload.transcript) ? payload.transcript.slice() : [];
+	        sourceNote = '<div class="control-transcript-window-note">Loaded from Codex session history.</div>';
+	      } else {
+	        visible = transcriptItemsForTurn(transcript, turn);
+	        const pending = transcript.filter((item) => String(item.role || "") === "user_pending" && !visible.includes(item));
+	        if (pending.length) visible = visible.concat(pending);
+	      }
 	      if (controlSearchText) {
 	        const matched = visible.filter((item) => controlTranscriptMatches(item, controlSearchText));
 	        if (!matched.length && !String(turn.label || "").toLowerCase().includes(controlSearchText.toLowerCase())) {
@@ -13910,13 +15817,14 @@ class Handler(BaseHTTPRequestHandler):
 	      }
 	      const groups = controlTranscriptGroups(visible);
 	      const matchedTurns = controlSearchText
-	        ? controlTurns(session, transcript).filter((candidate) => turnMatchesSearch(transcript, candidate, controlSearchText)).length
+	        ? controlTurns(session, transcript).filter((candidate) => turnMatchesSearch(transcript, candidate, controlSearchText, session)).length
 	        : 0;
 	      const searchNote = matchedTurns > 1
 	        ? `<div class="control-transcript-window-note">${matchedTurns} turns match. Use the turn selector to navigate.</div>`
 	        : "";
 	      return `
 	        ${searchNote}
+	        ${sourceNote}
 	        <div class="control-transcript" data-total="${groups.length}">
 	          ${groups.map((group, offset) => (
 	            renderControlTranscriptGroup(group, offset, groups.length)
@@ -13997,7 +15905,7 @@ class Handler(BaseHTTPRequestHandler):
 
 	    function selectedResumeCandidateId(session) {
 	      const key = String(session && session.key || selectedControlSessionKey || "");
-	      const candidates = session && Array.isArray(session.resume_candidates) ? session.resume_candidates : [];
+	      const candidates = resumeCandidatesForSession(session);
 	      const selected = selectedResumeCandidateIds[key] || "";
 	      if (selected && candidates.some((candidate) => String(candidate.id || "") === selected)) return selected;
 	      const fallback = candidates.length ? String(candidates[0].id || "") : "";
@@ -14006,7 +15914,7 @@ class Handler(BaseHTTPRequestHandler):
 	    }
 
 	    function renderResumePane(session) {
-	      const candidates = session && Array.isArray(session.resume_candidates) ? session.resume_candidates : [];
+	      const candidates = resumeCandidatesForSession(session);
 	      if (!candidates.length) {
 	        return '<div class="control-empty">No resumable Codex CLI sessions were found for this workdir.</div>';
 	      }
@@ -14058,6 +15966,8 @@ class Handler(BaseHTTPRequestHandler):
 	        modal.hidden = true;
 	        return;
 	      }
+	      requestHistoryIndex(session);
+	      if (controlView === "resume") requestResumeCandidates(session);
 	      updateControlDockGeometry();
 	      document.getElementById("controlTitle").textContent = String(session.cwd || session.display || sessionTitle(session));
 	      const active = Number(session.active_requests || 0);
@@ -14757,14 +16667,194 @@ class Handler(BaseHTTPRequestHandler):
 		      return profileStateFromValue(value.detail) || profileStateFromValue(value.error) || profileStateFromValue(value.message) || profileStateFromValue(value.reason);
 		    }
 
-		    function modelCatalog() {
-	      return latestModelCatalog.length ? latestModelCatalog : [
-	        { id: "gpt-5.5", display: "gpt-5.5", reasoning: ["low", "medium", "high", "xhigh"] },
-	        { id: "gpt-5.4", display: "gpt-5.4", reasoning: ["low", "medium", "high", "xhigh"] },
-	        { id: "gpt-5.4-mini", display: "gpt-5.4-mini", reasoning: ["low", "medium", "high", "xhigh"] },
-	        { id: "gpt-5.3-codex", display: "gpt-5.3-codex", reasoning: ["low", "medium", "high", "xhigh"] },
-	        { id: "gpt-5.2", display: "gpt-5.2", reasoning: ["low", "medium", "high", "xhigh"] }
-	      ];
+	    function renderAuthHealth(profile) {
+	      if (profile.auth_health_html) return profile.auth_health_html;
+	      const health = profile.auth_health && typeof profile.auth_health === "object" ? profile.auth_health : null;
+	      if (!health) return "";
+	      const status = String(health.status || "");
+	      if (status !== "login_required" && status !== "refresh_failed") return "";
+	      const label = status === "login_required" ? "Login required" : "Auth refresh failed";
+	      const timestamp = formatEventTime(health.error_at || health.last_refresh_failed_at || "");
+	      const suffix = timestamp ? ` (${timestamp})` : "";
+	      return `
+	        <div class="auth-health ${escapeHtml(status)}" title="${escapeHtml(health.message || "")}">
+	          <strong>${escapeHtml(label)}</strong>${escapeHtml(suffix)}
+	        </div>
+	      `;
+	    }
+
+	    function renderQuotaRefreshControl(profileName) {
+	      if (!profileName) return '<span class="quota-refresh-spacer"></span>';
+	      return `
+	        <form method="post" action="/api/refresh-quota" class="quota-refresh-form" data-action="refresh_quota" data-profile="${escapeHtml(profileName)}">
+	          <input type="hidden" name="token" value="${escapeHtml(TOKEN)}">
+	          <input type="hidden" name="profile" value="${escapeHtml(profileName)}">
+	          <button class="quota-refresh-icon" aria-label="Refresh quota" title="Refresh quota">
+	            <svg class="quota-refresh-glyph" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+	              <path d="M20 12a8 8 0 1 1-2.34-5.66"></path>
+	              <path d="M20 4v5h-5"></path>
+	            </svg>
+	          </button>
+	        </form>
+	      `;
+	    }
+
+	    function renderQuotaCredits(label) {
+	      return label
+	        ? `<span class="quota-credits-pill" title="Codex credits balance">Credits: ${escapeHtml(label)}</span>`
+	        : "";
+	    }
+
+	    function renderResetCreditControl(resetCredit, profileName) {
+	      if (!resetCredit || typeof resetCredit !== "object") return "";
+	      const label = String(resetCredit.label || "");
+	      if (!label) return "";
+	      const message = String(resetCredit.message || "");
+	      if (resetCredit.disabled) {
+	        return `<span class="quota-reset-credit-pill disabled" title="${escapeHtml(message)}">${escapeHtml(label)}</span>`;
+	      }
+	      return `
+	        <form method="post" action="/api/consume-reset-credit" class="reset-credit-form" data-action="consume_reset_credit" data-profile="${escapeHtml(profileName)}" data-confirm="${escapeHtml(message)}">
+	          <input type="hidden" name="token" value="${escapeHtml(TOKEN)}">
+	          <input type="hidden" name="profile" value="${escapeHtml(profileName)}">
+	          <button class="quota-reset-credit-pill" title="Use one rate-limit reset credit">${escapeHtml(label)}</button>
+	        </form>
+	      `;
+	    }
+
+	    function renderQuotaState(state) {
+	      const data = state && typeof state === "object" ? state : {};
+	      const level = ["warning", "error", "info"].includes(String(data.level || "")) ? String(data.level) : "warning";
+	      const title = String(data.title || "Quota unavailable");
+	      const message = String(data.message || "Quota is unavailable for this profile.");
+	      return `
+	        <div class="quota-empty quota-state ${escapeHtml(level)}">
+	          <strong>${escapeHtml(title)}</strong>
+	          <span>${escapeHtml(message)}</span>
+	        </div>
+	      `;
+	    }
+
+	    function renderQuotaCountRows(rows) {
+	      return (rows || []).map((row) => {
+	        const reset = row.reset ? ` <span class="quota-count-reset">(${escapeHtml(row.reset)})</span>` : "";
+	        return `<div class="quota-count-line"><span>${escapeHtml(row.label || "")}</span><strong>${escapeHtml(row.value || "")}</strong>${reset}</div>`;
+	      }).join("") || '<div class="quota-muted">No window details</div>';
+	    }
+
+	    function renderQuotaHorizons(stack, bucket) {
+	      const name = String(bucket.name || "Quota bucket");
+	      const title = String(bucket.title || "");
+	      if (Array.isArray(stack.count_rows) && stack.count_rows.length) {
+	        return `
+	          <div class="quota-title">
+	            <span class="quota-horizon weekly"></span>
+	            <span class="quota-bucket-name" title="${escapeHtml(title)}">${escapeHtml(name)}</span>
+	            <span class="quota-horizon primary"></span>
+	          </div>
+	        `;
+	      }
+	      return `
+	        <div class="quota-title">
+	          <span class="quota-horizon weekly">${escapeHtml(stack.weekly_status || "")}</span>
+	          <span class="quota-bucket-name" title="${escapeHtml(title)}">${escapeHtml(name)}</span>
+	          <span class="quota-horizon primary">${escapeHtml(stack.primary_reset_text || "")}</span>
+	        </div>
+	      `;
+	    }
+
+	    function renderQuotaStack(stack) {
+	      if (Array.isArray(stack.count_rows) && stack.count_rows.length) {
+	        return renderQuotaCountRows(stack.count_rows);
+	      }
+	      const primaryStyle = Number(stack.primary_style || 0);
+	      const weeklyStyle = Number(stack.weekly_style || 0);
+	      const primaryText = String(stack.primary_text || "");
+	      const weeklyText = String(stack.weekly_text || "");
+	      const primaryEmpty = String(stack.primary_empty || "");
+	      const special = String(stack.special || "");
+	      const stackClass = special ? ` quota-stack-${special}` : "";
+	      const aria = String(stack.aria || "");
+	      const barAttrs = special
+	        ? `role="img" aria-label="${escapeHtml(aria)}"`
+	        : `role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${primaryStyle.toFixed(0)}" aria-label="${escapeHtml(aria)}"`;
+	      return `
+	        <div class="quota-stack${escapeHtml(stackClass)}">
+	          <div class="quota-stack-row">
+	            <span class="quota-weekly-label">${escapeHtml(weeklyText)}</span>
+	            <div class="quota-stack-bar" ${barAttrs}>
+	              <span class="quota-weekly-fill" style="width: ${weeklyStyle.toFixed(2)}%"></span>
+	              <span class="quota-primary-fill${escapeHtml(primaryEmpty)}" style="width: ${primaryStyle.toFixed(2)}%"></span>
+	            </div>
+	            <span class="quota-primary-label-outside">${escapeHtml(primaryText)}</span>
+	          </div>
+	        </div>
+	      `;
+	    }
+
+	    function renderQuotaBucket(bucket) {
+	      const stack = bucket && typeof bucket.stack === "object" ? bucket.stack : {};
+	      return `
+	        <div class="quota-bucket">
+	          ${renderQuotaHorizons(stack, bucket || {})}
+	          ${renderQuotaStack(stack)}
+	        </div>
+	      `;
+	    }
+
+	    function renderStructuredQuota(profile, profileName) {
+	      const quota = profile.quota && typeof profile.quota === "object" ? profile.quota : null;
+	      if (!quota) return profile.quota_html || '<div class="quota-empty">No quota cached</div>';
+	      const updated = String(quota.updated || "No quota cached");
+	      let body = "";
+	      const buckets = Array.isArray(quota.buckets) ? quota.buckets : [];
+	      if (buckets.length) {
+	        body = buckets.map((bucket) => renderQuotaBucket(bucket)).join("");
+	      } else if (quota.state) {
+	        body = renderQuotaState(quota.state);
+	      } else {
+	        const empty = String(quota.empty || "No quota cached");
+	        const emptyClass = quota.refresh_error_billing ? "quota-empty error billing" : empty === "Quota payload has no bucket details" ? "quota-muted" : "quota-empty";
+	        body = `<div class="${emptyClass}">${escapeHtml(empty)}</div>`;
+	      }
+	      const refreshError = quota.refresh_error
+	        ? `<div class="quota-refresh-error${quota.refresh_error_billing ? " billing" : ""}">Last refresh failed: ${escapeHtml(quota.refresh_error)}</div>`
+	        : "";
+	      return `
+	        <div class="quota-panel">
+	          <div class="quota-panel-head">
+	            ${renderQuotaRefreshControl(profileName)}
+	            <span class="quota-updated">${escapeHtml(updated)}</span>
+	            ${renderResetCreditControl(quota.reset_credit, profileName)}
+	            ${renderQuotaCredits(quota.credits_label)}
+	          </div>
+	          ${body}
+	          ${refreshError}
+	        </div>
+	      `;
+	    }
+
+	    function modelCatalog(profile) {
+	      const profileCatalog = profile && Array.isArray(profile.model_catalog) ? profile.model_catalog : [];
+	      return profileCatalog.length ? profileCatalog : (latestModelCatalog.length ? latestModelCatalog : [
+	        { id: "gpt-5.6-sol", display: "GPT-5.6-Sol", reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+		        { id: "gpt-5.6-terra", display: "GPT-5.6-Terra", reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"] },
+		        { id: "gpt-5.6-luna", display: "GPT-5.6-Luna", reasoning: ["low", "medium", "high", "xhigh", "max"] },
+		        { id: "gpt-5.5", display: "GPT-5.5", reasoning: ["low", "medium", "high", "xhigh"] },
+		        { id: "gpt-5.4", display: "GPT-5.4", reasoning: ["low", "medium", "high", "xhigh"] },
+		        { id: "gpt-5.4-mini", display: "GPT-5.4-Mini", reasoning: ["low", "medium", "high", "xhigh"] },
+	        { id: "gpt-5.2", display: "GPT-5.2", reasoning: ["low", "medium", "high", "xhigh"] }
+	      ]);
+	    }
+
+	    function stableRenderHash(value) {
+	      let hash = 2166136261;
+	      const text = String(value || "");
+	      for (let index = 0; index < text.length; index += 1) {
+	        hash ^= text.charCodeAt(index);
+	        hash = Math.imul(hash, 16777619);
+	      }
+	      return String(hash >>> 0);
 	    }
 
 		    function renderProfileChips(profile, name) {
@@ -14827,18 +16917,18 @@ class Handler(BaseHTTPRequestHandler):
 	      return `<div class="profile-chips">${chips.join("")}</div>`;
 	    }
 
-	    function renderModelMenu(profile, name) {
-	      const setting = profile.model_setting && typeof profile.model_setting === "object" ? profile.model_setting : {};
-	      const currentModel = String(setting.model || "gpt-5.5");
-	      const currentReasoning = String(setting.reasoning_effort || "medium");
-		      const label = `${currentModel.toLowerCase()} ${reasoningDisplay(currentReasoning)}`;
-	      const items = modelCatalog().map((item) => {
+		    function renderModelMenu(profile, name) {
+		      const setting = profile.model_setting && typeof profile.model_setting === "object" ? profile.model_setting : {};
+		      const currentModel = String(setting.model || "gpt-5.6-sol");
+		      const currentReasoning = String(setting.reasoning_effort || (currentModel === "gpt-5.6-sol" ? "low" : "medium"));
+			      const label = `${currentModel.toLowerCase()} ${reasoningDisplay(currentReasoning)}`;
+	      const items = modelCatalog(profile).map((item) => {
 	        const model = String(item.id || "");
 	        if (!model) return "";
 	        const display = String(item.display || model);
 	        const note = String(item.note || "");
 	        const selected = model === currentModel ? " selected" : "";
-	        const levels = Array.isArray(item.reasoning) && item.reasoning.length ? item.reasoning : ["low", "medium", "high", "xhigh"];
+		        const levels = Array.isArray(item.reasoning) && item.reasoning.length ? item.reasoning : ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 	        const reasoning = levels.map((level) => {
 	          const value = String(level || "");
 	          if (!value) return "";
@@ -14887,13 +16977,13 @@ class Handler(BaseHTTPRequestHandler):
 	      const isQuotaPending = pending === "refresh_quota" || pending === "consume_reset_credit";
 	      const quota = isQuotaPending
 	        ? `<div class="quota-panel"><div class="quota-panel-head"><span class="quota-refresh-icon disabled" aria-hidden="true"><span class="spinner quota-spinner-small"></span></span><span class="quota-updated">${quotaPendingLabel}</span></div><div class="quota-loading"><span class="spinner"></span><span>${quotaPendingLabel}</span></div></div>`
-	        : profile.quota_html || '<div class="quota-empty">No quota cached</div>';
+	        : renderStructuredQuota(profile, name);
 	      const pinMenu = profile.pin_menu_html || "";
 	      const pinnedSessions = profile.pinned_sessions_html || "";
 	      const loginStatusHtml = profile.login_status_html || "";
-	      const authHealthHtml = profile.auth_health_html || "";
+	      const authHealthHtml = renderAuthHealth(profile);
 	      return `
-	        <tr class="profile-row${profile.active ? " active" : ""}" data-profile="${escapeHtml(name)}">
+	        <tr class="profile-row${profile.active ? " active" : ""}" data-profile="${escapeHtml(name)}" data-profile-key="${escapeHtml(name)}">
 	          <td class="profile-cell">
 	            <div class="profile-name">${escapeHtml(name)} <span class="profile-plan">(${escapeHtml(plan)})</span></div>
 	            <div class="profile-email">${escapeHtml(profile.email || profile.account_id || "")}</div>
@@ -14916,8 +17006,50 @@ class Handler(BaseHTTPRequestHandler):
 	      `;
 	    }
 
+	    function renderProfileRows(profiles, pendingAction, pendingProfile) {
+	      const body = document.getElementById("profileRows");
+	      if (!body) return;
+	      const existing = new Map();
+	      Array.from(body.children).forEach((row) => {
+	        if (row instanceof HTMLElement) existing.set(row.dataset.profileKey || "", row);
+	      });
+	      const seen = new Set();
+	      const template = document.createElement("template");
+	      for (const [index, profile] of (profiles || []).entries()) {
+	        const name = String(profile && profile.name || `profile-${index}`);
+	        const html = profileRow(profile, pendingAction, pendingProfile).trim();
+	        const hash = stableRenderHash(html);
+	        let row = existing.get(name);
+	        if (!row || row.dataset.renderHash !== hash) {
+	          template.innerHTML = html;
+	          const next = template.content.firstElementChild;
+	          if (!(next instanceof HTMLElement)) continue;
+	          next.dataset.profileKey = name;
+	          next.dataset.renderHash = hash;
+	          if (row) {
+	            row.replaceWith(next);
+	          } else {
+	            body.appendChild(next);
+	          }
+	          row = next;
+	          normalizeNativeTooltips(row);
+	        }
+	        seen.add(name);
+	        body.appendChild(row);
+	      }
+	      for (const [key, row] of existing.entries()) {
+	        if (!seen.has(key)) row.remove();
+	      }
+	    }
+
     function render(packet) {
       const status = packet.status || {};
+      latestStatus = status;
+      const sections = new Set(Array.isArray(packet.sections) ? packet.sections : ["full"]);
+      const fullRender = sections.has("full") || !Array.isArray(packet.sections);
+      const profilesChanged = fullRender || sections.has("profiles");
+      const controlChanged = fullRender || sections.has("control_plane");
+      const statsChanged = fullRender || sections.has("stats");
       updateQuotaRefreshEpoch(status);
       const pendingAction = packet.pending_action || "";
       const pendingProfile = String(packet.pending_profile || "");
@@ -14936,36 +17068,132 @@ class Handler(BaseHTTPRequestHandler):
 	        quotaRefreshInFlight = "";
 	        scheduleNextQuotaRefresh(250);
 	      }
-	      queueInitialQuotaRefreshes(status.profiles || []);
+	      if (profilesChanged) queueInitialQuotaRefreshes(status.profiles || []);
 	      scheduleNextQuotaRefresh(250);
 	      document.getElementById("activeProfile").textContent = status.active_profile || "none";
 	      const codexCli = status.codex && status.codex.cli ? status.codex.cli : {};
 	      document.getElementById("codexVersion").textContent = codexCli.version || "unknown";
+	      const restartState = status.codex && status.codex.restart_required ? status.codex.restart_required : {};
+	      const restartRequired = Boolean(restartState.required);
+	      const restartNotice = document.getElementById("codexRestartRequired");
+	      restartNotice.hidden = !restartRequired;
+	      restartNotice.title = restartRequired ? String(restartState.reason || "Restart Provision when active work is idle.") : "";
 	      document.getElementById("activeRequests").textContent = String(activeRequests);
 	      document.getElementById("activeTunnels").textContent = String(activeTunnels);
-	      renderSessionTabs(status);
-	      renderLauncherBar(status);
+	      if (controlChanged) {
+	        renderSessionTabs(status);
+	        renderLauncherBar(status);
+	      }
 	      const connection = document.getElementById("connectionState");
 	      const isDisconnected = connection.textContent === "Disconnected";
 	      if (!isDisconnected) {
 	        connection.textContent = `Live (${liveBusy ? "busy" : "idle"})`;
 	        document.getElementById("proxyDot").className = "dot" + (liveBusy ? " busy" : "");
 	      }
-	      rememberOpenMenus();
-      document.getElementById("profileRows").innerHTML = (status.profiles || [])
-        .map((profile) => profileRow(profile, pendingAction, pendingProfile))
-        .join("");
-	      normalizeNativeTooltips(document.getElementById("profileRows"));
-	      restoreOpenMenus();
-	      if (!document.getElementById("statsModal").hidden) {
+	      if (profilesChanged) {
+	        rememberOpenMenus();
+	        renderProfileRows(status.profiles || [], pendingAction, pendingProfile);
+	        restoreOpenMenus();
+	      }
+	      if (statsChanged && !document.getElementById("statsModal").hidden) {
 	        renderStats(latestStats);
       }
-	      renderControlModal();
-	      normalizeNativeTooltips(document);
+	      if (controlChanged) renderControlModal();
+	      if (fullRender || profilesChanged || controlChanged || statsChanged) normalizeNativeTooltips(document);
 	      if (typeof packet.message === "string") {
 	        showUiMessage(packet.message);
 	      }
     }
+
+	    function mergeStateDelta(packet) {
+	      const delta = packet.status || {};
+	      const previous = latestStatus || {};
+	      const merged = {
+	        ...previous,
+	        ...delta,
+	        profiles: Object.prototype.hasOwnProperty.call(delta, "profiles")
+	          ? delta.profiles
+	          : (previous.profiles || []),
+	        sessions: Object.prototype.hasOwnProperty.call(delta, "sessions")
+	          ? delta.sessions
+	          : (previous.sessions || []),
+	        control_plane: Object.prototype.hasOwnProperty.call(delta, "control_plane")
+	          ? delta.control_plane
+	          : (previous.control_plane || latestControlPlane || { sessions: [] }),
+	        stats: Object.prototype.hasOwnProperty.call(delta, "stats")
+	          ? delta.stats
+	          : (previous.stats || latestStats || { profiles: [], recent: [] }),
+	        codex: Object.prototype.hasOwnProperty.call(delta, "codex")
+	          ? delta.codex
+	          : (previous.codex || latestCodex || {}),
+	        model_catalog: Object.prototype.hasOwnProperty.call(delta, "model_catalog")
+	          ? delta.model_catalog
+	          : (previous.model_catalog || latestModelCatalog || [])
+	      };
+	      latestStatus = merged;
+	      return { ...packet, type: "state", status: merged };
+	    }
+
+	    function scheduleRender(packet) {
+	      const statePacket = packet.type === "state_delta" ? mergeStateDelta(packet) : packet;
+	      if (packet.type === "state") latestStatus = packet.status || {};
+	      pendingRenderPacket = statePacket;
+	      if (pendingRenderFrame) return;
+	      pendingRenderFrame = requestAnimationFrame(() => {
+	        const nextPacket = pendingRenderPacket;
+	        pendingRenderPacket = null;
+	        pendingRenderFrame = null;
+	        if (nextPacket) render(nextPacket);
+	      });
+	    }
+
+	    function handleHistoryTurnPacket(packet) {
+	      const sessionKey = String(packet.session_key || "");
+	      const turnKey = String(packet.turn_key || "");
+	      const key = historyCacheKey(sessionKey, turnKey);
+	      delete historyTurnRequests[key];
+	      if (!packet.ok) {
+	        showUiMessage(packet.error ? `History load failed: ${packet.error}` : "History load failed.");
+	        return;
+	      }
+	      if (packet.payload && typeof packet.payload === "object") {
+	        historyTurnCache[key] = packet.payload;
+	      }
+	      if (sessionKey === selectedControlSessionKey && selectedControlTurnKeys[sessionKey] === turnKey) {
+	        renderControlModal(true);
+	      }
+	    }
+
+	    function handleHistoryIndexPacket(packet) {
+	      const sessionKey = String(packet.session_key || "");
+	      delete historyIndexRequests[sessionKey];
+	      if (!packet.ok) {
+	        showUiMessage(packet.error ? `History index failed: ${packet.error}` : "History index failed.");
+	        return;
+	      }
+	      historyTurnIndexes[sessionKey] = Array.isArray(packet.turns) ? packet.turns : [];
+	      if (sessionKey === selectedControlSessionKey) renderControlModal(true);
+	    }
+
+	    function handleResumeCandidatesPacket(packet) {
+	      const sessionKey = String(packet.session_key || "");
+	      delete resumeCandidateRequests[sessionKey];
+	      if (!packet.ok) {
+	        showUiMessage(packet.error ? `Resume lookup failed: ${packet.error}` : "Resume lookup failed.");
+	        return;
+	      }
+	      resumeCandidateIndexes[sessionKey] = Array.isArray(packet.candidates) ? packet.candidates : [];
+	      if (sessionKey === selectedControlSessionKey) renderControlModal(true);
+	      if (sessionKey === selectedLauncherSessionKey) {
+	        renderLauncherBar({ control_plane: latestControlPlane });
+	      }
+	    }
+
+	    function clearPendingSessionLookups() {
+	      for (const key of Object.keys(historyTurnRequests)) delete historyTurnRequests[key];
+	      for (const key of Object.keys(historyIndexRequests)) delete historyIndexRequests[key];
+	      for (const key of Object.keys(resumeCandidateRequests)) delete resumeCandidateRequests[key];
+	    }
 
     function connect() {
       if (reconnectTimer) {
@@ -14986,13 +17214,25 @@ class Handler(BaseHTTPRequestHandler):
         try {
           const packet = JSON.parse(event.data);
           if (packet.type === "state") {
-            render(packet);
+            scheduleRender(packet);
+          } else if (packet.type === "state_delta") {
+            scheduleRender(packet);
+	        } else if (packet.type === "history_turn") {
+	          handleHistoryTurnPacket(packet);
+	        } else if (packet.type === "history_index") {
+	          handleHistoryIndexPacket(packet);
+	        } else if (packet.type === "resume_candidates") {
+	          handleResumeCandidatesPacket(packet);
+	        } else if (packet.type === "heartbeat") {
+            latestLiveBusy = Boolean(packet.live_busy);
+            setConnection("Live", latestLiveBusy ? "busy" : "");
           }
         } catch {
           setConnection("Live", "");
         }
       });
 	      socket.addEventListener("close", () => {
+	        clearPendingSessionLookups();
 	        quotaRefreshInFlight = "";
 	        setConnection("Disconnected", "disconnected");
 	        renderLauncherBar({ control_plane: latestControlPlane });
@@ -15000,6 +17240,7 @@ class Handler(BaseHTTPRequestHandler):
 	        reconnectTimer = setTimeout(connect, 1500);
 	      });
 	      socket.addEventListener("error", () => {
+	        clearPendingSessionLookups();
 	        quotaRefreshInFlight = "";
 	        setConnection("Disconnected", "disconnected");
 	        renderLauncherBar({ control_plane: latestControlPlane });

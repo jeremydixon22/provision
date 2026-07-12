@@ -10,6 +10,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import threading
 import urllib.parse
@@ -31,13 +32,14 @@ else:
 from .daemon import (
     DEFAULT_DAEMON_HOST,
     PROTOCOL_VERSION,
+    bridge_codex_history_into_app_home,
     daemon_running,
     daemon_url_host,
     health,
     project_session_sentinel,
     wait_until_running,
 )
-from .paths import Paths, launcher_path, source_root
+from .paths import Paths, default_codex_home, launcher_path, source_root
 from .store import Store
 
 
@@ -148,20 +150,22 @@ def ensure_daemon(paths: Paths, port: int | None = None, host: str | None = None
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = src if not existing else src + os.pathsep + existing
     paths.log.parent.mkdir(parents=True, exist_ok=True)
-    log = paths.log.open("ab")
     argv = [sys.executable, "-m", "provision", "daemon"]
     if port is not None:
         argv.extend(["--port", str(port)])
     if requested_host is not None:
         argv.extend(["--host", requested_host])
-    subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=log,
-        stderr=log,
-        start_new_session=True,
-        env=env,
-    )
+    # Popen duplicates the descriptor for the daemon. Closing the parent's copy
+    # immediately avoids retaining a log descriptor for the caller's lifetime.
+    with paths.log.open("ab") as log:
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+            env=env,
+        )
     return wait_until_running(paths)
 
 
@@ -453,7 +457,7 @@ def launch_codex(codex_args: list[str]) -> int:
     paths = Paths()
     store = Store(paths)
     store.import_default_if_available()
-    store.active_profile()
+    active_profile = store.active_profile()
     status = ensure_daemon(paths, configured_daemon_port(), configured_daemon_host())
     port = int(status["port"])
     host = str(status.get("host") or DEFAULT_DAEMON_HOST)
@@ -489,5 +493,71 @@ def launch_codex(codex_args: list[str]) -> int:
             session_key=session_key,
         )
     register_session(port, proxy_token, cwd, host, session_key=session_key)
+    if codex_args and codex_args[0] in CODEX_PASSTHROUGH_COMMANDS:
+        return run_profiled_passthrough_codex(
+            store,
+            str(active_profile),
+            argv,
+            env,
+            command=codex_args[0],
+        )
     os.execvpe("codex", argv, env)
     return 127
+
+
+def run_profiled_passthrough_codex(
+    store: Store,
+    profile: str,
+    argv: list[str],
+    env: dict[str, str],
+    *,
+    command: str,
+) -> int:
+    """Run a non-proxy Codex command with the selected profile's credentials.
+
+    App-server and remote-control commands do not use Provision's HTTP provider
+    override. A short-lived Codex home gives those commands the active profile
+    while preserving the normal CLI configuration and shared session state.
+    """
+    auth_source = store.auth_path(profile)
+    with tempfile.TemporaryDirectory(prefix=f"provision-codex-{profile}-") as temp:
+        codex_home = Path(temp)
+        bridge_codex_history_into_app_home(codex_home)
+        auth_target = codex_home / "auth.json"
+        shutil.copy2(auth_source, auth_target)
+        auth_target.chmod(0o600)
+        config = codex_home / "config.toml"
+        source_config = default_codex_home() / "config.toml"
+        try:
+            source_config_text = source_config.read_text(encoding="utf-8")
+        except OSError:
+            source_config_text = ""
+        runtime_config_text = source_config_text
+        if "cli_auth_credentials_store" not in runtime_config_text:
+            runtime_config_text = runtime_config_text.rstrip() + '\ncli_auth_credentials_store = "file"\n'
+        config.write_text(runtime_config_text, encoding="utf-8")
+        config.chmod(0o600)
+        profiled_env = dict(env)
+        profiled_env["CODEX_HOME"] = str(codex_home)
+        result = subprocess.run(argv, env=profiled_env, check=False)
+        if auth_target.exists():
+            store.import_auth_file(profile, auth_target, overwrite=True, set_active=False)
+        elif command == "logout":
+            store.remove_profile(profile)
+        try:
+            updated_config = config.read_text(encoding="utf-8")
+        except OSError:
+            updated_config = runtime_config_text
+        if "cli_auth_credentials_store" not in source_config_text:
+            updated_config = "\n".join(
+                line
+                for line in updated_config.splitlines()
+                if not line.lstrip().startswith("cli_auth_credentials_store")
+            ).rstrip()
+            if updated_config:
+                updated_config += "\n"
+        if updated_config != source_config_text:
+            source_config.parent.mkdir(parents=True, exist_ok=True)
+            source_config.write_text(updated_config, encoding="utf-8")
+            source_config.chmod(0o600)
+        return result.returncode
