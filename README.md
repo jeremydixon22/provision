@@ -26,6 +26,8 @@ The earlier cross-CLI credential research is still available in
 
 - Codex CLI `0.144.0` or newer is the current validation target for the full
   dashboard, GPT-5.6 model picker, quota, and compatibility-reporting path.
+- The current bundled catalog includes GPT-5.6-Sol, GPT-5.6-Terra, and
+  GPT-5.6-Luna (also commonly searched as GPT-5.6 Codex).
 - Python 3.11+ is recommended.
 - The richest quota display depends on Codex CLI and the ChatGPT backend
   reporting multi-bucket usage data. Older Codex CLI versions may still route
