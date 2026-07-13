@@ -2390,6 +2390,100 @@ class StoreTests(unittest.TestCase):
             [{"role": "user", "text": "Initial observed prompt"}],
         )
         self.assertEqual(
+            daemon_module.user_transcript_entries(
+                "<user_shell_command>\n"
+                "<command>\nls\n</command>\n"
+                "<result>\n"
+                "Exit code: 0\n"
+                "Duration: 0.0183 seconds\n"
+                "Output:\n"
+                "bin\nBUGGER.json\nREADME.md\n"
+                "</result>\n"
+                "</user_shell_command>"
+            ),
+            [
+                {"role": "user", "text": "! ls"},
+                {
+                    "role": "tool",
+                    "text": (
+                        "Command: ls (exit 0, duration 0.0183 seconds)\n"
+                        "Output:\n"
+                        "bin\nBUGGER.json\nREADME.md"
+                    ),
+                },
+            ],
+        )
+        shell_payload = {
+            "type": "response.create",
+            "response": {
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    "<user_shell_command><command>pwd</command>"
+                                    "<result>Exit code: 0\nDuration: 0.002 seconds\n"
+                                    "Output:\n/workspace/provision</result>"
+                                    "</user_shell_command>"
+                                ),
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+        self.assertEqual(
+            daemon_module.response_create_payload_user_entries(shell_payload),
+            [
+                {"role": "user", "text": "! pwd"},
+                {
+                    "role": "tool",
+                    "text": (
+                        "Command: pwd (exit 0, duration 0.002 seconds)\n"
+                        "Output:\n/workspace/provision"
+                    ),
+                },
+            ],
+        )
+        self.assertEqual(daemon_module.response_create_payload_user_text(shell_payload), "! pwd")
+        self.assertEqual(
+            daemon_module.codex_history_entries_from_response_item(
+                {
+                    "type": "message",
+                    "role": "user",
+                    "turn_id": "turn-shell",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "<user_shell_command><command>ls</command>"
+                                "<result>Exit code: 0\nDuration: 0.0183 seconds\n"
+                                "Output:\nbin</result></user_shell_command>"
+                            ),
+                        }
+                    ],
+                },
+                "2026-07-13T09:00:00Z",
+            ),
+            [
+                {
+                    "role": "user",
+                    "text": "! ls",
+                    "ts": "2026-07-13T09:00:00Z",
+                    "turn_id": "turn-shell",
+                },
+                {
+                    "role": "tool",
+                    "text": "Command: ls (exit 0, duration 0.0183 seconds)\nOutput:\nbin",
+                    "ts": "2026-07-13T09:00:00Z",
+                    "turn_id": "turn-shell",
+                },
+            ],
+        )
+        self.assertEqual(
             daemon_module.split_user_entries_by_prompt_suffix(
                 [{"role": "user", "text": "Earlier follow-up\n\nCurrent question"}],
                 "Current question",

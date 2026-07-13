@@ -225,6 +225,24 @@ CODEX_GOAL_CONTEXT_RE = re.compile(
 )
 CODEX_GOAL_OBJECTIVE_RE = re.compile(r"<objective>\s*(.*?)\s*</objective>", re.IGNORECASE | re.DOTALL)
 CONTROL_TRANSCRIPT_EDGE_RE = re.compile(r"^[\s\ufeff\u200b\u200c\u200d]+|[\s\ufeff\u200b\u200c\u200d]+$")
+USER_SHELL_COMMAND_RE = re.compile(
+    r"<user_shell_command\b[^>]*>(?P<body>.*?)</user_shell_command\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+USER_SHELL_COMMAND_COMMAND_RE = re.compile(
+    r"<command\b[^>]*>\s*(?P<command>.*?)\s*</command\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+USER_SHELL_COMMAND_RESULT_RE = re.compile(
+    r"<result\b[^>]*>\s*(?P<result>.*?)\s*</result\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+USER_SHELL_RESULT_EXIT_CODE_RE = re.compile(r"^\s*Exit code:\s*(?P<value>.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+USER_SHELL_RESULT_DURATION_RE = re.compile(r"^\s*Duration:\s*(?P<value>.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+USER_SHELL_RESULT_OUTPUT_RE = re.compile(
+    r"^\s*Output:\s*(?P<value>.*)$",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
 LOGIN_URL_RE = re.compile(r"https?://[^\s<>]+")
 DEVICE_CODE_RE = re.compile(r"\b[A-Z0-9]{4,}(?:-[A-Z0-9]{4,})+\b")
 CONTROL_TOOL_CALL_RE = re.compile(r"^ctc_[a-f0-9]{16,}$", re.IGNORECASE)
@@ -2506,7 +2524,9 @@ def user_entries_from_text_items(text_items: list[str]) -> list[dict[str, str]]:
         text = str(entry.get("text") or "")
         if not text:
             continue
-        role = "user" if index == last_user_index else "resume"
+        role = str(entry.get("role") or "user")
+        if role == "user":
+            role = "user" if index == last_user_index else "resume"
         entries.append({"role": role, "text": text})
     return entries
 
@@ -2518,7 +2538,11 @@ def transcript_entries_from_input(value: Any) -> list[dict[str, str]]:
 def response_create_payload_user_text(value: Any) -> str:
     entries = response_create_payload_user_entries(value)
     if entries:
-        return "\n".join(entry["text"] for entry in entries if entry.get("text"))
+        return "\n".join(
+            entry["text"]
+            for entry in entries
+            if entry.get("role") in {"user", "resume"} and entry.get("text")
+        )
     if isinstance(value, list):
         pieces = [response_create_payload_user_text(item) for item in value]
         return "\n".join(piece for piece in pieces if piece)
@@ -2575,26 +2599,79 @@ def goal_context_display_text(value: str) -> str:
     return CODEX_GOAL_CONTEXT_RE.sub(replace, value)
 
 
+def user_shell_command_transcript_entries(block: str, *, role: str) -> list[dict[str, str]]:
+    command_match = USER_SHELL_COMMAND_COMMAND_RE.search(block)
+    if not command_match:
+        return []
+    command = clean_transcript_text(command_match.group("command"))
+    if not command:
+        return []
+
+    result_match = USER_SHELL_COMMAND_RESULT_RE.search(block)
+    result = clean_transcript_text(result_match.group("result")) if result_match else ""
+    exit_code_match = USER_SHELL_RESULT_EXIT_CODE_RE.search(result)
+    duration_match = USER_SHELL_RESULT_DURATION_RE.search(result)
+    output_match = USER_SHELL_RESULT_OUTPUT_RE.search(result)
+    exit_code = clean_transcript_text(exit_code_match.group("value")) if exit_code_match else ""
+    duration = clean_transcript_text(duration_match.group("value")) if duration_match else ""
+    output = clean_transcript_text(output_match.group("value")) if output_match else ""
+
+    suffixes = []
+    if exit_code:
+        suffixes.append(f"exit {exit_code}")
+    if duration:
+        suffixes.append(f"duration {duration}")
+    header = f"Command: {command}"
+    if suffixes:
+        header = f"{header} ({', '.join(suffixes)})"
+    details = [header]
+    if output:
+        details.append(f"Output:\n{output}")
+    elif result:
+        details.append(f"Result:\n{result}")
+    return [
+        {"role": role, "text": f"! {command}"},
+        {"role": "tool", "text": "\n".join(details)},
+    ]
+
+
+def user_transcript_segment_entries(text: str, *, role: str) -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    offset = 0
+    for match in USER_SHELL_COMMAND_RE.finditer(text):
+        preceding = clean_control_user_text(text[offset : match.start()])
+        if preceding:
+            entries.append({"role": role, "text": preceding})
+        shell_entries = user_shell_command_transcript_entries(match.group("body"), role=role)
+        if shell_entries:
+            entries.extend(shell_entries)
+        else:
+            unparsed = clean_control_user_text(match.group(0))
+            if unparsed:
+                entries.append({"role": role, "text": unparsed})
+        offset = match.end()
+    trailing = clean_control_user_text(text[offset:])
+    if trailing:
+        entries.append({"role": role, "text": trailing})
+    return entries
+
+
 def user_transcript_entries(text: str) -> list[dict[str, str]]:
     text = goal_context_display_text(text)
     matches = list(ENVIRONMENT_CONTEXT_RE.finditer(text))
     if not matches:
-        cleaned = clean_control_user_text(text)
-        return [{"role": "user", "text": cleaned}] if cleaned else []
+        return user_transcript_segment_entries(text, role="user")
 
     history = ENVIRONMENT_CONTEXT_RE.sub("\n\n", text[: matches[-1].start()])
     current = ENVIRONMENT_CONTEXT_RE.sub("\n\n", text[matches[-1].end() :])
-    entries = []
-    history = clean_control_user_text(history)
-    current = clean_control_user_text(current)
-    if history:
-        entries.append({"role": "resume", "text": history})
-    if current:
-        entries.append({"role": "user", "text": current})
+    entries = user_transcript_segment_entries(history, role="resume")
+    entries.extend(user_transcript_segment_entries(current, role="user"))
     if entries:
         return entries
-    cleaned = clean_control_user_text(ENVIRONMENT_CONTEXT_RE.sub("\n\n", text))
-    return [{"role": "user", "text": cleaned}] if cleaned else []
+    return user_transcript_segment_entries(
+        ENVIRONMENT_CONTEXT_RE.sub("\n\n", text),
+        role="user",
+    )
 
 
 def split_user_entries_by_prompt_suffix(
