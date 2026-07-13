@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "provision"
-version = "0.4.0"
+version = "0.5.0"
 description = "Local Codex CLI control plane, profile manager, and session dashboard"
 readme = "README.md"
 requires-python = ">=3.11"

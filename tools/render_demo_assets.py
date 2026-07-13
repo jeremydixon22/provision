@@ -239,32 +239,32 @@ class DemoServer:
             key = str(session.get("key") or "")
             transcript = [
                 {
-                    "ts": (datetime.now() - timedelta(minutes=12)).isoformat(),
-                    "updated_at": (datetime.now() - timedelta(minutes=12)).isoformat(),
+                    "ts": (datetime.now() - timedelta(minutes=10, seconds=30)).isoformat(),
+                    "updated_at": (datetime.now() - timedelta(minutes=10, seconds=30)).isoformat(),
                     "role": "user",
-                    "text": "Tighten the release notes and verify the quota dashboard behavior.",
+                    "text": "! git status --short",
                     "turn_id": "turn_demo",
                     "profile": session.get("last_profile") or "work",
-                    "search_text": "user release notes quota dashboard",
+                    "search_text": "user git status short",
                 },
                 {
                     "ts": (datetime.now() - timedelta(minutes=10)).isoformat(),
                     "updated_at": (datetime.now() - timedelta(minutes=10)).isoformat(),
                     "role": "tool",
-                    "text": "Command: python3 tools/render_demo_assets.py (status completed, exit 0)\nStdout:\nRendered sanitized dashboard media.",
+                    "text": "Command: git status --short (exit 0, duration 0.018s)\nOutput:\nM README.md\nM src/provision/daemon.py",
                     "turn_id": "turn_demo",
                     "profile": session.get("last_profile") or "work",
-                    "search_text": "tool render demo assets",
-                    "call_id": "call_demo",
+                    "search_text": "tool git status short readme daemon",
+                    "call_id": "call_demo_shell",
                 },
                 {
                     "ts": (datetime.now() - timedelta(minutes=8)).isoformat(),
                     "updated_at": (datetime.now() - timedelta(minutes=8)).isoformat(),
                     "role": "assistant",
-                    "text": "I updated the release copy, checked the dashboard layout, and confirmed the active session indicators remain visible.",
+                    "text": "The working tree contains the intended release changes. The Discussion capture now shows the shell command as a structured activity card.",
                     "turn_id": "turn_demo",
                     "profile": session.get("last_profile") or "work",
-                    "search_text": "assistant updated release copy dashboard active session indicators",
+                    "search_text": "assistant release discussion shell command activity card",
                 },
             ]
             for transcript_index, item in enumerate(transcript):
@@ -303,7 +303,7 @@ class DemoServer:
                 "end_index": len(transcript) - 1,
                 "timestamp": transcript[0]["ts"],
                 "updated_at": transcript[-1]["updated_at"],
-                "label": "Tighten the release notes and verify the quota dashboard behavior.",
+                "label": "git status --short",
             }
             sessions.append(
                 dict(
@@ -358,8 +358,8 @@ class DemoServer:
         return profile == "work"
 
     def profile_model_setting(self, profile: str) -> dict[str, Any]:
-        model = "gpt-5.5" if profile == "work" else "gpt-5.4"
-        reasoning = "high" if profile == "work" else "medium"
+        model = "gpt-5.6-sol" if profile == "work" else "gpt-5.4"
+        reasoning = "xhigh" if profile == "work" else "medium"
         return {
             "model": model,
             "reasoning_effort": reasoning,
@@ -545,9 +545,27 @@ def quota_window(remaining_percent: float, window_seconds: int, reset_seconds: i
 
 
 def render_demo_html() -> str:
+    import provision.daemon as daemon_module
+
     handler = Handler.__new__(Handler)
     handler.server = DemoServer()
-    html = handler.render_ui()
+    original_compatibility_payload = daemon_module.codex_compatibility_payload
+    daemon_module.codex_compatibility_payload = lambda: {
+        "cli": {"available": True, "version": "0.144.3", "error": ""},
+        "runtime_cli": {"available": True, "version": "0.144.3", "error": ""},
+        "restart_required": {
+            "required": False,
+            "startup_version": "0.144.3",
+            "runtime_version": "0.144.3",
+            "reason": "",
+        },
+        "model_catalog": {"source": "demo", "available": True, "count": 6, "error": ""},
+        "app_server": {"available": True},
+    }
+    try:
+        html = handler.render_ui()
+    finally:
+        daemon_module.codex_compatibility_payload = original_compatibility_payload
     return html.replace("\n\t    connect();", "\n\t    // Demo page: the live daemon WebSocket is intentionally disabled.")
 
 
@@ -589,6 +607,7 @@ try {
 const outDir = process.env.DEMO_OUT_DIR;
 const url = process.env.DEMO_URL;
 const frameDir = process.env.DEMO_FRAME_DIR;
+const discussionFrameDir = process.env.DEMO_DISCUSSION_FRAME_DIR;
 const browserPath = process.env.DEMO_CHROMIUM_EXECUTABLE || "";
 
 async function newPage(browser, viewport, isMobile = false) {
@@ -623,8 +642,35 @@ async function newPage(browser, viewport, isMobile = false) {
   await session.page.waitForTimeout(150);
   await session.page.screenshot({
     path: path.join(outDir, "provision-control-plane-desktop-light.png"),
-    fullPage: true
+    fullPage: false
   });
+  await session.context.close();
+
+  session = await newPage(browser, { width: 1440, height: 1000 });
+  await session.page.click("#sessionTabs .session-tab[data-session-key]");
+  await session.page.waitForSelector("#controlModal:not([hidden])");
+  await session.page.waitForTimeout(250);
+  await session.page.mouse.move(960, 520);
+  await session.page.waitForTimeout(150);
+  await session.page.screenshot({
+    path: path.join(outDir, "provision-discussion-desktop-light.png"),
+    fullPage: false
+  });
+  fs.mkdirSync(discussionFrameDir, { recursive: true });
+  let discussionFrame = 0;
+  for (; discussionFrame < 12; discussionFrame++) {
+    await session.page.screenshot({ path: path.join(discussionFrameDir, `frame-${String(discussionFrame).padStart(3, "0")}.png`) });
+  }
+  await session.page.click("#controlDetailsView");
+  await session.page.waitForTimeout(250);
+  for (; discussionFrame < 24; discussionFrame++) {
+    await session.page.screenshot({ path: path.join(discussionFrameDir, `frame-${String(discussionFrame).padStart(3, "0")}.png`) });
+  }
+  await session.page.click("#controlDiscussionView");
+  await session.page.waitForTimeout(250);
+  for (; discussionFrame < 48; discussionFrame++) {
+    await session.page.screenshot({ path: path.join(discussionFrameDir, `frame-${String(discussionFrame).padStart(3, "0")}.png`) });
+  }
   await session.context.close();
 
   session = await newPage(browser, { width: 390, height: 844 }, true);
@@ -670,8 +716,10 @@ def render_assets(output_dir: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="provision-demo-") as temp_root:
         site_dir = Path(temp_root) / "site"
         frame_dir = Path(temp_root) / "frames"
+        discussion_frame_dir = Path(temp_root) / "discussion-frames"
         site_dir.mkdir()
         frame_dir.mkdir()
+        discussion_frame_dir.mkdir()
         write_demo_site(site_dir)
         server, url = serve(site_dir)
         try:
@@ -679,6 +727,7 @@ def render_assets(output_dir: Path) -> None:
             env["DEMO_URL"] = url
             env["DEMO_OUT_DIR"] = str(output_dir)
             env["DEMO_FRAME_DIR"] = str(frame_dir)
+            env["DEMO_DISCUSSION_FRAME_DIR"] = str(discussion_frame_dir)
             env["DEMO_CHROMIUM_EXECUTABLE"] = chromium_executable()
             result = subprocess.run(
                 ["node", "-e", NODE_SCRIPT],
@@ -691,6 +740,7 @@ def render_assets(output_dir: Path) -> None:
                 sys.stderr.write(result.stderr)
                 result.check_returncode()
             encode_video(frame_dir, output_dir / "provision-dashboard-theme-toggle.mp4")
+            encode_video(discussion_frame_dir, output_dir / "provision-discussion-demo.mp4")
         finally:
             server.shutdown()
             server.server_close()
@@ -714,6 +764,7 @@ def expected_capture_outputs_exist(output_dir: Path, frame_dir: Path) -> bool:
     required = [
         output_dir / "provision-dashboard-desktop-light.png",
         output_dir / "provision-control-plane-desktop-light.png",
+        output_dir / "provision-discussion-desktop-light.png",
         output_dir / "provision-dashboard-mobile-light.png",
         output_dir / "provision-dashboard-desktop-dark.png",
     ]

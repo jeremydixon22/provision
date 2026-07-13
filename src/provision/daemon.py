@@ -11616,6 +11616,10 @@ class Handler(BaseHTTPRequestHandler):
 		      --danger: #ff6b63;
 		      --shadow: 0 14px 34px rgba(0, 0, 0, 0.34);
 		    }
+    html {
+      min-height: 100%;
+      background: var(--page);
+    }
     * { box-sizing: border-box; }
     body {
       margin: 0;
@@ -11646,7 +11650,7 @@ class Handler(BaseHTTPRequestHandler):
 		      border-radius: 6px;
 		      flex: 0 0 auto;
 		    }
-	    .top-meta {
+    .top-meta {
 	      display: flex;
 	      flex-wrap: wrap;
 	      gap: 10px;
@@ -11654,6 +11658,9 @@ class Handler(BaseHTTPRequestHandler):
 	      font-size: 13px;
 	      flex: 1 1 300px;
 	    }
+    #codexRestartRequired[hidden] {
+      display: none;
+    }
     .pill {
       display: inline-flex;
       align-items: center;
