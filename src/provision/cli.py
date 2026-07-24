@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Sequence
 
 from . import __version__
+from .connector import connector_abi_payload
 from .daemon import (
     CodexAppServerClient,
     CodexAppServerError,
@@ -35,6 +36,7 @@ def ui_url(host: object | None, port: object) -> str:
 
 COMMANDS = {
     "app-server-probe",
+    "connector",
     "daemon",
     "doctor",
     "help",
@@ -62,6 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("help", help="show Provision help")
     app_server_probe = subparsers.add_parser("app-server-probe", help="inspect Codex CLI app-server capabilities")
     app_server_probe.add_argument("--read-account", action="store_true", help="read current account usage and rate limits")
+
+    connector = subparsers.add_parser(
+        "connector",
+        help="inspect or explicitly enable the local generic Connector ABI socket",
+    )
+    connector.add_argument("action", nargs="?", choices=("abi", "status", "enable", "disable"), default="status")
 
     daemon = subparsers.add_parser("daemon", help="run the local proxy daemon")
     daemon.add_argument("--port", type=int, default=None)
@@ -128,6 +136,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "app-server-probe":
             return cmd_app_server_probe(args)
+        if args.command == "connector":
+            return cmd_connector(paths, store, args)
         if args.command == "import-default":
             return cmd_import_default(store, args)
         if args.command == "login":
@@ -257,6 +267,56 @@ def cmd_app_server_probe(args: argparse.Namespace) -> int:
             exit_code = 1
     print(json.dumps(payload, indent=2))
     return exit_code
+
+
+def connector_daemon_action(
+    store: Store,
+    action: str,
+    port: int,
+    host: str | None = None,
+) -> dict[str, object]:
+    body = urllib.parse.urlencode({"token": store.proxy_token(), "action": action})
+    conn = http.client.HTTPConnection(daemon_url_host(host), port, timeout=5)
+    try:
+        conn.request(
+            "POST",
+            "/api/connector",
+            body=body,
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+        response = conn.getresponse()
+        payload = response.read()
+    finally:
+        conn.close()
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        data = {}
+    if response.status != 200 or not isinstance(data, dict) or not data.get("ok"):
+        error = data.get("error") if isinstance(data, dict) else None
+        raise RuntimeError(str(error or f"connector control failed with HTTP {response.status}"))
+    connector = data.get("connector")
+    return connector if isinstance(connector, dict) else {}
+
+
+def cmd_connector(paths: Paths, store: Store, args: argparse.Namespace) -> int:
+    action = str(args.action or "status")
+    if action == "abi":
+        print(json.dumps(connector_abi_payload(), indent=2))
+        return 0
+
+    status = daemon_running(paths)
+    if action == "enable":
+        status = ensure_daemon(paths, configured_daemon_port(), configured_daemon_host())
+    if not status:
+        print(json.dumps({"enabled": False, "reason": "daemon is not running"}, indent=2))
+        return 1 if action == "status" else 0
+    port = status.get("port")
+    if not isinstance(port, int):
+        raise RuntimeError("daemon status did not include a port")
+    connector = connector_daemon_action(store, action, port, str(status.get("host") or ""))
+    print(json.dumps(connector, indent=2))
+    return 0
 
 
 def cmd_start(paths: Paths, port: int | None = None, host: str | None = None) -> int:

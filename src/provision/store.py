@@ -63,6 +63,7 @@ class Store:
             metadata = self.read_metadata(name)
             metadata["name"] = name
             metadata["active"] = name == active
+            metadata["hidden"] = bool(metadata.get("hidden"))
             profiles.append(metadata)
         return profiles
 
@@ -102,7 +103,10 @@ class Store:
         target_dir.chmod(0o700)
         write_secret_json(target_auth, auth)
 
+        prior_metadata = self.read_metadata(name)
         metadata = extract_metadata(auth)
+        if prior_metadata.get("hidden"):
+            metadata["hidden"] = True
         write_secret_json(target_dir / "metadata.json", metadata)
         if set_active or not self.paths.active_profile.exists():
             self.set_active_profile(name)
@@ -142,6 +146,19 @@ class Store:
         self.paths.active_profile.write_text(name + "\n", encoding="utf-8")
         self.paths.active_profile.chmod(0o600)
 
+    def set_profile_hidden(self, name: str, hidden: bool) -> None:
+        """Persist dashboard visibility without changing profile availability.
+
+        Hidden profiles continue to be eligible for routing and can remain
+        active; this setting only declutters the dashboard profile list.
+        """
+        validate_profile_name(name)
+        if not self.profile_exists(name):
+            raise StoreError(f"profile does not exist: {name}")
+        metadata = self.read_metadata(name)
+        metadata["hidden"] = bool(hidden)
+        write_secret_json(self.metadata_path(name), metadata)
+
     def remove_profile(self, name: str) -> None:
         """Remove credentials for a profile after a profile-scoped Codex logout."""
         directory = self.profile_dir(name)
@@ -168,6 +185,49 @@ class Store:
         self.paths.proxy_token.parent.mkdir(parents=True, exist_ok=True)
         self.paths.proxy_token.write_text(token + "\n", encoding="utf-8")
         self.paths.proxy_token.chmod(0o600)
+        return token
+
+    def remote_secret(self) -> bytes:
+        """Return the daemon-local secret used for opaque remote identifiers.
+
+        This is intentionally distinct from the proxy token.  A future Remote
+        Agent gets its authority from a paired transport identity, not from
+        this value or any existing dashboard credential.
+        """
+        try:
+            secret = self.paths.remote_secret.read_bytes()
+        except OSError:
+            secret = b""
+        if len(secret) >= 32:
+            return secret[:32]
+        secret = secrets.token_bytes(32)
+        self.paths.remote_secret.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.remote_secret.write_bytes(secret)
+        self.paths.remote_secret.chmod(0o600)
+        return secret
+
+    def remote_agent_token(self) -> str:
+        """Return the separate local capability for the future Remote Agent."""
+        if self.paths.remote_agent_token.exists():
+            token = self.paths.remote_agent_token.read_text(encoding="utf-8").strip()
+            if token:
+                return token
+        token = secrets.token_urlsafe(32)
+        self.paths.remote_agent_token.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.remote_agent_token.write_text(token + "\n", encoding="utf-8")
+        self.paths.remote_agent_token.chmod(0o600)
+        return token
+
+    def connector_token(self) -> str:
+        """Return the distinct local capability for an explicitly enabled Connector."""
+        if self.paths.connector_token.exists():
+            token = self.paths.connector_token.read_text(encoding="utf-8").strip()
+            if token:
+                return token
+        token = secrets.token_urlsafe(32)
+        self.paths.connector_token.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.connector_token.write_text(token + "\n", encoding="utf-8")
+        self.paths.connector_token.chmod(0o600)
         return token
 
     def delete_capture(self, path: Path) -> None:

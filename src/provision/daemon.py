@@ -40,7 +40,32 @@ from .auth import (
     upstream_base_url,
     upstream_chatgpt_backend_base_url,
 )
+from .connector import (
+    CONNECTOR_ABI_VERSION,
+    ConnectorError,
+    LocalConnectorHub,
+)
 from .paths import Paths, default_codex_home, launcher_path
+from .remote import (
+    REMOTE_ACTION_PROMPT_MAX_BYTES,
+    REMOTE_DELTA_SYNC_MAX_BYTES,
+    REMOTE_DEFAULT_CAPABILITIES,
+    LocalRemoteAgentSocket,
+    RemoteActionCache,
+    RemoteControlLeases,
+    RemoteCursorCodec,
+    RemoteDeviceRegistry,
+    RemoteError,
+    RemoteStateSynchronizer,
+    build_remote_discussion_page,
+    build_remote_message_expand,
+    build_remote_session_summaries,
+    compact_json_bytes,
+    opaque_identifier,
+    remote_discussion_entry,
+    remote_session_id,
+    remote_session_audit_ref,
+)
 from .store import Store, StoreError
 
 
@@ -77,6 +102,14 @@ UPSTREAM_IDENTITY_HEADERS = {
     "x-openai-fedramp",
 }
 DEFAULT_UPSTREAM_USER_AGENT = "OpenAI Codex CLI (Provision local proxy)"
+CODEX_API_POST_PROXY_PATHS = frozenset(
+    {
+        "/v1/responses",
+        "/v1/responses/compact",
+        "/v1/images/generations",
+        "/v1/images/edits",
+    }
+)
 
 PROTOCOL_VERSION = 28
 DEFAULT_DAEMON_HOST = "127.0.0.1"
@@ -170,7 +203,9 @@ CONTROL_PLANE_SESSION_EVENT_LIMIT = 32
 CONTROL_TRANSCRIPT_MAX_ITEMS = 600
 CONTROL_TRANSCRIPT_TEXT_LIMIT = 12000
 CONTROL_TRANSCRIPT_EVENT_TEXT_LIMIT = 4000
-CONTROL_CONTEXT_WINDOW_TOKENS = 256000
+CONTROL_TRANSCRIPT_SNAPSHOT_MAX_BYTES = 64 * 1024
+CONTROL_TURN_PAYLOAD_MAX_BYTES = 256 * 1024
+CONTROL_CONTEXT_WINDOW_TOKENS = 272000
 UI_DIRTY_LOG_LIMIT = 512
 CONTROL_HISTORY_CACHE_SECONDS = 5.0
 CONTROL_HISTORY_TURN_SEARCH_TEXT_LIMIT = 1600
@@ -2924,6 +2959,17 @@ def nested_command_value(value: Any) -> str:
     return ""
 
 
+def patch_tool_input(value: Any) -> str:
+    """Return an apply_patch body embedded in a tool-call-shaped payload, if any."""
+    if not isinstance(value, dict):
+        return ""
+    for key in ("patch", "input", "content", "arguments", "cmd", "command", "code"):
+        text = compact_tool_detail(value.get(key))
+        if "*** Begin Patch" in text:
+            return text
+    return ""
+
+
 def tool_call_identifier(value: dict[str, Any]) -> str:
     return first_string_value(
         value,
@@ -3135,13 +3181,31 @@ def tool_activity_entry_from_value(value: Any) -> dict[str, Any] | None:
         or is_web_search_tool_call_name(call_id)
     )
     is_programmatic = normalized in {"program", "program_output"}
+    original_name = name
     status = first_string_value(value, ("status", "state"))
     exit_code = first_string_value(value, ("exit_code", "exitCode", "returncode"))
     command = nested_command_value(value)
     if programmatic_details and programmatic_details["command"]:
         command = programmatic_details["command"]
+    patch_input = patch_tool_input(value)
+    if not patch_input and programmatic_details:
+        for candidate in (programmatic_details["input"], programmatic_details["command"]):
+            if "*** Begin Patch" in candidate:
+                patch_input = candidate
+                break
+    patch_source = ""
+    if patch_input:
+        patch_source = original_name or normalized
+        name = "apply_patch"
+        command = ""
     detail_sections: list[tuple[str, str]] = []
     seen_detail_text: set[tuple[str, str]] = set()
+    if patch_input:
+        source = "native apply_patch" if "apply_patch" in patch_source.lower() or normalized == "apply_patch_call" else patch_source
+        seen_detail_text.add(("Source", source))
+        detail_sections.append(("Source", source))
+        seen_detail_text.add(("Input", patch_input))
+        detail_sections.append(("Input", patch_input))
     if programmatic_details and programmatic_details["input"]:
         programmatic_input = programmatic_details["input"]
         seen_detail_text.add(("Input", programmatic_input))
@@ -3151,7 +3215,7 @@ def tool_activity_entry_from_value(value: Any) -> dict[str, Any] | None:
         if query:
             seen_detail_text.add(("Query", query))
             detail_sections.append(("Query", query))
-    if "apply_patch" in name.lower() or normalized == "apply_patch_call":
+    if not patch_input and ("apply_patch" in name.lower() or normalized == "apply_patch_call"):
         for key in ("cmd", "command"):
             text = compact_tool_detail(value.get(key))
             if text and "*** Begin Patch" in text:
@@ -3189,11 +3253,15 @@ def tool_activity_entry_from_value(value: Any) -> dict[str, Any] | None:
             }
         ):
             continue
+        if patch_input and text == patch_input:
+            continue
         detail_key = (label, text)
         if text and detail_key not in seen_detail_text:
             seen_detail_text.add(detail_key)
             detail_sections.append((label, text))
-    if normalized in {"local_shell_call", "shell_call", "command_execution"} or (
+    if patch_input:
+        header = "Tool: apply_patch"
+    elif normalized in {"local_shell_call", "shell_call", "command_execution"} or (
         command and not is_programmatic
     ):
         header = f"Command: {command or name}"
@@ -5743,6 +5811,21 @@ class ProvisionServer(ThreadingHTTPServer):
         self.paths = paths
         self.store = Store(paths)
         self.proxy_token = self.store.proxy_token()
+        # Remote groundwork stays inert during normal local-only operation.
+        # In particular, normal daemon startup creates neither a Remote Agent
+        # capability nor remote credential material on disk.
+        self.remote_runtime_lock = threading.Lock()
+        self.remote_secret: bytes | None = None
+        self.remote_cursor_codec: RemoteCursorCodec | None = None
+        self.remote_devices: RemoteDeviceRegistry | None = None
+        self.remote_state: RemoteStateSynchronizer | None = None
+        self.remote_actions: RemoteActionCache | None = None
+        self.remote_control_leases = RemoteControlLeases()
+        self.remote_action_locks: dict[str, threading.Lock] = {}
+        self.remote_action_locks_lock = threading.Lock()
+        self.remote_agent_api: LocalRemoteAgentSocket | None = None
+        self.connector_hub_lock = threading.Lock()
+        self.connector_hub: LocalConnectorHub | None = None
         self.active_requests: dict[int, dict[str, Any]] = {}
         self.active_websockets: dict[int, dict[str, Any]] = {}
         self.active_lock = threading.Lock()
@@ -5795,6 +5878,208 @@ class ProvisionServer(ThreadingHTTPServer):
                 message,
             )
         )
+
+    def ensure_remote_runtime(self) -> None:
+        """Lazily allocate dormant local state for a future Remote Agent."""
+        if self.remote_state is not None:
+            return
+        with self.remote_runtime_lock:
+            if self.remote_state is not None:
+                return
+            secret = self.store.remote_secret()
+            self.remote_secret = secret
+            self.remote_cursor_codec = RemoteCursorCodec(secret)
+            self.remote_devices = RemoteDeviceRegistry(self.paths.remote_devices, self.paths.remote_audit)
+            self.remote_state = RemoteStateSynchronizer()
+            self.remote_actions = RemoteActionCache(self.paths.remote_action_state)
+
+    def remote_runtime(
+        self,
+    ) -> tuple[bytes, RemoteCursorCodec, RemoteDeviceRegistry, RemoteStateSynchronizer, RemoteActionCache]:
+        self.ensure_remote_runtime()
+        assert self.remote_secret is not None
+        assert self.remote_cursor_codec is not None
+        assert self.remote_devices is not None
+        assert self.remote_state is not None
+        assert self.remote_actions is not None
+        return (
+            self.remote_secret,
+            self.remote_cursor_codec,
+            self.remote_devices,
+            self.remote_state,
+            self.remote_actions,
+        )
+
+    def start_remote_agent_api(self) -> None:
+        self.ensure_remote_runtime()
+        with self.remote_runtime_lock:
+            if self.remote_agent_api is None:
+                self.remote_agent_api = LocalRemoteAgentSocket(
+                    self.paths.remote_agent_socket,
+                    self.store.remote_agent_token(),
+                    self.handle_remote_agent_request,
+                )
+            agent_api = self.remote_agent_api
+        agent_api.start()
+
+    def stop_remote_agent_api(self) -> None:
+        with self.remote_runtime_lock:
+            agent_api = self.remote_agent_api
+        if agent_api is not None:
+            agent_api.stop()
+
+    @staticmethod
+    def connector_lanes() -> list[str]:
+        return ["provision.echo/v1", "provision.remote/v1"]
+
+    def connector_status(self) -> dict[str, Any]:
+        with self.connector_hub_lock:
+            hub = self.connector_hub
+        return {
+            "enabled": bool(hub and hub.running()),
+            "abi": CONNECTOR_ABI_VERSION,
+            "lanes": self.connector_lanes(),
+        }
+
+    def connector_echo_frame(
+        self,
+        _connector_id: str,
+        _link_id: str,
+        _lane: str,
+        payload: bytes,
+    ) -> bytes:
+        """Reference lane used to validate a connector without network access."""
+        return payload
+
+    def connector_remote_frame(
+        self,
+        _connector_id: str,
+        _link_id: str,
+        _lane: str,
+        payload: bytes,
+    ) -> bytes:
+        """Adapt the bounded Remote service to the generic Connector ABI.
+
+        The connector is a trusted *local* process.  Network peer identity,
+        encryption, and pairing proof must be completed by that process before
+        it submits an already-authenticated device request here.
+        """
+        try:
+            request = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return compact_json_bytes({"ok": False, "error": "invalid remote connector frame"})
+        if not isinstance(request, dict) or "token" in request:
+            return compact_json_bytes({"ok": False, "error": "invalid remote connector frame"})
+        try:
+            result = self.handle_remote_agent_request(request)
+        except RemoteError as exc:
+            return compact_json_bytes({"ok": False, "error": str(exc)})
+        return compact_json_bytes({"ok": True, "result": result})
+
+    def start_connector_hub(self) -> dict[str, Any]:
+        """Enable only the local Connector ABI socket; never a network listener."""
+        with self.connector_hub_lock:
+            if self.connector_hub is None:
+                self.connector_hub = LocalConnectorHub(
+                    self.paths.connector_socket,
+                    self.store.connector_token(),
+                    {
+                        "provision.echo/v1": self.connector_echo_frame,
+                        "provision.remote/v1": self.connector_remote_frame,
+                    },
+                )
+            hub = self.connector_hub
+        try:
+            hub.start()
+        except ConnectorError as exc:
+            raise StoreError(str(exc)) from exc
+        return self.connector_status()
+
+    def stop_connector_hub(self) -> dict[str, Any]:
+        with self.connector_hub_lock:
+            hub = self.connector_hub
+            self.connector_hub = None
+        if hub is not None:
+            hub.stop()
+        return self.connector_status()
+
+    def server_close(self) -> None:
+        self.stop_connector_hub()
+        self.stop_remote_agent_api()
+        super().server_close()
+
+    def handle_remote_agent_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Dispatch the typed Unix-socket contract used by a future agent.
+
+        The socket authenticates only the *local* process.  Device identity and
+        capability checks below remain mandatory so this API cannot substitute
+        for transport pairing when a remote transport is eventually added.
+        """
+        operation = request.get("operation")
+        if not isinstance(operation, str):
+            raise RemoteError("local remote-agent operation is required")
+        device_id = request.get("device_id")
+        if not isinstance(device_id, str):
+            raise RemoteError("remote device ID is required")
+        if operation == "state":
+            since = request.get("since_revision")
+            cursor = request.get("cursor")
+            if since is not None and (isinstance(since, bool) or not isinstance(since, int)):
+                raise RemoteError("invalid remote revision")
+            if cursor is not None and not isinstance(cursor, str):
+                raise RemoteError("invalid remote session cursor")
+            return self.remote_state_payload(
+                device_id,
+                since_revision=since,
+                cursor=cursor or "",
+            )
+        session_id = request.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise RemoteError("remote session ID is required")
+        if operation == "discussion":
+            cursor = request.get("cursor")
+            if cursor is not None and not isinstance(cursor, str):
+                raise RemoteError("invalid remote discussion cursor")
+            return self.remote_discussion_payload(device_id, session_id, cursor=cursor or "")
+        if operation == "message_expand":
+            message_id = request.get("message_id")
+            cursor = request.get("cursor")
+            if not isinstance(message_id, str) or not message_id:
+                raise RemoteError("remote message ID is required")
+            if cursor is not None and not isinstance(cursor, str):
+                raise RemoteError("invalid remote expansion cursor")
+            return self.remote_message_expand_payload(
+                device_id,
+                session_id,
+                message_id,
+                cursor=cursor or "",
+            )
+        if operation == "action":
+            expected_revision = request.get("expected_revision")
+            expected_turn_id = request.get("expected_turn_id")
+            idempotency_key = request.get("idempotency_key")
+            expires_at = request.get("expires_at")
+            action = request.get("action")
+            prompt = request.get("prompt", "")
+            if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+                raise RemoteError("remote action revision is required")
+            if not isinstance(expected_turn_id, str):
+                raise RemoteError("invalid remote action turn")
+            if not isinstance(idempotency_key, str) or not isinstance(expires_at, str):
+                raise RemoteError("remote action idempotency key and expiry are required")
+            if not isinstance(action, str) or not isinstance(prompt, str):
+                raise RemoteError("invalid remote action")
+            return self.perform_remote_action(
+                device_id,
+                action=action,
+                session_id=session_id,
+                expected_revision=expected_revision,
+                expected_turn_id=expected_turn_id,
+                idempotency_key=idempotency_key,
+                expires_at=expires_at,
+                prompt=prompt,
+            )
+        raise RemoteError("unsupported local remote-agent operation")
 
     def mark_ui_dirty(self, reason: str = "state") -> int:
         lock = getattr(self, "ui_state_lock", None)
@@ -6278,6 +6563,69 @@ class ProvisionServer(ThreadingHTTPServer):
             raise StoreError("historical turn was not found for this session")
         payload["session_key"] = session_key
         return payload
+
+    def control_turn_payload_for_session(
+        self,
+        session_key: str,
+        turn_key: str,
+        *,
+        before_index: int | None = None,
+    ) -> dict[str, Any]:
+        """Return one bounded, newest-first page of an observed turn.
+
+        Full Discussion retention is useful locally, but it must not be part of
+        every dashboard snapshot.  Older turn material is therefore fetched
+        explicitly and bounded even when one turn contains many tool entries.
+        """
+        with self.active_lock:
+            record = self.observed_sessions.get(session_key)
+            if not isinstance(record, dict):
+                raise StoreError("unknown session")
+            transcript = self.control_transcript_snapshot(session_key)
+            turn = next(
+                (
+                    candidate
+                    for candidate in self.control_turns_from_transcript(transcript)
+                    if str(candidate.get("key") or "") == turn_key
+                ),
+                None,
+            )
+        if not isinstance(turn, dict):
+            raise StoreError("observed turn was not found for this session")
+        start_index = max(0, int(turn.get("start_index") or 0))
+        end_index = max(start_index, int(turn.get("end_index") or start_index))
+        if before_index is None:
+            page_end = end_index
+        elif isinstance(before_index, bool) or not isinstance(before_index, int):
+            raise StoreError("invalid observed turn cursor")
+        else:
+            page_end = min(end_index, before_index - 1)
+        if page_end < start_index:
+            raise StoreError("no older observed discussion is available")
+
+        selected: list[dict[str, Any]] = []
+        encoded_size = 2
+        for item in reversed(transcript):
+            control_index = int(item.get("control_index") or 0)
+            if control_index < start_index or control_index > page_end:
+                continue
+            item_size = len(json.dumps(item, separators=(",", ":")).encode("utf-8"))
+            if selected and encoded_size + item_size + 1 > CONTROL_TURN_PAYLOAD_MAX_BYTES:
+                break
+            selected.append(item)
+            encoded_size += item_size + 1
+        selected.reverse()
+        if not selected:
+            raise StoreError("observed turn could not be loaded")
+        first_index = int(selected[0].get("control_index") or start_index)
+        return {
+            "source": "observed",
+            "session_key": session_key,
+            "turn_key": turn_key,
+            "transcript": selected,
+            "has_more_before": first_index > start_index,
+            "next_before_index": first_index if first_index > start_index else None,
+        }
 
     def save_profile_settings_locked(self) -> None:
         try:
@@ -7432,6 +7780,7 @@ class ProvisionServer(ThreadingHTTPServer):
         self,
         transcript: list[dict[str, Any]],
         *,
+        session_key: str,
         turn_id: str,
         profile: str,
         now: str,
@@ -7447,8 +7796,15 @@ class ProvisionServer(ThreadingHTTPServer):
                 continue
             existing["updated_at"] = now
             existing["profile"] = profile or existing.get("profile") or ""
+            self.record_remote_transcript_change(
+                session_key,
+                transcript,
+                existing,
+                replace=True,
+            )
             return
         item = {
+            "item_id": f"cti_{uuid.uuid4().hex}",
             "ts": now,
             "updated_at": now,
             "role": "context_compaction",
@@ -7457,6 +7813,12 @@ class ProvisionServer(ThreadingHTTPServer):
         }
         self.set_transcript_item_text(item, "context_compaction", text)
         transcript.append(item)
+        self.record_remote_transcript_change(
+            session_key,
+            transcript,
+            item,
+            replace=False,
+        )
 
     @staticmethod
     def transcript_has_activity_after(
@@ -7492,6 +7854,15 @@ class ProvisionServer(ThreadingHTTPServer):
         self.mark_ui_dirty("transcript")
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         transcript = self.control_transcripts.setdefault(session_key, [])
+
+        def notify_remote(item: dict[str, Any], *, replace: bool) -> None:
+            self.record_remote_transcript_change(
+                session_key,
+                transcript,
+                item,
+                replace=replace,
+            )
+
         if role == "user" and not turn_id and not append:
             for index in range(len(transcript) - 1, -1, -1):
                 existing = transcript[index]
@@ -7505,6 +7876,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 )
                 if replay_marker_seen:
                     existing["updated_at"] = now
+                    notify_remote(existing, replace=True)
                     return
                 break
         if role not in {"user", "user_pending", "resume", "context_compaction"} and turn_id:
@@ -7521,6 +7893,10 @@ class ProvisionServer(ThreadingHTTPServer):
             profile=profile,
             now=now,
         ):
+            for existing in reversed(transcript):
+                if existing.get("role") == "user" and self.transcript_text_matches(existing, text):
+                    notify_remote(existing, replace=True)
+                    break
             return
         if role == "resume" and not append and transcript and transcript[-1].get("role") == "resume":
             existing = transcript[-1]
@@ -7539,6 +7915,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 existing["updated_at"] = now
                 existing["turn_id"] = turn_id or existing_turn or ""
                 existing["profile"] = profile or existing.get("profile") or ""
+                notify_remote(existing, replace=True)
                 return
         if role in {"resume", "user"} and not append:
             for index in range(len(transcript) - 1, -1, -1):
@@ -7556,6 +7933,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 existing["profile"] = profile or existing.get("profile") or ""
                 existing["updated_at"] = now
                 self.set_transcript_item_text(existing, role, text)
+                notify_remote(existing, replace=True)
                 if role == "resume" and self.transcript_has_activity_after(
                     transcript,
                     index,
@@ -7563,12 +7941,21 @@ class ProvisionServer(ThreadingHTTPServer):
                 ):
                     self.append_context_replay_marker(
                         transcript,
+                        session_key=session_key,
                         turn_id=turn_id,
                         profile=profile,
                         now=now,
                     )
                     if len(transcript) > CONTROL_TRANSCRIPT_MAX_ITEMS:
-                        del transcript[0 : len(transcript) - CONTROL_TRANSCRIPT_MAX_ITEMS]
+                        trim_count = len(transcript) - CONTROL_TRANSCRIPT_MAX_ITEMS
+                        dropped = transcript[:trim_count]
+                        del transcript[:trim_count]
+                        for dropped_index, dropped_item in enumerate(dropped):
+                            self.record_remote_transcript_remove(
+                                session_key,
+                                dropped_item,
+                                index=dropped_index,
+                            )
                 return
         if role == "assistant":
             for existing in reversed(transcript):
@@ -7582,6 +7969,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 existing["updated_at"] = now
                 existing["turn_id"] = turn_id or existing_turn or ""
                 existing["profile"] = profile or existing.get("profile") or ""
+                notify_remote(existing, replace=True)
                 return
         if role == "tool" and call_id:
             for existing in reversed(transcript):
@@ -7593,6 +7981,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 existing["updated_at"] = now
                 existing["turn_id"] = turn_id or existing.get("turn_id") or ""
                 existing["profile"] = profile or existing.get("profile") or ""
+                notify_remote(existing, replace=True)
                 return
         if (
             append
@@ -7605,6 +7994,7 @@ class ProvisionServer(ThreadingHTTPServer):
             merged = existing + separator + text
             self.set_transcript_item_text(transcript[-1], role, merged)
             transcript[-1]["updated_at"] = now
+            notify_remote(transcript[-1], replace=True)
             return
         clipped = self.transcript_display_text(text)
         for existing in transcript[-6:]:
@@ -7615,6 +8005,7 @@ class ProvisionServer(ThreadingHTTPServer):
             ):
                 return
         item = {
+            "item_id": f"cti_{uuid.uuid4().hex}",
             "ts": now,
             "updated_at": now,
             "role": role,
@@ -7627,8 +8018,17 @@ class ProvisionServer(ThreadingHTTPServer):
         if call_id:
             item["call_id"] = call_id
         transcript.append(item)
+        notify_remote(item, replace=False)
         if len(transcript) > CONTROL_TRANSCRIPT_MAX_ITEMS:
-            del transcript[0 : len(transcript) - CONTROL_TRANSCRIPT_MAX_ITEMS]
+            trim_count = len(transcript) - CONTROL_TRANSCRIPT_MAX_ITEMS
+            dropped = transcript[:trim_count]
+            del transcript[:trim_count]
+            for dropped_index, dropped_item in enumerate(dropped):
+                self.record_remote_transcript_remove(
+                    session_key,
+                    dropped_item,
+                    index=dropped_index,
+                )
 
     def record_websocket_transcript_message(
         self,
@@ -7905,12 +8305,47 @@ class ProvisionServer(ThreadingHTTPServer):
             self.mark_ui_dirty("websocket_close")
         return count
 
-    def control_transcript_snapshot(self, session_key: str) -> list[dict[str, Any]]:
-        rows = []
-        for index, item in enumerate(self.control_transcripts.get(session_key, [])[-CONTROL_TRANSCRIPT_MAX_ITEMS:]):
+    def control_transcript_snapshot_window(
+        self,
+        session_key: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, int | bool]]:
+        """Return the newest transcript window and metadata for on-demand paging."""
+        retained = self.control_transcripts.get(session_key, [])[-CONTROL_TRANSCRIPT_MAX_ITEMS:]
+        rows: list[dict[str, Any]] = []
+        for index, item in enumerate(retained):
             copied = dict(item)
             copied["control_index"] = index
             rows.append(copied)
+        if max_bytes is None:
+            start = 0
+            return rows, {
+                "start_index": start,
+                "end_index": len(rows) - 1,
+                "total_items": len(rows),
+                "has_more_before": False,
+            }
+
+        selected: list[dict[str, Any]] = []
+        encoded_size = 2
+        for item in reversed(rows):
+            item_size = len(json.dumps(item, separators=(",", ":")).encode("utf-8"))
+            if selected and encoded_size + item_size + 1 > max_bytes:
+                break
+            selected.append(item)
+            encoded_size += item_size + 1
+        selected.reverse()
+        start = int(selected[0].get("control_index") or 0) if selected else len(rows)
+        return selected, {
+            "start_index": start,
+            "end_index": len(rows) - 1,
+            "total_items": len(rows),
+            "has_more_before": start > 0,
+        }
+
+    def control_transcript_snapshot(self, session_key: str) -> list[dict[str, Any]]:
+        rows, _window = self.control_transcript_snapshot_window(session_key)
         return rows
 
     def control_turns_from_transcript(self, transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -8140,9 +8575,14 @@ class ProvisionServer(ThreadingHTTPServer):
                     "requests": request_rows,
                     "tunnels": tunnel_rows,
                 }
-                transcript = self.control_transcript_snapshot(key)
+                full_transcript = self.control_transcript_snapshot(key)
+                transcript, transcript_window = self.control_transcript_snapshot_window(
+                    key,
+                    max_bytes=CONTROL_TRANSCRIPT_SNAPSHOT_MAX_BYTES,
+                )
                 session["transcript"] = transcript
-                session["turns"] = self.control_turns_from_transcript(transcript)
+                session["transcript_window"] = transcript_window
+                session["turns"] = self.control_turns_from_transcript(full_transcript)
 
         for event in self.stats_events(CONTROL_PLANE_EVENT_LIMIT):
             session_key = event.get("session_key")
@@ -8181,6 +8621,361 @@ class ProvisionServer(ThreadingHTTPServer):
                 else "Launch or resume a Codex CLI session with `provision` in an interactive terminal to enable live UI input.",
             },
         }
+
+    # Remote control intentionally uses a narrow source rather than
+    # control_plane_sessions().  The latter includes every retained
+    # transcript item for the local dashboard; constructing it for remote
+    # state would recreate the oversized snapshot problem this design solves.
+    def remote_session_summaries(self) -> list[dict[str, Any]]:
+        secret, _cursor_codec, _devices, _state, _actions = self.remote_runtime()
+        sessions = self.session_snapshots()
+        contexts: dict[str, dict[str, Any]] = {}
+        for event in self.stats_events(CONTROL_PLANE_EVENT_LIMIT):
+            session_key = event.get("session_key")
+            if not isinstance(session_key, str) or not session_key:
+                continue
+            if event.get("type") != "token_usage":
+                continue
+            context = context_summary_from_usage(event.get("usage"))
+            if context:
+                contexts[session_key] = context
+        with self.active_lock:
+            self.expire_websocket_work_locked()
+            turns_by_session: dict[str, list[dict[str, str]]] = {}
+            for tunnel in self.active_websockets.values():
+                session_key = tunnel.get("session_key")
+                turn_id = tunnel.get("turn_id")
+                if not isinstance(session_key, str) or not session_key:
+                    continue
+                if not isinstance(turn_id, str) or not turn_id:
+                    continue
+                turns_by_session.setdefault(session_key, []).append({"turn_id": turn_id})
+        for session in sessions:
+            key = str(session.get("key") or "")
+            if key in contexts:
+                session["context"] = contexts[key]
+            session["active_details"] = {"tunnels": turns_by_session.get(key, [])}
+        return build_remote_session_summaries({"sessions": sessions}, secret)
+
+    def refresh_remote_state(self) -> int:
+        _secret, _cursor_codec, _devices, state, _actions = self.remote_runtime()
+        return state.refresh(self.remote_session_summaries())
+
+    def record_remote_transcript_change(
+        self,
+        session_key: str,
+        transcript: list[dict[str, Any]],
+        item: dict[str, Any],
+        *,
+        replace: bool,
+    ) -> None:
+        """Queue one bounded Discussion delta without rebuilding a transcript."""
+        remote_state = getattr(self, "remote_state", None)
+        secret = getattr(self, "remote_secret", None)
+        if not isinstance(remote_state, RemoteStateSynchronizer) or not isinstance(secret, bytes):
+            return
+        try:
+            index = transcript.index(item)
+        except ValueError:
+            return
+        session_id = remote_session_id(secret, session_key)
+        entry = remote_discussion_entry(
+            secret=secret,
+            session_id=session_id,
+            item=item,
+            index=index,
+        )
+        remote_state.record_discussion_change(session_id, entry, replace=replace)
+
+    def record_remote_transcript_remove(
+        self,
+        session_key: str,
+        item: dict[str, Any],
+        *,
+        index: int,
+    ) -> None:
+        """Keep an attached remote Discussion cache correct after local trim."""
+        remote_state = getattr(self, "remote_state", None)
+        secret = getattr(self, "remote_secret", None)
+        if not isinstance(remote_state, RemoteStateSynchronizer) or not isinstance(secret, bytes):
+            return
+        session_id = remote_session_id(secret, session_key)
+        entry = remote_discussion_entry(
+            secret=secret,
+            session_id=session_id,
+            item=item,
+            index=index,
+        )
+        remote_state.record_discussion_remove(session_id, str(entry["message_id"]))
+
+    def enroll_remote_device(
+        self,
+        device_id: str,
+        identity_fingerprint: str,
+        *,
+        capabilities: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Record a verified pairing after a future transport handshake.
+
+        This method is deliberately not wired to the dashboard, CLI, or HTTP
+        proxy.  Pairing is a local-host action that the Remote Agent will call
+        only after its cryptographic safety code is verified.
+        """
+        _secret, _cursor_codec, devices, _state, _actions = self.remote_runtime()
+        result = devices.enroll(
+            device_id,
+            identity_fingerprint,
+            capabilities=capabilities if capabilities is not None else REMOTE_DEFAULT_CAPABILITIES,
+        )
+        devices.append_audit(
+            event="device_enrolled",
+            device_id=str(result.get("device_id") or ""),
+            outcome="ok",
+        )
+        return result
+
+    def revoke_remote_device(self, device_id: str) -> None:
+        _secret, _cursor_codec, devices, _state, _actions = self.remote_runtime()
+        devices.revoke(device_id)
+        self.remote_control_leases.release_all_for_device(device_id)
+        devices.append_audit(
+            event="device_revoked",
+            device_id=device_id,
+            outcome="ok",
+        )
+
+    def remote_state_payload(
+        self,
+        device_id: str,
+        *,
+        since_revision: int | None = None,
+        cursor: str = "",
+    ) -> dict[str, Any]:
+        _secret, cursor_codec, devices, state, _actions = self.remote_runtime()
+        devices.authorize(device_id, "read_state")
+        if cursor and since_revision is not None:
+            raise RemoteError("remote session cursor cannot be combined with a delta revision")
+        revision = self.refresh_remote_state()
+        if since_revision is None:
+            payload = state.state_payload(
+                cursor_codec=cursor_codec,
+                cursor=cursor,
+            )
+            payload["type"] = "state"
+            return payload
+        deltas = state.deltas_since(since_revision)
+        if deltas is None:
+            payload = state.state_payload(cursor_codec=cursor_codec)
+            payload["type"] = "state"
+            payload["resync_required"] = True
+            return payload
+        payload = {
+            "type": "state_delta",
+            "protocol_version": 1,
+            "revision": revision,
+            "deltas": deltas,
+        }
+        if len(compact_json_bytes(payload)) > REMOTE_DELTA_SYNC_MAX_BYTES:
+            snapshot = state.state_payload(cursor_codec=cursor_codec)
+            snapshot["type"] = "state"
+            snapshot["resync_required"] = True
+            return snapshot
+        return payload
+
+    def remote_session_key(self, session_id: str) -> str:
+        self.refresh_remote_state()
+        _secret, _cursor_codec, _devices, state, _actions = self.remote_runtime()
+        session_key = state.session_key_for_id(session_id)
+        if not session_key:
+            raise RemoteError("remote session was not found")
+        return session_key
+
+    def remote_discussion_payload(
+        self,
+        device_id: str,
+        session_id: str,
+        *,
+        cursor: str = "",
+    ) -> dict[str, Any]:
+        secret, cursor_codec, devices, _state, _actions = self.remote_runtime()
+        devices.authorize(device_id, "read_discussion")
+        session_key = self.remote_session_key(session_id)
+        with self.active_lock:
+            transcript = self.control_transcript_snapshot(session_key)
+        return build_remote_discussion_page(
+            secret=secret,
+            session_id=session_id,
+            transcript=transcript,
+            cursor_codec=cursor_codec,
+            cursor=cursor,
+        )
+
+    def remote_message_expand_payload(
+        self,
+        device_id: str,
+        session_id: str,
+        message_id: str,
+        *,
+        cursor: str = "",
+    ) -> dict[str, Any]:
+        secret, cursor_codec, devices, _state, _actions = self.remote_runtime()
+        devices.authorize(device_id, "read_discussion")
+        session_key = self.remote_session_key(session_id)
+        with self.active_lock:
+            transcript = self.control_transcript_snapshot(session_key)
+        return build_remote_message_expand(
+            secret=secret,
+            session_id=session_id,
+            transcript=transcript,
+            message_id=message_id,
+            cursor_codec=cursor_codec,
+            cursor=cursor,
+        )
+
+    def remote_action_lock(self, session_key: str) -> threading.Lock:
+        with self.remote_action_locks_lock:
+            return self.remote_action_locks.setdefault(session_key, threading.Lock())
+
+    @staticmethod
+    def validate_remote_action_expiry(expires_at: str) -> None:
+        if not isinstance(expires_at, str) or not expires_at:
+            raise RemoteError("remote action expiry is required")
+        try:
+            expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise RemoteError("invalid remote action expiry") from exc
+        if expiry.tzinfo is None:
+            raise RemoteError("invalid remote action expiry")
+        remaining = (expiry.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+        if remaining <= 0:
+            raise RemoteError("remote action has expired")
+        if remaining > 300:
+            raise RemoteError("remote action expiry is too far in the future")
+
+    def perform_remote_action(
+        self,
+        device_id: str,
+        *,
+        action: str,
+        session_id: str,
+        expected_revision: int,
+        expected_turn_id: str = "",
+        idempotency_key: str,
+        expires_at: str,
+        prompt: str = "",
+    ) -> dict[str, Any]:
+        secret, _cursor_codec, devices, state, actions = self.remote_runtime()
+        capability_by_action = {
+            "send_prompt": "send_prompt",
+            "interrupt_turn": "interrupt_turn",
+        }
+        capability = capability_by_action.get(action)
+        if not capability:
+            raise RemoteError("remote action is not available")
+        devices.authorize(device_id, capability)
+        self.validate_remote_action_expiry(expires_at)
+        if len(prompt.encode("utf-8")) > REMOTE_ACTION_PROMPT_MAX_BYTES:
+            raise RemoteError("remote prompt exceeds its byte limit")
+        if action == "send_prompt" and not prompt.strip():
+            raise RemoteError("remote prompt is empty")
+        if action == "interrupt_turn" and prompt:
+            raise RemoteError("remote interrupt action does not accept a prompt")
+        if action == "interrupt_turn" and not expected_turn_id:
+            raise RemoteError("remote interrupt action requires the expected turn")
+
+        semantic_ref = opaque_identifier(
+            secret,
+            "remote-action",
+            f"{action}\0{session_id}\0{expected_revision}\0{expected_turn_id}\0{prompt}",
+            prefix="request",
+        )
+        cached = actions.get(device_id, idempotency_key)
+        if cached is not None:
+            if cached.get("_semantic_ref") != semantic_ref:
+                raise RemoteError("remote idempotency key was reused for a different action")
+            if cached.get("_state") != "completed":
+                raise RemoteError("remote action outcome is indeterminate; inspect the session before retrying")
+            return {key: value for key, value in cached.items() if not key.startswith("_")}
+
+        self.refresh_remote_state()
+        session = state.session_payload(session_id)
+        session_key = state.session_key_for_id(session_id)
+        if session is None or not session_key:
+            raise RemoteError("remote session was not found")
+        if expected_revision != int(session.get("unread_revision") or 0):
+            raise RemoteError("remote action has a stale session revision")
+        if expected_turn_id and expected_turn_id != str(session.get("current_turn_id") or ""):
+            raise RemoteError("remote action has a stale turn")
+
+        audit_session = remote_session_audit_ref(secret, session_key)
+        action_lock = self.remote_action_lock(session_key)
+        with action_lock:
+            self.remote_control_leases.acquire(session_key, device_id)
+            mutation_attempted = False
+            try:
+                # State can change while an adjacent device waited for the
+                # session lock, so recheck before writing to the PTY.
+                self.refresh_remote_state()
+                session = state.session_payload(session_id)
+                if session is None or expected_revision != int(session.get("unread_revision") or 0):
+                    raise RemoteError("remote action has a stale session revision")
+                if expected_turn_id and expected_turn_id != str(session.get("current_turn_id") or ""):
+                    raise RemoteError("remote action has a stale turn")
+                cached = actions.reserve(
+                    device_id,
+                    idempotency_key,
+                    semantic_ref,
+                    expires_at,
+                )
+                if cached is not None:
+                    return {key: value for key, value in cached.items() if not key.startswith("_")}
+                mutation_attempted = True
+                if action == "send_prompt":
+                    self.send_session_prompt(session_key, prompt)
+                else:
+                    self.send_session_escape(session_key)
+                resulting_revision = self.refresh_remote_state()
+                resulting_session = state.session_payload(session_id) or {}
+                result = {
+                    "ok": True,
+                    "action": action,
+                    "session_id": session_id,
+                    "revision": resulting_revision,
+                    "session_revision": int(resulting_session.get("unread_revision") or resulting_revision),
+                    "idempotency_key": idempotency_key,
+                    "_semantic_ref": semantic_ref,
+                }
+                actions.remember(
+                    device_id,
+                    idempotency_key,
+                    result,
+                    expires_at=expires_at,
+                )
+                devices.append_audit(
+                    event="remote_action",
+                    device_id=device_id,
+                    capability=capability,
+                    session_ref=audit_session,
+                    outcome="ok",
+                    request_ref=semantic_ref,
+                )
+                return {key: value for key, value in result.items() if not key.startswith("_")}
+            except (StoreError, RemoteError, OSError, json.JSONDecodeError) as exc:
+                devices.append_audit(
+                    event="remote_action",
+                    device_id=device_id,
+                    capability=capability,
+                    session_ref=audit_session,
+                    outcome="indeterminate" if mutation_attempted else "rejected",
+                    request_ref=semantic_ref,
+                )
+                if isinstance(exc, RemoteError):
+                    raise
+                raise RemoteError("remote action was not completed") from exc
+            finally:
+                # A lease exists only for the serialized mutation.  Local
+                # terminal input therefore remains immediately authoritative.
+                self.remote_control_leases.release(session_key, device_id=device_id)
 
     def pinned_sessions_for_profile(
         self,
@@ -9409,6 +10204,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/switch":
             self.handle_switch()
             return
+        if parsed.path == "/api/profile-visibility":
+            self.handle_profile_visibility()
+            return
         if parsed.path == "/api/refresh-quota":
             self.handle_refresh_quota()
             return
@@ -9430,11 +10228,10 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/pin-session":
             self.handle_pin_session()
             return
-        if parsed.path in (
-            "/v1/responses",
-            "/v1/responses/compact",
-            "/v1/images/generations",
-        ):
+        if parsed.path == "/api/connector":
+            self.handle_connector()
+            return
+        if parsed.path in CODEX_API_POST_PROXY_PATHS:
             self.proxy_to_upstream("POST", parsed)
             return
         if self.is_chatgpt_backend_proxy_path(parsed.path):
@@ -9444,6 +10241,30 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "invalid ChatGPT backend proxy path token"}, status=401)
             return
         self.send_error(404)
+
+    def handle_connector(self) -> None:
+        try:
+            data = self.read_post_fields()
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        if data.get("token") != self.server.proxy_token:
+            self.send_json({"error": "invalid connector control token"}, status=401)
+            return
+        action = str(data.get("action") or "status")
+        try:
+            if action == "enable":
+                connector = self.server.start_connector_hub()
+            elif action == "disable":
+                connector = self.server.stop_connector_hub()
+            elif action == "status":
+                connector = self.server.connector_status()
+            else:
+                raise StoreError("unsupported connector action")
+        except StoreError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        self.send_json({"ok": True, "connector": connector})
 
     def handle_switch(self) -> None:
         try:
@@ -9472,6 +10293,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.server.mark_ui_dirty("profile_switch")
         self.server.close_websocket_tunnels(blocking_only=True)
+        self.redirect_ui()
+
+    def handle_profile_visibility(self) -> None:
+        try:
+            data = self.read_post_fields()
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        if data.get("token") != self.server.proxy_token:
+            self.send_json({"error": "invalid UI token"}, status=401)
+            return
+        profile = str(data.get("profile") or "")
+        hidden = str(data.get("hidden") or "").strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            self.server.store.set_profile_hidden(profile, hidden)
+        except StoreError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        self.server.mark_ui_dirty("profiles")
         self.redirect_ui()
 
     def handle_refresh_quota(self) -> None:
@@ -9766,6 +10606,16 @@ class Handler(BaseHTTPRequestHandler):
             self.server.close_websocket_tunnels(blocking_only=True)
             self.send_ui_state()
             return
+        if action == "set_profile_visibility":
+            hidden = str(message.get("hidden") or "").strip().lower() in {"1", "true", "yes", "on"}
+            try:
+                self.server.store.set_profile_hidden(profile, hidden)
+            except StoreError as exc:
+                self.send_ui_state(message=str(exc))
+                return
+            self.server.mark_ui_dirty("profiles")
+            self.send_ui_state()
+            return
         if action == "refresh_quota":
             if not self.server.store.profile_exists(profile):
                 self.send_ui_state(message=f"unknown profile: {profile}")
@@ -9917,6 +10767,37 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_ui_state(message=f"Session escape failed: {exc}")
                 return
             self.send_ui_state()
+            return
+        if action == "load_control_turn":
+            session_key = str(message.get("session_key") or "")
+            turn_key = str(message.get("turn_key") or "")
+            before_index = message.get("before_index")
+            try:
+                payload = self.server.control_turn_payload_for_session(
+                    session_key,
+                    turn_key,
+                    before_index=before_index,
+                )
+            except StoreError as exc:
+                self.send_websocket_json(
+                    {
+                        "type": "control_turn",
+                        "ok": False,
+                        "session_key": session_key,
+                        "turn_key": turn_key,
+                        "error": str(exc),
+                    }
+                )
+                return
+            self.send_websocket_json(
+                {
+                    "type": "control_turn",
+                    "ok": True,
+                    "session_key": session_key,
+                    "turn_key": turn_key,
+                    "payload": payload,
+                }
+            )
             return
         if action == "load_history_turn":
             session_key = str(message.get("session_key") or "")
@@ -11021,6 +11902,7 @@ class Handler(BaseHTTPRequestHandler):
             "recent_websocket_data_activity": recent_activity,
             "live_busy": active_requests > 0 or pending_work > 0 or recent_activity > 0,
             "switch_block_reason": self.server.switch_block_reason(),
+            "connector": self.server.connector_status(),
         }
         if include_profiles:
             sessions = self.server.session_snapshots()
@@ -11375,6 +12257,8 @@ class Handler(BaseHTTPRequestHandler):
     def render_profile_rows(self, status: dict[str, Any]) -> str:
         rows = []
         for profile in status.get("profiles", []):
+            if profile.get("hidden"):
+                continue
             rows.append(self.render_profile_row(profile))
         return "".join(rows)
 
@@ -11416,6 +12300,12 @@ class Handler(BaseHTTPRequestHandler):
                 <input type="hidden" name="token" value="{token}">
                 <input type="hidden" name="profile" value="{name}">
                 <button class="{switch_class}" {disabled} title="{html.escape(switch_reason)}">{switch_label}</button>
+              </form>
+              <form method="post" action="/api/profile-visibility" data-action="set_profile_visibility" data-profile="{name}">
+                <input type="hidden" name="token" value="{token}">
+                <input type="hidden" name="profile" value="{name}">
+                <input type="hidden" name="hidden" value="true">
+                <button class="profile-visibility-action" title="Hide this profile from the dashboard">Hide</button>
               </form>
             </td>
           </tr>
@@ -12293,6 +13183,7 @@ class Handler(BaseHTTPRequestHandler):
       pointer-events: auto;
     }
     .control-head {
+	  grid-row: 1;
       display: flex;
       align-items: flex-start;
       justify-content: space-between;
@@ -12345,6 +13236,7 @@ class Handler(BaseHTTPRequestHandler):
       padding: 4px 8px;
     }
     .control-toolbar {
+	  grid-row: 3;
       display: flex;
       align-items: center;
       flex-wrap: wrap;
@@ -12382,7 +13274,8 @@ class Handler(BaseHTTPRequestHandler):
       background: var(--subtle);
       color: var(--ink);
     }
-	    .control-status-pills {
+    .control-status-pills {
+	      grid-row: 2;
 	      display: flex;
 	      flex-wrap: wrap;
 	      align-items: center;
@@ -12390,6 +13283,10 @@ class Handler(BaseHTTPRequestHandler):
 	      padding: 8px 12px 6px;
 	      background: var(--surface);
 	    }
+    .mobile-control-status,
+    .mobile-focus-restore {
+      display: none;
+    }
     .control-compact-quota {
       display: inline-grid;
       grid-template-columns: auto auto minmax(76px, 112px) auto;
@@ -12470,6 +13367,7 @@ class Handler(BaseHTTPRequestHandler):
 	      opacity: 0.9;
 	    }
     .control-content {
+	  grid-row: 4;
       min-width: 0;
       min-height: 0;
       overflow: auto;
@@ -12627,6 +13525,34 @@ class Handler(BaseHTTPRequestHandler):
 	      font-weight: 650;
 	      text-align: center;
 	    }
+	    .control-turn-boundary,
+	    .control-prior-turn {
+	      display: flex;
+	      align-items: center;
+	      justify-content: space-between;
+	      gap: 8px;
+	      padding: 7px 8px;
+	      border: 1px dashed var(--line);
+	      border-radius: 6px;
+	      color: var(--muted);
+	      background: var(--surface);
+	      font-size: 11px;
+	      font-weight: 720;
+	    }
+	    .control-prior-turn-actions {
+	      display: flex;
+	      flex-wrap: wrap;
+	      justify-content: flex-end;
+	      gap: 6px;
+	    }
+	    .control-prior-turn button,
+	    .control-transcript-window-button {
+	      width: auto;
+	      min-height: 26px;
+	      padding: 3px 8px;
+	      border-radius: 999px;
+	      font-size: 11px;
+	    }
 	    .control-message {
 	      display: grid;
 	      gap: 4px;
@@ -12660,6 +13586,11 @@ class Handler(BaseHTTPRequestHandler):
     .control-message.context_compaction {
       border-left: 3px solid var(--blue);
       background: linear-gradient(180deg, rgba(59, 130, 214, 0.08), var(--subtle));
+    }
+    .control-compaction-summary {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
     }
     .control-message.tool {
       border-left: 3px solid var(--amber);
@@ -13034,6 +13965,23 @@ class Handler(BaseHTTPRequestHandler):
       color: var(--red);
       background: rgba(204, 70, 70, 0.08);
     }
+    .control-tool-patch-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 720;
+    }
+    .control-tool-patch-file {
+      color: var(--ink);
+      overflow-wrap: anywhere;
+    }
+    .control-tool-section.patch.collapsed pre {
+      max-height: 10.2em;
+      overflow: hidden;
+      white-space: pre-wrap;
+    }
     .control-message.compact .control-message-text {
       overflow: hidden;
       max-height: 5.8em;
@@ -13084,14 +14032,14 @@ class Handler(BaseHTTPRequestHandler):
       font-weight: 650;
     }
 	    .control-compose {
+	      grid-row: 5;
 	      border-top: 1px solid var(--line);
 	      padding: 8px 12px;
 	      display: grid;
 	      grid-template-columns: minmax(0, 1fr) auto;
 	      gap: 10px;
 	      background: var(--soft);
-	      position: sticky;
-	      bottom: 0;
+	      position: relative;
 	      z-index: 2;
 	    }
     .control-compose textarea {
@@ -13119,6 +14067,9 @@ class Handler(BaseHTTPRequestHandler):
       overflow: visible;
       box-shadow: var(--shadow);
     }
+    .discussion-active .profiles {
+      display: none;
+    }
     table {
       width: 100%;
       border-collapse: collapse;
@@ -13143,9 +14094,26 @@ class Handler(BaseHTTPRequestHandler):
     }
     tbody tr:last-child td { border-bottom: 0; }
 	    .profile-row.active { background: var(--active-row); }
+	    .profile-row.hidden-profile { background: var(--soft); }
 	    .profile-cell { min-width: 0; }
 	    .model-cell { color: var(--muted); min-width: 0; overflow: visible; }
 	    .actions { width: 130px; }
+	    .profile-visibility-action {
+	      color: var(--muted);
+	      background: transparent;
+	    }
+	    .profile-hidden-toggle {
+	      display: block;
+	      width: calc(100% - 28px);
+	      margin: 0 14px 14px;
+	      color: var(--muted);
+	      background: var(--soft);
+	    }
+	    .profile-hidden-badge {
+	      color: var(--muted);
+	      font-size: 11px;
+	      font-weight: 650;
+	    }
 	    .quota-cell { min-width: 0; overflow: hidden; }
 	    .profile-name {
 	      display: flex;
@@ -13949,7 +14917,12 @@ class Handler(BaseHTTPRequestHandler):
       text-overflow: ellipsis;
     }
 	    @media (max-width: 860px) {
-	      .shell { width: min(100vw - 20px, 760px); margin-top: 10px; }
+	      .shell {
+	        width: min(100vw - 20px, 760px);
+	        margin-top: 10px;
+	        display: flex;
+	        flex-direction: column;
+	      }
 		      .topbar { align-items: flex-start; }
 		      .logo { width: 180px; height: 36px; }
 		      .top-actions { margin-left: 0; align-items: flex-start; }
@@ -13992,9 +14965,160 @@ class Handler(BaseHTTPRequestHandler):
 	      }
 	      .control-compose {
 	        grid-template-columns: 1fr;
+	        padding-bottom: max(8px, env(safe-area-inset-bottom));
 	      }
 	      .control-compose button {
 	        width: 100%;
+	      }
+	      .session-tabs {
+	        position: sticky;
+	        top: 0;
+	        z-index: 74;
+	        margin: 0 -10px;
+	        padding: 6px 10px;
+	        background: var(--surface);
+	        border-bottom: 1px solid var(--line);
+	      }
+	      .session-tab {
+	        min-width: 116px;
+	        max-width: 188px;
+	        min-height: 36px;
+	        padding: 6px 8px;
+	        justify-content: center;
+	      }
+	      .session-tab-meta,
+	      .session-tab-close {
+	        display: none;
+	      }
+	      .session-tab.launch-tab {
+	        min-width: 42px;
+	        max-width: 42px;
+	      }
+	      .mobile-control-status {
+	        position: sticky;
+	        top: var(--mobile-session-tabs-height, 48px);
+	        z-index: 73;
+	        display: flex;
+	        align-items: center;
+	        gap: 7px;
+	        min-height: 34px;
+	        margin: 0 -10px;
+	        padding: 5px 10px;
+	        border-bottom: 1px solid var(--line);
+	        background: var(--soft);
+	      }
+	      .mobile-control-status[hidden] {
+	        display: none;
+	      }
+	      .mobile-control-status-readouts {
+	        display: flex;
+	        min-width: 0;
+	        flex: 1 1 auto;
+	        align-items: center;
+	        gap: 6px;
+	        overflow-x: auto;
+	      }
+	      .mobile-control-status .pill,
+	      .mobile-control-status .control-compact-quota {
+	        flex: 0 0 auto;
+	      }
+	      .mobile-focus-toggle,
+	      .mobile-focus-restore {
+	        width: auto;
+	        min-height: 28px;
+	        padding: 3px 8px;
+	        border-radius: 999px;
+	        white-space: nowrap;
+	        font-size: 11px;
+	      }
+	      .control-dock {
+	        position: relative;
+	        inset: auto;
+	        z-index: 65;
+	        order: 1;
+	        flex: 0 0 auto;
+	        block-size: var(--mobile-control-dock-height, max(0px, calc(var(--mobile-viewport-height, 100dvh) - var(--mobile-control-chrome-height, 0px))));
+	        min-block-size: 0;
+	        margin-top: 0;
+	      }
+	      .mobile-control-stuck .shell::after {
+	        content: "";
+	        display: block;
+	        order: 1;
+	        flex: 0 0 var(--mobile-control-dock-height, 0px);
+	        min-block-size: 0;
+	        pointer-events: none;
+	      }
+	      .mobile-control-stuck .control-dock {
+	        position: fixed;
+	        top: var(--mobile-control-chrome-height, 0px);
+	        right: max(10px, calc((100vw - 760px) / 2));
+	        left: max(10px, calc((100vw - 760px) / 2));
+	        z-index: 75;
+	      }
+	      .profiles {
+	        order: 2;
+	      }
+	      .control-modal {
+	        block-size: 100%;
+	        border-radius: 7px;
+	      }
+	      .control-modal.discussion-view .control-content {
+	        overscroll-behavior: contain;
+	      }
+	      .control-status-pills {
+	        display: none;
+	      }
+	      .mobile-focus-restore {
+	        position: fixed;
+	        top: max(8px, env(safe-area-inset-top));
+	        right: 12px;
+	        bottom: auto;
+	        z-index: 76;
+	        box-shadow: var(--shadow);
+	      }
+	      .mobile-discussion-focus #sessionTabs,
+	      .mobile-discussion-focus #mobileControlStatus {
+	        display: none;
+	      }
+	      .mobile-discussion-focus .control-dock {
+	        position: fixed;
+	        top: var(--mobile-visual-viewport-top, 0px);
+	        right: max(10px, calc((100vw - 760px) / 2));
+	        left: max(10px, calc((100vw - 760px) / 2));
+	        bottom: auto;
+	        block-size: var(--mobile-viewport-height, 100dvh);
+	        margin-top: 0;
+	        z-index: 75;
+	      }
+	      .mobile-discussion-focus .mobile-focus-restore {
+	        display: inline-flex;
+	      }
+	      .mobile-discussion-focus .control-modal.discussion-view .control-toolbar,
+	      .mobile-discussion-focus .control-modal.discussion-view .control-head {
+	        display: none;
+	      }
+	      .mobile-composer-focus #sessionTabs,
+	      .mobile-composer-focus #mobileControlStatus,
+	      .mobile-composer-focus .control-modal.discussion-view .control-toolbar,
+	      .mobile-composer-focus .control-modal.discussion-view .control-head {
+	        display: none;
+	      }
+	      .mobile-composer-focus .control-dock {
+	        position: fixed;
+	        top: var(--mobile-visual-viewport-top, 0px);
+	        right: max(10px, calc((100vw - 760px) / 2));
+	        left: max(10px, calc((100vw - 760px) / 2));
+	        bottom: auto;
+	        block-size: var(--mobile-viewport-height, 100dvh);
+	        margin-top: 0;
+	        z-index: 75;
+	      }
+	      @media (prefers-reduced-motion: reduce) {
+	        .control-compact-quota-weekly-fill,
+	        .control-compact-quota-primary-fill {
+	          transition: none;
+	        }
 	      }
 	    }
   </style>
@@ -14018,6 +15142,10 @@ class Handler(BaseHTTPRequestHandler):
     </header>
     <div id="message" class="message" aria-live="polite"></div>
     <section id="sessionTabs" class="session-tabs" aria-label="Provision-managed Codex CLI sessions"></section>
+    <section id="mobileControlStatus" class="mobile-control-status" aria-label="Current session context and quota" hidden>
+      <div id="mobileControlReadouts" class="mobile-control-status-readouts"></div>
+      <button id="mobileFocusToggle" class="mobile-focus-toggle" type="button" aria-pressed="false">Focus discussion</button>
+    </section>
     <section id="launcherBar" class="launcher-dock" aria-label="Launch Codex CLI session" hidden>
       <div class="launcher-modal" role="dialog" aria-modal="false" aria-labelledby="launcherTitle">
         <div class="launcher-head">
@@ -14058,6 +15186,7 @@ class Handler(BaseHTTPRequestHandler):
     </section>
     <div id="controlModal" class="control-dock" hidden>
       <section class="control-modal" role="dialog" aria-modal="false" aria-labelledby="controlTitle">
+        <button id="mobileFocusRestore" class="mobile-focus-restore" type="button" hidden>Show controls</button>
         <div class="control-head">
           <div class="control-title-block">
             <h2 id="controlTitle">Session</h2>
@@ -14104,7 +15233,7 @@ class Handler(BaseHTTPRequestHandler):
       </section>
     </div>
     <div id="uiTooltip" class="ui-tooltip" hidden></div>
-    <section class="profiles">
+	    <section id="profilesPanel" class="profiles">
       <table>
         <colgroup>
           <col class="profile-col">
@@ -14117,6 +15246,7 @@ class Handler(BaseHTTPRequestHandler):
         </thead>
         <tbody id="profileRows">__ROWS__</tbody>
       </table>
+      <button id="profileHiddenToggle" class="profile-hidden-toggle" type="button" hidden></button>
     </section>
   </main>
   <script>
@@ -14151,7 +15281,8 @@ class Handler(BaseHTTPRequestHandler):
 			    let controlPromptHistoryIndex = null;
 			    let controlPromptHistorySessionKey = "";
 		    let controlPromptHistoryDraft = "";
-		    let pendingControlRender = false;
+	    let pendingControlRender = false;
+	    let preserveControlScrollOnNextRender = false;
 		    let renderedControlScrollKey = "";
 		    let controlRenderDeferredAt = 0;
 		    let controlRenderDeferTimer = null;
@@ -14159,8 +15290,11 @@ class Handler(BaseHTTPRequestHandler):
 		    const controlScrollPositions = {};
 	    const controlInnerScrollPositions = {};
 	    const controlTranscriptWindows = {};
+	    const controlTurnPresentations = {};
 	    const expandedControlMessages = {};
 	    const markdownRenderCache = new Map();
+	    const observedTurnCache = {};
+	    const observedTurnRequests = {};
 	    const historyTurnCache = {};
 	    const historyTurnRequests = {};
 	    const historyTurnIndexes = {};
@@ -14169,16 +15303,22 @@ class Handler(BaseHTTPRequestHandler):
 	    const resumeCandidateRequests = {};
 	    const selectedControlTurnKeys = {};
 		    const manuallySelectedControlTurnKeys = {};
-		    const latestObservedUserKeys = {};
-		    const followLatestTurnAfterUserInput = {};
+	    let mobileDiscussionFocused = false;
+	    let mobileComposerFocused = false;
+	    let mobileControlDockAnchorY = null;
+	    let mobileFocusScrollLockUntil = 0;
+	    let mobileTouchStartY = null;
+	    const MOBILE_FOCUS_GESTURE_DELTA = 28;
+	    const MOBILE_FOCUS_SCROLL_LOCK_MS = 280;
 		    const selectedResumeCandidateIds = {};
 	    const statsVisibleProfiles = {};
 	    let pendingConfirmation = null;
 		    let openPinMenuProfile = null;
 		    let openModelMenuProfile = null;
-		    let openLoginMenuProfile = null;
-		    let openReasoningProfile = null;
-		    let openReasoningModel = null;
+	    let openLoginMenuProfile = null;
+	    let openReasoningProfile = null;
+	    let openReasoningModel = null;
+	    let showHiddenProfiles = false;
 		    let quotaRefreshTimer = null;
 		    let quotaRefreshInFlight = "";
 		    const pageDaemonPid = INITIAL.status ? INITIAL.status.pid || null : null;
@@ -14204,6 +15344,14 @@ class Handler(BaseHTTPRequestHandler):
 	      return text;
 	    }
 
+	    function isContextCompactionPacket(item) {
+	      const role = String(item && item.role || "");
+	      if (role === "context_compaction") return true;
+	      if (role !== "tool") return false;
+	      const text = [item && item.text, item && item.full_text].filter(Boolean).join("\n");
+	      return /^(?:Tool|Command):\s*context(?:[ _-]?compaction)\b/im.test(text);
+	    }
+
 	    function safeMarkdownHref(value) {
 	      const raw = String(value || "").trim();
 	      if (!raw) return "";
@@ -14215,6 +15363,83 @@ class Handler(BaseHTTPRequestHandler):
 	        return "";
 	      }
 	      return escapeHtml(raw);
+	    }
+
+	    function isLocalMarkdownFileReference(value) {
+	      const raw = String(value || "").trim();
+	      return /^(?:file:|\/|~\/|\.{1,2}\/)/i.test(raw);
+	    }
+
+	    function markdownLinkLabel(label, href) {
+	      const visible = String(label || "").replace(/\s+/g, " ").trim();
+	      return visible || String(href || "").trim();
+	    }
+
+	    function replaceMarkdownLinks(value, renderLink) {
+	      const source = String(value || "");
+	      let output = "";
+	      let cursor = 0;
+	      while (cursor < source.length) {
+	        const open = source.indexOf("[", cursor);
+	        if (open < 0) return output + source.slice(cursor);
+	        const labelEnd = source.indexOf("](", open + 1);
+	        if (labelEnd < 0 || source.slice(open + 1, labelEnd).includes("\n") || (open > 0 && source[open - 1] === "!")) {
+	          output += source.slice(cursor, open + 1);
+	          cursor = open + 1;
+	          continue;
+	        }
+	        const label = source.slice(open + 1, labelEnd);
+	        let index = labelEnd + 2;
+	        while (/[ \t]/.test(source[index] || "")) index += 1;
+	        let href = "";
+	        if (source[index] === "<") {
+	          const close = source.indexOf(">", index + 1);
+	          if (close < 0 || source.slice(index + 1, close).includes("\n")) {
+	            output += source.slice(cursor, open + 1);
+	            cursor = open + 1;
+	            continue;
+	          }
+	          href = source.slice(index + 1, close);
+	          index = close + 1;
+	        } else {
+	          const hrefStart = index;
+	          let depth = 0;
+	          while (index < source.length) {
+	            const char = source[index];
+	            if (char === "\n") break;
+	            if (char === "(" ) depth += 1;
+	            if (char === ")") {
+	              if (depth === 0) break;
+	              depth -= 1;
+	            }
+	            if (depth === 0 && /[ \t]/.test(char)) break;
+	            index += 1;
+	          }
+	          href = source.slice(hrefStart, index);
+	        }
+	        while (/[ \t]/.test(source[index] || "")) index += 1;
+	        if (source[index] === '"' || source[index] === "'") {
+	          const quote = source[index];
+	          index += 1;
+	          while (index < source.length && source[index] !== quote && source[index] !== "\n") index += 1;
+	          if (source[index] !== quote) {
+	            output += source.slice(cursor, open + 1);
+	            cursor = open + 1;
+	            continue;
+	          }
+	          index += 1;
+	          while (/[ \t]/.test(source[index] || "")) index += 1;
+	        }
+	        if (!href || source[index] !== ")") {
+	          output += source.slice(cursor, open + 1);
+	          cursor = open + 1;
+	          continue;
+	        }
+	        const match = source.slice(open, index + 1);
+	        output += source.slice(cursor, open) + renderLink(match, label, href);
+	        cursor = index + 1;
+	      }
+	      return output;
 	    }
 
 	    function restoreMarkdownTokens(html, inserts) {
@@ -14231,16 +15456,17 @@ class Handler(BaseHTTPRequestHandler):
 	      text = text.replace(/`([^`\n]+)`/g, (_match, code) => (
 	        token(`<code>${escapeHtml(code)}</code>`)
 	      ));
-	      text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (match, label, href) => {
-	        const safeHref = safeMarkdownHref(href);
+	      text = replaceMarkdownLinks(text, (match, label, href) => {
+	        const rawHref = String(href || "").trim();
+	        const visibleLabel = markdownLinkLabel(label, rawHref);
+	        if (isLocalMarkdownFileReference(rawHref)) {
+	          return token(`<code class="markdown-file-ref" title="${escapeHtml(rawHref)}">${escapeHtml(visibleLabel)}</code>`);
+	        }
+	        const safeHref = safeMarkdownHref(rawHref);
 	        if (!safeHref) {
-	          const rawHref = String(href || "").trim();
-	          if (/^(?:\/|~\/|\.{1,2}\/)/.test(rawHref)) {
-	            return token(`<code class="markdown-file-ref" title="${escapeHtml(rawHref)}">${escapeHtml(label)}</code>`);
-	          }
 	          return match;
 	        }
-	        return token(`<a href="${safeHref}" target="_blank" rel="noreferrer">${renderMarkdownInline(label)}</a>`);
+	        return token(`<a href="${safeHref}" target="_blank" rel="noreferrer">${renderMarkdownInline(visibleLabel)}</a>`);
 	      });
 	      text = text.replace(/(^|[\s([{,;])([A-Za-z_][A-Za-z0-9_.-]*=[A-Za-z0-9_./:-]+)/g, (_match, prefix, assignment) => (
 	        `${prefix}${token(`<code>${escapeHtml(assignment)}</code>`)}`
@@ -14291,10 +15517,9 @@ class Handler(BaseHTTPRequestHandler):
 	      return value;
 	    }
 
-			    function repairStreamedMarkdownSource(value) {
-			      let source = String(value || "").replace(/\r\n?/g, "\n");
-			      source = source.replace(/^(\s*)~~~([A-Za-z0-9_.+-]*)\s*$/gm, "$1```$2");
-			      source = source.replace(/\[\s*\n{2,}\s*([^\]\n]{1,160}?)\s*\]/g, (_match, label) => `[${label.trim()}]`);
+		    function repairStreamedMarkdownProse(value) {
+		      let source = String(value || "");
+		      source = source.replace(/\[\s*\n{2,}\s*([^\]\n]{1,160}?)\s*\]/g, (_match, label) => `[${label.trim()}]`);
 		      source = source.replace(/\[([^\]\n]{1,120}?)\s*\n{2,}\s*([^\]\n]{1,120}?)\]/g, (_match, left, right) => {
 		        const label = `${left.trim()}${right.trim()}`;
 		        return label.length <= 180 ? `[${label}]` : _match;
@@ -14302,6 +15527,32 @@ class Handler(BaseHTTPRequestHandler):
 		      source = source.replace(/\]\s*\n{2,}\s*\(([^)\n]{1,500})\)/g, (_match, href) => `](${href.trim()})`);
 		      source = source.replace(/\bx\n{2,}Unit\b/g, "xUnit");
 		      return source;
+		    }
+
+		    function repairStreamedMarkdownSource(value) {
+		      const lines = String(value || "").replace(/\r\n?/g, "\n").split("\n");
+		      const rendered = [];
+		      let prose = [];
+		      let inFence = false;
+		      const flushProse = () => {
+		        if (!prose.length) return;
+		        rendered.push(...repairStreamedMarkdownProse(prose.join("\n")).split("\n"));
+		        prose = [];
+		      };
+		      for (const rawLine of lines) {
+		        const tildeFence = rawLine.match(/^(\s*)~~~([A-Za-z0-9_.+-]*)\s*$/);
+		        const line = tildeFence ? `${tildeFence[1]}\`\`\`${tildeFence[2]}` : rawLine;
+		        if (/^\s*```/.test(line)) {
+		          flushProse();
+		          rendered.push(line);
+		          inFence = !inFence;
+		          continue;
+		        }
+		        if (inFence) rendered.push(line);
+		        else prose.push(line);
+		      }
+		      flushProse();
+		      return rendered.join("\n");
 		    }
 
 	    function normalizeMarkdownSource(value) {
@@ -14489,8 +15740,37 @@ class Handler(BaseHTTPRequestHandler):
 	    function markdownTableCells(line) {
 	      let text = String(line || "").trim();
 	      if (text.startsWith("|")) text = text.slice(1);
-	      if (text.endsWith("|")) text = text.slice(0, -1);
-	      return text.split("|").map((cell) => cell.trim());
+	      if (/(?:^|[^\\])(?:\\\\)*\|$/.test(text)) text = text.slice(0, -1);
+	      const cells = [];
+	      let cell = "";
+	      let escaped = false;
+	      let codeTickCount = 0;
+	      for (let index = 0; index < text.length; index += 1) {
+	        const char = text[index];
+	        if (char === "\\" && !escaped) {
+	          escaped = true;
+	          cell += char;
+	          continue;
+	        }
+	        if (char === "`" && !escaped) {
+	          let run = 1;
+	          while (text[index + run] === "`") run += 1;
+	          if (!codeTickCount) codeTickCount = run;
+	          else if (codeTickCount === run) codeTickCount = 0;
+	          cell += text.slice(index, index + run);
+	          index += run - 1;
+	          continue;
+	        }
+	        if (char === "|" && !escaped && !codeTickCount) {
+	          cells.push(cell.trim().replace(/\\\|/g, "|"));
+	          cell = "";
+	          continue;
+	        }
+	        cell += char;
+	        escaped = false;
+	      }
+	      cells.push(cell.trim().replace(/\\\|/g, "|"));
+	      return cells;
 	    }
 
 	    function renderMarkdownTable(lines, index) {
@@ -14789,7 +16069,9 @@ class Handler(BaseHTTPRequestHandler):
 		      if (stats) {
 		        const tabsTop = tabs.getBoundingClientRect().top;
 		        stats.style.setProperty("--stats-modal-top", `${Math.max(0, tabsTop)}px`);
-		      }
+	      }
+	      updateMobileControlChromeGeometry();
+	      updateMobileControlStickiness();
 	    }
 
 	    function controlScrollKey() {
@@ -14797,9 +16079,10 @@ class Handler(BaseHTTPRequestHandler):
 	      return `${selectedControlSessionKey || "none"}:${controlView || "discussion"}:${turn}:${controlSearchText || ""}`;
 	    }
 
-		    function controlTranscriptWindowKey() {
-		      return `${selectedControlSessionKey || "none"}:${controlSearchText || ""}`;
-		    }
+	    function controlTranscriptWindowKey() {
+	      const turn = selectedControlTurnKeys[selectedControlSessionKey || ""] || "";
+	      return `${selectedControlSessionKey || "none"}:${turn}:${controlSearchText || ""}`;
+	    }
 
 		    function controlTranscriptWindow(total) {
 		      if (total <= CONTROL_TRANSCRIPT_WINDOW_SIZE) {
@@ -14951,11 +16234,16 @@ class Handler(BaseHTTPRequestHandler):
 	      if (!sessions.length) {
 	        selectedControlSessionKey = "";
 	        container.innerHTML = '<div class="session-tabs-empty">No Provision-managed Codex CLI sessions observed yet</div>' + launchTab;
+	        resetMobileDiscussionFocus();
+	        syncDiscussionPaneVisibility();
+	        renderMobileControlStatus(null);
 	        updateControlDockGeometry();
 	        return;
 	      }
 	      if (selectedControlSessionKey && !sessions.some((session) => session.key === selectedControlSessionKey)) {
 	        selectedControlSessionKey = "";
+	        resetMobileDiscussionFocus();
+	        renderMobileControlStatus(null);
 	      }
 	      container.innerHTML = sessions.map((session) => {
 	        const key = String(session.key || "");
@@ -14969,6 +16257,11 @@ class Handler(BaseHTTPRequestHandler):
           </button>
 	        `;
 	      }).join("") + launchTab;
+	      if (!selectedControlSessionKey || document.getElementById("controlModal").hidden) {
+	        resetMobileComposerFocus();
+	        renderMobileControlStatus(null);
+	      }
+	      syncDiscussionPaneVisibility();
 	      updateControlDockGeometry();
 	    }
 
@@ -15284,6 +16577,45 @@ class Handler(BaseHTTPRequestHandler):
 	      return historyTurnCache[historyCacheKey(sessionKey, turnKey)] || null;
 	    }
 
+	    function observedTurnPayload(session, turn) {
+	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
+	      const turnKey = controlTurnKey(turn);
+	      return observedTurnCache[historyCacheKey(sessionKey, turnKey)] || null;
+	    }
+
+	    function observedTurnNeedsLoad(session, turn) {
+	      if (!turn || turn.source === "history" || observedTurnPayload(session, turn)) return false;
+	      const window = session && session.transcript_window && typeof session.transcript_window === "object"
+	        ? session.transcript_window
+	        : null;
+	      if (!window) return false;
+	      const start = Number(window.start_index);
+	      const end = Number(window.end_index);
+	      const turnStart = Number(turn.start_index);
+	      const turnEnd = Number(turn.end_index);
+	      return Number.isFinite(start) && Number.isFinite(end)
+	        && Number.isFinite(turnStart) && Number.isFinite(turnEnd)
+	        && (turnStart < start || turnEnd > end);
+	    }
+
+	    function requestObservedTurn(session, turn, beforeIndex = null) {
+	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
+	      const turnKey = controlTurnKey(turn);
+	      if (!sessionKey || !turnKey || !socket || socket.readyState !== WebSocket.OPEN) return false;
+	      const key = `${historyCacheKey(sessionKey, turnKey)}\u0001${beforeIndex == null ? "latest" : beforeIndex}`;
+	      if (observedTurnRequests[key]) return false;
+	      if (beforeIndex == null && observedTurnPayload(session, turn)) return false;
+	      observedTurnRequests[key] = true;
+	      socket.send(JSON.stringify({
+	        action: "load_control_turn",
+	        session_key: sessionKey,
+	        turn_key: turnKey,
+	        before_index: beforeIndex,
+	        token: TOKEN
+	      }));
+	      return true;
+	    }
+
 	    function requestHistoryTurn(session, turn) {
 	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
 	      const turnKey = controlTurnKey(turn);
@@ -15396,6 +16728,8 @@ class Handler(BaseHTTPRequestHandler):
 	        const payload = historyTurnPayload(session, turn);
 	        return payload && Array.isArray(payload.transcript) ? payload.transcript : [];
 	      }
+	      const observed = observedTurnPayload(session, turn);
+	      if (observed && Array.isArray(observed.transcript)) return observed.transcript;
 	      return transcriptItemsForTurn(transcript, turn);
 	    }
 
@@ -15424,42 +16758,191 @@ class Handler(BaseHTTPRequestHandler):
 	      return `${prefix}${label}${suffix}`;
 	    }
 
-	    function latestUserInputKey(session) {
-	      const transcript = session && Array.isArray(session.transcript) ? session.transcript : [];
-	      for (let index = transcript.length - 1; index >= 0; index -= 1) {
-	        const item = transcript[index] || {};
-	        const role = String(item.role || "");
-	        if (role !== "user" && role !== "user_pending") continue;
-	        const text = String(item.full_text || item.text || "");
-	        return [
-	          role,
-	          item.ts || "",
-	          text.length,
-	          text.slice(0, 96)
-	        ].join(":");
-	      }
-	      return "";
+	    function mobileLayoutActive() {
+	      return window.matchMedia("(max-width: 860px)").matches;
 	    }
 
-	    function observeControlUserInputs(controlPlane) {
-	      const sessions = controlSessions({ control_plane: controlPlane || latestControlPlane || { sessions: [] } });
-	      for (const session of sessions) {
-	        const sessionKey = String(session && session.key || "");
-	        if (!sessionKey) continue;
-	        const userKey = latestUserInputKey(session);
-	        const previous = latestObservedUserKeys[sessionKey];
-	        if (userKey && previous && userKey !== previous) {
-	          delete manuallySelectedControlTurnKeys[sessionKey];
-	          followLatestTurnAfterUserInput[sessionKey] = true;
-	        }
-	        latestObservedUserKeys[sessionKey] = userKey;
-	      }
+	    function discussionActive() {
+	      const modal = document.getElementById("controlModal");
+	      return Boolean(
+	        controlView === "discussion"
+	        && selectedControlSessionKey
+	        && modal
+	        && !modal.hidden
+	      );
 	    }
 
-	    function selectedTurnForSessionShouldFollowLatest(sessionKey) {
-	      if (!sessionKey || controlSearchText.trim()) return false;
-	      if (manuallySelectedControlTurnKeys[sessionKey]) return false;
-	      return Boolean(followLatestTurnAfterUserInput[sessionKey]);
+	    function syncDiscussionPaneVisibility() {
+	      const profiles = document.getElementById("profilesPanel");
+	      const active = discussionActive();
+	      document.body.classList.toggle("discussion-active", active);
+	      if (profiles) profiles.hidden = active;
+	    }
+
+	    function updateMobileControlChromeGeometry() {
+	      const root = document.documentElement;
+	      const tabs = document.getElementById("sessionTabs");
+	      const status = document.getElementById("mobileControlStatus");
+	      if (!root || !tabs) return;
+	      const visualViewport = window.visualViewport;
+	      const viewportHeight = visualViewport && Number.isFinite(visualViewport.height)
+	        ? visualViewport.height
+	        : window.innerHeight;
+	      const focused = (mobileDiscussionFocused || mobileComposerFocused) && mobileLayoutActive();
+	      const viewportTop = visualViewport && Number.isFinite(visualViewport.offsetTop)
+	        ? Math.max(0, Math.round(visualViewport.offsetTop))
+	        : 0;
+	      const tabsHeight = focused ? 0 : tabs.offsetHeight;
+	      const statusHeight = focused || !status || status.hidden ? 0 : status.offsetHeight;
+	      const dockHeight = Math.max(0, Math.round(viewportHeight) - tabsHeight - statusHeight);
+	      root.style.setProperty("--mobile-viewport-height", `${Math.max(0, Math.round(viewportHeight))}px`);
+	      root.style.setProperty("--mobile-visual-viewport-top", `${viewportTop}px`);
+	      root.style.setProperty("--mobile-session-tabs-height", `${tabsHeight}px`);
+	      root.style.setProperty("--mobile-control-chrome-height", `${tabsHeight + statusHeight}px`);
+	      root.style.setProperty("--mobile-control-dock-height", `${dockHeight}px`);
+	    }
+
+	    function renderMobileControlStatus(session) {
+	      const status = document.getElementById("mobileControlStatus");
+	      const readouts = document.getElementById("mobileControlReadouts");
+	      const focus = document.getElementById("mobileFocusToggle");
+	      if (!status || !readouts || !focus) return;
+	      if (!session) {
+	        status.hidden = true;
+	        updateMobileControlChromeGeometry();
+	        return;
+	      }
+	      const pills = [];
+	      if (session.context && session.context.label) {
+	        const contextTitle = [
+	          session.context.input_tokens ? `${formatNumber(session.context.input_tokens)} input tokens` : "",
+	          session.context.remaining_tokens ? `${formatNumber(session.context.remaining_tokens)} tokens remaining` : "",
+	          session.context.updated_at ? `Updated ${formatEventTime(session.context.updated_at)}` : ""
+	        ].filter(Boolean).join(" / ");
+	        pills.push(`<span class="pill" title="${escapeHtml(contextTitle)}">Context <strong>${escapeHtml(session.context.label)}</strong></span>`);
+	      } else {
+	        pills.push('<span class="pill">Context <strong>unavailable</strong></span>');
+	      }
+	      if (session.quota_compact_html) pills.push(String(session.quota_compact_html));
+	      readouts.innerHTML = pills.join("");
+	      status.hidden = false;
+	      focus.hidden = controlView !== "discussion";
+	      focus.setAttribute("aria-pressed", mobileDiscussionFocused ? "true" : "false");
+	      focus.textContent = mobileDiscussionFocused ? "Show controls" : "Focus discussion";
+	      updateMobileControlChromeGeometry();
+	      requestAnimationFrame(updateMobileControlStickiness);
+	    }
+
+	    function resetMobileControlStickiness() {
+	      mobileControlDockAnchorY = null;
+	      document.body.classList.remove("mobile-control-stuck");
+	    }
+
+	    function updateMobileControlStickiness() {
+	      const modal = document.getElementById("controlModal");
+	      const status = document.getElementById("mobileControlStatus");
+	      if (
+	        !mobileLayoutActive()
+	        || !selectedControlSessionKey
+	        || !modal
+	        || modal.hidden
+	      ) {
+	        resetMobileControlStickiness();
+	        return;
+	      }
+	      if (mobileControlDockAnchorY == null) {
+	        if (!mobileDiscussionFocused && !mobileComposerFocused && status && status.hidden) return;
+	        const chrome = Number.parseFloat(
+	          getComputedStyle(document.documentElement).getPropertyValue("--mobile-control-chrome-height")
+	        ) || 0;
+	        const bounds = modal.getBoundingClientRect();
+	        mobileControlDockAnchorY = Math.max(0, bounds.top + window.scrollY - chrome);
+	      }
+	      const shouldStick = mobileDiscussionFocused || mobileComposerFocused || window.scrollY >= mobileControlDockAnchorY - 1;
+	      document.body.classList.toggle("mobile-control-stuck", shouldStick);
+	    }
+
+	    function documentAtBottom() {
+	      const root = document.documentElement;
+	      const visualViewport = window.visualViewport;
+	      const viewportHeight = visualViewport && Number.isFinite(visualViewport.height)
+	        ? visualViewport.height
+	        : window.innerHeight;
+	      const documentHeight = Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0);
+	      return window.scrollY + viewportHeight >= documentHeight - 3;
+	    }
+
+	    function mobileGestureTargetsDiscussion(target) {
+	      return target instanceof Element && Boolean(target.closest("#controlContent, #controlCompose, [data-control-inner-scroll]"));
+	    }
+
+	    function setMobileDiscussionFocus(focused) {
+	      if (!mobileLayoutActive() || controlView !== "discussion" || !selectedControlSessionKey) return false;
+	      if (focused) resetMobileComposerFocus();
+	      mobileDiscussionFocused = Boolean(focused);
+	      document.body.classList.toggle("mobile-discussion-focus", mobileDiscussionFocused);
+	      const restore = document.getElementById("mobileFocusRestore");
+	      if (restore) restore.hidden = !mobileDiscussionFocused;
+	      renderMobileControlStatus(selectedControlSession());
+	      requestAnimationFrame(() => {
+	        updateMobileControlChromeGeometry();
+	        if (mobileDiscussionFocused) window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "auto" });
+	      });
+	      return true;
+	    }
+
+	    function resetMobileDiscussionFocus() {
+	      mobileDiscussionFocused = false;
+	      document.body.classList.remove("mobile-discussion-focus");
+	      const restore = document.getElementById("mobileFocusRestore");
+	      if (restore) restore.hidden = true;
+	      updateMobileControlChromeGeometry();
+	    }
+
+	    function setMobileComposerFocus(focused) {
+	      if (!focused) {
+	        resetMobileComposerFocus();
+	        return false;
+	      }
+	      if (!mobileLayoutActive() || controlView !== "discussion" || !selectedControlSessionKey) return false;
+	      mobileComposerFocused = true;
+	      document.body.classList.add("mobile-composer-focus");
+	      mobileControlDockAnchorY = null;
+	      updateMobileControlChromeGeometry();
+	      requestAnimationFrame(updateMobileControlStickiness);
+	      return true;
+	    }
+
+	    function resetMobileComposerFocus() {
+	      mobileComposerFocused = false;
+	      document.body.classList.remove("mobile-composer-focus");
+	      mobileControlDockAnchorY = null;
+	      document.body.classList.remove("mobile-control-stuck");
+	      updateMobileControlChromeGeometry();
+	      requestAnimationFrame(updateMobileControlStickiness);
+	    }
+
+	    function handleMobileBoundaryGesture(deltaY, event) {
+	      if (
+	        !mobileLayoutActive()
+	        || !selectedControlSessionKey
+	        || controlView !== "discussion"
+	        || Math.abs(deltaY) < MOBILE_FOCUS_GESTURE_DELTA
+	        || mobileGestureTargetsDiscussion(event.target)
+	        || !documentAtBottom()
+	      ) return;
+	      if (Date.now() < mobileFocusScrollLockUntil) {
+	        if (event.cancelable) event.preventDefault();
+	        return;
+	      }
+	      if (deltaY > 0 && !mobileDiscussionFocused) {
+	        if (event.cancelable) event.preventDefault();
+	        setMobileDiscussionFocus(true);
+	      } else if (deltaY < 0 && mobileDiscussionFocused) {
+	        if (event.cancelable) event.preventDefault();
+	        setMobileDiscussionFocus(false);
+	        mobileFocusScrollLockUntil = Date.now() + MOBILE_FOCUS_SCROLL_LOCK_MS;
+	      }
 	    }
 
 	    function selectedTurnForSession(session, transcript) {
@@ -15472,13 +16955,72 @@ class Handler(BaseHTTPRequestHandler):
 	      const selectedKey = selectedControlTurnKeys[sessionKey] || "";
 	      const selected = available.find((turn) => controlTurnKey(turn) === selectedKey);
 	      const fallback = available[available.length - 1] || null;
-	      if (fallback && selectedTurnForSessionShouldFollowLatest(sessionKey)) {
-	        selectedControlTurnKeys[sessionKey] = controlTurnKey(fallback);
-	        delete followLatestTurnAfterUserInput[sessionKey];
-	        return fallback;
-	      }
 	      if (fallback) selectedControlTurnKeys[sessionKey] = controlTurnKey(selected || fallback);
 	      return selected || fallback;
+	    }
+
+	    function controlTurnPresentationKey(session) {
+	      return `${String(session && session.key || selectedControlSessionKey || "none")}:${controlSearchText || ""}`;
+	    }
+
+	    function controlTurnByKey(turns, key) {
+	      return turns.find((turn) => controlTurnKey(turn) === key) || null;
+	    }
+
+	    function controlTurnPresentation(session, transcript, selected) {
+	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
+	      const key = controlTurnPresentationKey(session);
+	      if (
+	        !sessionKey
+	        || controlSearchText.trim()
+	        || manuallySelectedControlTurnKeys[sessionKey]
+	        || !selected
+	        || selected.source === "history"
+	      ) {
+	        delete controlTurnPresentations[key];
+	        return null;
+	      }
+	      const turns = controlTurns(session, transcript).filter((turn) => turn.source !== "history");
+	      const latest = turns[turns.length - 1] || null;
+	      if (!latest) return null;
+	      const selectedKey = controlTurnKey(selected);
+	      const state = controlTurnPresentations[key] || {
+	        activeKey: selectedKey,
+	        pendingKey: "",
+	        hiddenKey: "",
+	        revealedKey: ""
+	      };
+	      if (!controlTurnByKey(turns, state.activeKey)) state.activeKey = selectedKey;
+	      if (controlTurnKey(latest) !== state.activeKey) state.pendingKey = controlTurnKey(latest);
+	      if (state.pendingKey && !controlTurnByKey(turns, state.pendingKey)) state.pendingKey = "";
+	      controlTurnPresentations[key] = state;
+	      return { state, turns, active: controlTurnByKey(turns, state.activeKey) || selected, pending: controlTurnByKey(turns, state.pendingKey) };
+	    }
+
+	    function finalizeControlTurnBridgeIfScrolledAway() {
+	      const content = document.getElementById("controlContent");
+	      const session = selectedControlSession();
+	      if (!content || !session || controlView !== "discussion") return;
+	      const presentation = controlTurnPresentations[controlTurnPresentationKey(session)];
+	      const boundary = content.querySelector("[data-control-turn-boundary]");
+	      if (!presentation || (!presentation.pendingKey && !presentation.revealedKey) || !boundary) return;
+	      const contentBounds = content.getBoundingClientRect();
+	      if (boundary.getBoundingClientRect().bottom >= contentBounds.top + 4) return;
+	      if (presentation.pendingKey) {
+	        const turns = controlTurns(session, Array.isArray(session.transcript) ? session.transcript : [])
+	          .filter((turn) => turn.source !== "history");
+	        const activeIndex = turns.findIndex((turn) => controlTurnKey(turn) === presentation.activeKey);
+	        const pendingIndex = turns.findIndex((turn) => controlTurnKey(turn) === presentation.pendingKey);
+	        const next = activeIndex >= 0 && pendingIndex > activeIndex ? turns[activeIndex + 1] : null;
+	        presentation.hiddenKey = presentation.activeKey;
+	        presentation.activeKey = next ? controlTurnKey(next) : presentation.pendingKey;
+	        if (presentation.activeKey === presentation.pendingKey) presentation.pendingKey = "";
+	        selectedControlTurnKeys[String(session.key || selectedControlSessionKey || "")] = presentation.activeKey;
+	      }
+	      presentation.revealedKey = "";
+	      controlScrollPositions[controlScrollKey()] = content.scrollTop;
+	      preserveControlScrollOnNextRender = true;
+	      renderControlModal(true);
 	    }
 
 	    function renderControlTurnOptions(session) {
@@ -15586,7 +17128,7 @@ class Handler(BaseHTTPRequestHandler):
 		      return ["arguments", "input", "patch", "content"].includes(label) && /^\*\*\* Begin Patch/m.test(text);
 		    }
 
-			    function renderPatchText(text) {
+		    function renderPatchText(text) {
 			      return String(text || "").split("\n").map((line) => {
 			        let cls = "context";
 		        if (/^\*\*\* (Begin Patch|End Patch|Update File:|Add File:|Delete File:|Move to:)/.test(line) || /^@@/.test(line)) {
@@ -15654,6 +17196,55 @@ class Handler(BaseHTTPRequestHandler):
 			      if (payload && typeof payload.command === "string" && payload.command.trim()) return payload.command.trim();
 			      const first = text.split("\n").map((line) => line.trim()).find(Boolean) || "";
 		      return first.length > 220 ? `${first.slice(0, 220).trim()}...` : first;
+		    }
+
+		    function patchSummary(text) {
+		      const files = [];
+		      let added = 0;
+		      let deleted = 0;
+		      for (const line of String(text || "").split("\n")) {
+		        const file = line.match(/^\*\*\* (Update|Add|Delete) File:\s*(.+)$/);
+		        if (file) {
+		          files.push({ operation: file[1].toLowerCase(), path: file[2].trim() });
+		          continue;
+		        }
+		        const moved = line.match(/^\*\*\* Move to:\s*(.+)$/);
+		        if (moved && files.length) files[files.length - 1].movedTo = moved[1].trim();
+		        if (/^\+(?!\+\+)/.test(line)) added += 1;
+		        if (/^-(?!---)/.test(line)) deleted += 1;
+		      }
+		      return { files, added, deleted };
+		    }
+
+		    function patchPreviewText(text, maxLines = 12) {
+		      const lines = String(text || "").split("\n");
+		      if (lines.length <= maxLines) return String(text || "");
+		      const preview = lines.slice(0, maxLines);
+		      preview.push("… patch preview truncated …");
+		      return preview.join("\n");
+		    }
+
+		    function renderPatchToolSummary(parsed) {
+		      const section = (parsed.sections || []).find((candidate) => toolSectionIsPatch(candidate));
+		      if (!section) return "";
+		      const source = toolSectionByLabel(parsed, ["Source"]);
+		      const summary = patchSummary(section.text);
+		      const fileBits = summary.files.slice(0, 2).map((file) => {
+		        const target = file.movedTo ? ` → ${file.movedTo}` : "";
+		        return `<span class="control-tool-patch-file">${escapeHtml(file.operation)} ${escapeHtml(file.path)}${escapeHtml(target)}</span>`;
+		      });
+		      if (summary.files.length > 2) fileBits.push(`<span>+${summary.files.length - 2} files</span>`);
+		      const changes = [
+		        summary.added ? `+${summary.added}` : "",
+		        summary.deleted ? `-${summary.deleted}` : ""
+		      ].filter(Boolean);
+		      return `
+		        <div class="control-tool-patch-summary">
+		          ${source ? `<span>via ${escapeHtml(source.text)}</span>` : ""}
+		          ${fileBits.join("")}
+		          ${changes.length ? `<span>${escapeHtml(changes.join(" / "))} lines</span>` : ""}
+		        </div>
+		      `;
 		    }
 
 		    function toolSectionNeedsExpansion(section, parsed) {
@@ -15740,23 +17331,28 @@ class Handler(BaseHTTPRequestHandler):
 		    function renderToolSection(section, ownerKey, sectionIndex, expanded, parsed) {
 		      const isPatch = toolSectionIsPatch(section);
 		      const collapsed = toolSectionNeedsExpansion(section, parsed) && !expanded;
-			      const displayText = collapsed ? summarizeToolSection(section, parsed) : section.text;
-			      const body = isPatch && !collapsed ? renderPatchText(displayText) : escapeHtml(displayText);
-			      const scrollKey = `${ownerKey}:section:${sectionIndex}:${section.label}`;
-			      return `
-			        <div class="control-tool-section${isPatch ? " patch" : ""}${collapsed ? " collapsed" : ""}">
-			          <span class="control-tool-section-label">${escapeHtml(section.label)}</span>
-			          <pre data-control-inner-scroll="${escapeHtml(scrollKey)}">${body}</pre>
-			        </div>
+		      const displayText = isPatch && collapsed
+		        ? patchPreviewText(section.text)
+		        : (collapsed ? summarizeToolSection(section, parsed) : section.text);
+		      const body = isPatch ? renderPatchText(displayText) : escapeHtml(displayText);
+		      const scrollKey = `${ownerKey}:section:${sectionIndex}:${section.label}`;
+		      return `
+		        <div class="control-tool-section${isPatch ? " patch" : ""}${collapsed ? " collapsed" : ""}">
+		          <span class="control-tool-section-label">${escapeHtml(isPatch && collapsed ? "Patch preview" : section.label)}</span>
+		          <pre data-control-inner-scroll="${escapeHtml(scrollKey)}">${body}</pre>
+		        </div>
 		      `;
 		    }
 
-		    function renderControlToolBlock(item, fallback, options = {}) {
-		      const key = controlMessageKey(item, fallback);
-		      const displayText = String(item.text || "");
-		      const fullText = String(item.full_text || "");
-		      const compact = Boolean(options.compact);
-		      const hasMore = Boolean(item.truncated || (fullText && fullText !== displayText));
+	    function renderControlToolBlock(item, fallback, options = {}) {
+	      const key = controlMessageKey(item, fallback);
+	      const displayText = String(item.text || "");
+	      const fullText = String(item.full_text || "");
+	      const compact = Boolean(options.compact);
+	      if (isContextCompactionPacket(item)) {
+	        return `<div class="control-tool-block control-compaction-packet">${renderControlMessageText(item, fallback, { markdown: false, compact: true, compactionPacket: true })}</div>`;
+	      }
+	      const hasMore = Boolean(item.truncated || (fullText && fullText !== displayText));
 		      const expanded = Boolean(expandedControlMessages[key]);
 		      const text = expanded && fullText ? fullText : displayText;
 		      const parsed = parseToolActivityText(text);
@@ -15777,7 +17373,7 @@ class Handler(BaseHTTPRequestHandler):
 		      const statusClass = status.toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
 		      const summaryBits = [parsed.exit ? `exit ${parsed.exit}` : "", parsed.duration || ""].filter(Boolean);
 			      const summary = summaryBits.length ? `<span>${escapeHtml(summaryBits.join(" / "))}</span>` : "";
-			      const special = renderPlanToolSummary(parsed);
+		      const special = renderPlanToolSummary(parsed) + renderPatchToolSummary(parsed);
 			      const command = parsed.command
 			        ? `<div class="control-tool-command">${escapeHtml(parsed.command)}</div>`
 			        : "";
@@ -15785,8 +17381,9 @@ class Handler(BaseHTTPRequestHandler):
 			      const sections = parsed.sections.length
 			        ? `<div class="control-tool-sections">${parsed.sections.map((section, sectionIndex) => renderToolSection(section, key, sectionIndex, expanded, parsed)).join("")}</div>`
 			        : "";
-			      const button = hasMore || hasCollapsedSections
-			        ? `<button class="control-show-more" type="button" data-message-key="${escapeHtml(key)}">${expanded ? "Show less" : "Show more"}</button>`
+		      const hasPatch = parsed.sections.some((section) => toolSectionIsPatch(section));
+		      const button = hasMore || hasCollapsedSections
+		        ? `<button class="control-show-more" type="button" data-message-key="${escapeHtml(key)}">${expanded ? "Show less" : (hasPatch ? "Show full patch" : "Show more")}</button>`
 			        : "";
 		      return `
 		        <div class="control-tool-block">
@@ -15809,6 +17406,7 @@ class Handler(BaseHTTPRequestHandler):
 	      const displayText = normalizeControlMessageTextForDisplay(item.text, role);
 	      const fullText = normalizeControlMessageTextForDisplay(item.full_text, role);
 	      const compact = Boolean(options.compact);
+	      const compactionPacket = Boolean(options.compactionPacket) || isContextCompactionPacket(item);
 	      const hasMore = Boolean(
 	        item.truncated
 	        || (fullText && fullText !== displayText)
@@ -15818,15 +17416,19 @@ class Handler(BaseHTTPRequestHandler):
 	      const text = expanded && fullText ? fullText : displayText;
 	      const useMarkdown = options.markdown !== false && role !== "tool" && role !== "error";
 	      const className = `control-message-text ${useMarkdown ? "markdown" : "plain"}${expanded ? " expanded" : ""}`;
-	      const body = useMarkdown
-	        ? cachedMarkdownRender(`${role}\u0001${text}`, () => {
-	            const jsonBody = renderJsonControlMessage(text);
-	            return jsonBody || renderMarkdown(text);
-	          })
-	        : escapeHtml(text);
-	      const button = hasMore
-	        ? `<button class="control-show-more" type="button" data-message-key="${escapeHtml(key)}">${expanded ? "Show less" : "Show more"}</button>`
-	        : "";
+	      const body = compactionPacket && !expanded
+	        ? '<div class="control-compaction-summary">Context compacted. The post-compaction packet is hidden by default.</div>'
+	        : (useMarkdown
+	          ? cachedMarkdownRender(`${role}\u0001${text}`, () => {
+	              const jsonBody = renderJsonControlMessage(text);
+	              return jsonBody || renderMarkdown(text);
+	            })
+	          : escapeHtml(text));
+	      const button = compactionPacket && (displayText || fullText)
+	        ? `<button class="control-show-more control-show-compaction-packet" type="button" data-message-key="${escapeHtml(key)}">${expanded ? "Hide post-compaction packet" : "Show post-compaction packet"}</button>`
+	        : (hasMore
+	          ? `<button class="control-show-more" type="button" data-message-key="${escapeHtml(key)}">${expanded ? "Show less" : "Show more"}</button>`
+	          : "");
 	      return `<div class="${className}" data-control-inner-scroll="${escapeHtml(`${key}:message`)}">${body}</div>${button}`;
 	    }
 
@@ -15859,7 +17461,7 @@ class Handler(BaseHTTPRequestHandler):
 
 	    function controlMessageRoleLabel(role) {
 	      if (role === "resume") return "resumed context";
-	      if (role === "context_compaction") return "context replay";
+	      if (role === "context_compaction") return "context compaction";
 	      if (role === "assistant_progress") return "assistant activity";
 	      if (role === "tool") return "tool / command";
 	      if (role === "user_pending") return "user";
@@ -15899,13 +17501,17 @@ class Handler(BaseHTTPRequestHandler):
 	      const item = group.item;
 	      const role = String(item.role || "message");
 	      const displayRole = controlMessageRoleLabel(role);
+	      const compactionPacket = isContextCompactionPacket(item);
+	      const compactByDefault = compactionPacket;
+	      const messageCompact = Boolean(compact) || compactByDefault;
+	      const compactClass = messageCompact ? " compact" : "";
 	      return `
-	        <article class="control-message ${escapeHtml(role)}${compact}" data-transcript-index="${index}">
+	        <article class="control-message ${escapeHtml(role)}${compactClass}" data-transcript-index="${index}">
 	          <div class="control-message-head">
 	            <span>${escapeHtml(displayRole)}${controlTurnMarkup(item)}</span>
 	            <span>${escapeHtml(formatEventTime(item.updated_at || item.ts))}</span>
 	          </div>
-	          ${renderControlMessageText(item, `message-${index}`, { compact: Boolean(compact) })}
+	          ${renderControlMessageText(item, `message-${index}`, { compact: messageCompact, compactionPacket })}
 	        </article>
 	      `;
 	    }
@@ -15925,6 +17531,8 @@ class Handler(BaseHTTPRequestHandler):
 	      }
 	      let visible = [];
 	      let sourceNote = "";
+	      let boundaryOffsets = [];
+	      let priorTurnMarkup = "";
 	      if (turn.source === "history") {
 	        const payload = historyTurnPayload(session, turn);
 	        if (!payload) {
@@ -15934,7 +17542,53 @@ class Handler(BaseHTTPRequestHandler):
 	        visible = Array.isArray(payload.transcript) ? payload.transcript.slice() : [];
 	        sourceNote = '<div class="control-transcript-window-note">Loaded from Codex session history.</div>';
 	      } else {
-	        visible = transcriptItemsForTurn(transcript, turn);
+	        if (observedTurnNeedsLoad(session, turn)) {
+	          requestObservedTurn(session, turn);
+	          return '<div class="control-empty">Loading earlier observed discussion for this turn...</div>';
+	        }
+	        const presentation = controlTurnPresentation(session, transcript, turn);
+	        const activeTurn = presentation ? presentation.active : turn;
+	        if (observedTurnNeedsLoad(session, activeTurn)) {
+	          requestObservedTurn(session, activeTurn);
+	          return '<div class="control-empty">Loading earlier observed discussion for this turn...</div>';
+	        }
+	        visible = turnTranscriptItems(session, transcript, activeTurn);
+	        const activePayload = observedTurnPayload(session, activeTurn);
+	        if (activePayload && activePayload.has_more_before) {
+	          const before = Number(activePayload.next_before_index);
+	          sourceNote = `<div class="control-transcript-window-note">Earlier observed discussion is available.</div><button class="control-transcript-window-button" type="button" data-control-turn-more="${escapeHtml(controlTurnKey(activeTurn))}" data-control-turn-before="${escapeHtml(before)}">Show earlier discussion</button>`;
+	        }
+	        if (presentation && presentation.pending) {
+	          const activeIndex = presentation.turns.findIndex((candidate) => controlTurnKey(candidate) === controlTurnKey(activeTurn));
+	          const pendingIndex = presentation.turns.findIndex((candidate) => controlTurnKey(candidate) === controlTurnKey(presentation.pending));
+	          const bridgeTurns = activeIndex >= 0 && pendingIndex >= activeIndex
+	            ? presentation.turns.slice(activeIndex, pendingIndex + 1)
+	            : [activeTurn, presentation.pending];
+	          visible = [];
+	          for (const [index, bridgeTurn] of bridgeTurns.entries()) {
+	            if (index > 0) boundaryOffsets.push(controlTranscriptGroups(visible).length);
+	            visible = visible.concat(turnTranscriptItems(session, transcript, bridgeTurn));
+	          }
+	        } else if (presentation && presentation.state.revealedKey) {
+	          const prior = controlTurnByKey(presentation.turns, presentation.state.revealedKey);
+	          const priorItems = prior ? turnTranscriptItems(session, transcript, prior) : [];
+	          const nextItems = turnTranscriptItems(session, transcript, activeTurn);
+	          visible = priorItems.concat(nextItems);
+	          boundaryOffsets = [controlTranscriptGroups(priorItems).length];
+	        } else if (presentation && presentation.state.hiddenKey) {
+	          const prior = controlTurnByKey(presentation.turns, presentation.state.hiddenKey);
+	          if (prior) {
+	            priorTurnMarkup = `
+	              <div class="control-prior-turn">
+	                <span>Previous turn is compacted for performance.</span>
+	                <span class="control-prior-turn-actions">
+	                  <button type="button" data-control-prior-show="${escapeHtml(controlTurnKey(prior))}">Show more</button>
+	                  <button type="button" data-control-prior-open="${escapeHtml(controlTurnKey(prior))}">Open previous turn</button>
+	                </span>
+	              </div>
+	            `;
+	          }
+	        }
 	        const pending = transcript.filter((item) => String(item.role || "") === "user_pending" && !visible.includes(item));
 	        if (pending.length) visible = visible.concat(pending);
 	      }
@@ -15945,6 +17599,17 @@ class Handler(BaseHTTPRequestHandler):
 	        }
 	      }
 	      const groups = controlTranscriptGroups(visible);
+	      const bridgeVisible = boundaryOffsets.length > 0;
+	      const transcriptWindow = bridgeVisible
+	        ? { start: 0, end: groups.length }
+	        : controlTranscriptWindow(groups.length);
+	      const windowedGroups = groups.slice(transcriptWindow.start, transcriptWindow.end);
+	      const olderButton = transcriptWindow.start > 0
+	        ? `<button class="control-transcript-window-button" type="button" data-control-window="above">Show ${Math.min(CONTROL_TRANSCRIPT_WINDOW_STEP, transcriptWindow.start)} older entries</button>`
+	        : "";
+	      const newerButton = transcriptWindow.end < groups.length
+	        ? `<button class="control-transcript-window-button" type="button" data-control-window="below">Show ${Math.min(CONTROL_TRANSCRIPT_WINDOW_STEP, groups.length - transcriptWindow.end)} newer entries</button>`
+	        : "";
 	      const matchedTurns = controlSearchText
 	        ? controlTurns(session, transcript).filter((candidate) => turnMatchesSearch(transcript, candidate, controlSearchText, session)).length
 	        : 0;
@@ -15954,10 +17619,18 @@ class Handler(BaseHTTPRequestHandler):
 	      return `
 	        ${searchNote}
 	        ${sourceNote}
-	        <div class="control-transcript" data-total="${groups.length}">
-	          ${groups.map((group, offset) => (
-	            renderControlTranscriptGroup(group, offset, groups.length)
-	          )).join("")}
+	        ${priorTurnMarkup}
+	        <div class="control-transcript" data-total="${groups.length}" data-hidden-above="${transcriptWindow.start}" data-hidden-below="${groups.length - transcriptWindow.end}">
+	          ${olderButton}
+	          ${windowedGroups.map((group, offset) => {
+	            const index = transcriptWindow.start + offset;
+	            const boundary = bridgeVisible && boundaryOffsets.includes(index)
+	              ? '<div class="control-turn-boundary" data-control-turn-boundary>New turn</div>'
+	              : "";
+	            return `${boundary}${renderControlTranscriptGroup(group, index, groups.length)}`;
+	          }).join("")}
+	          ${bridgeVisible && boundaryOffsets.includes(groups.length) ? '<div class="control-turn-boundary" data-control-turn-boundary>New turn</div>' : ""}
+	          ${newerButton}
 	        </div>
 	      `;
 	    }
@@ -16093,8 +17766,16 @@ class Handler(BaseHTTPRequestHandler):
 	      const session = selectedControlSession();
 	      if (!session) {
 	        modal.hidden = true;
+	        resetMobileComposerFocus();
+	        syncDiscussionPaneVisibility();
+	        renderMobileControlStatus(null);
 	        return;
 	      }
+	      if (controlView !== "discussion" && mobileDiscussionFocused) {
+	        resetMobileDiscussionFocus();
+	      }
+	      if (controlView !== "discussion") resetMobileComposerFocus();
+	      syncDiscussionPaneVisibility();
 	      requestHistoryIndex(session);
 	      if (controlView === "resume") requestResumeCandidates(session);
 	      updateControlDockGeometry();
@@ -16122,6 +17803,7 @@ class Handler(BaseHTTPRequestHandler):
 	      }
 	      if (session.quota_compact_html) pills.push(String(session.quota_compact_html));
 	      document.getElementById("controlStatusPills").innerHTML = pills.join("");
+	      renderMobileControlStatus(session);
 	      const panel = modal.querySelector(".control-modal");
 	      if (panel) {
 	        panel.classList.toggle("details-view", controlView === "details");
@@ -16135,7 +17817,8 @@ class Handler(BaseHTTPRequestHandler):
 	      const content = document.getElementById("controlContent");
 	      const nextScrollKey = controlScrollKey();
 	      const sameScrollSurface = renderedControlScrollKey === nextScrollKey;
-	      const shouldFollowDiscussion = controlView === "discussion"
+	      const shouldFollowDiscussion = !preserveControlScrollOnNextRender
+	        && controlView === "discussion"
 	        && !controlSearchText
 	        && (!sameScrollSurface || controlContentAtBottom(content));
 	      if (sameScrollSurface) {
@@ -16168,7 +17851,11 @@ class Handler(BaseHTTPRequestHandler):
 	      requestAnimationFrame(restoreControlInnerScroll);
 	      updateControlComposeState(session);
 	      updateControlHeaderActions(session);
-	      requestAnimationFrame(updateControlScrollBadges);
+	      requestAnimationFrame(() => {
+	        updateControlScrollBadges();
+	        finalizeControlTurnBridgeIfScrolledAway();
+	      });
+	      preserveControlScrollOnNextRender = false;
 	      pendingControlRender = false;
 	    }
 
@@ -17099,6 +18786,7 @@ class Handler(BaseHTTPRequestHandler):
 	    function profileRow(profile, pendingAction, pendingProfile) {
 	      const name = String(profile.name || "");
 	      const plan = String(profile.plan_type || "unknown");
+	      const hidden = Boolean(profile.hidden);
 	      const reason = String(profile.switch_disabled_reason || "");
 	      const pending = pendingProfile === name ? pendingAction : "";
 	      const disabled = reason || pending ? "disabled" : "";
@@ -17116,9 +18804,9 @@ class Handler(BaseHTTPRequestHandler):
 	      const loginStatusHtml = profile.login_status_html || "";
 	      const authHealthHtml = renderAuthHealth(profile);
 	      return `
-	        <tr class="profile-row${profile.active ? " active" : ""}" data-profile="${escapeHtml(name)}" data-profile-key="${escapeHtml(name)}">
+	        <tr class="profile-row${profile.active ? " active" : ""}${hidden ? " hidden-profile" : ""}" data-profile="${escapeHtml(name)}" data-profile-key="${escapeHtml(name)}">
 	          <td class="profile-cell">
-	            <div class="profile-name">${escapeHtml(name)} <span class="profile-plan">(${escapeHtml(plan)})</span></div>
+	            <div class="profile-name">${escapeHtml(name)} <span class="profile-plan">(${escapeHtml(plan)})</span>${hidden ? ' <span class="profile-hidden-badge">Hidden</span>' : ""}</div>
 	            <div class="profile-email">${escapeHtml(profile.email || profile.account_id || "")}</div>
 	            ${authHealthHtml}
 	            ${renderProfileChips(profile, name)}
@@ -17134,6 +18822,12 @@ class Handler(BaseHTTPRequestHandler):
 	              <input type="hidden" name="profile" value="${escapeHtml(name)}">
 	              <button class="${useClass}" ${disabled} title="${escapeHtml(useTitle)}">${escapeHtml(useLabel)}</button>
 	            </form>
+	            <form method="post" action="/api/profile-visibility" data-action="set_profile_visibility" data-profile="${escapeHtml(name)}">
+	              <input type="hidden" name="token" value="${escapeHtml(TOKEN)}">
+	              <input type="hidden" name="profile" value="${escapeHtml(name)}">
+	              <input type="hidden" name="hidden" value="${hidden ? "false" : "true"}">
+	              <button class="profile-visibility-action" title="${hidden ? "Show this profile in the dashboard" : "Hide this profile from the dashboard"}">${hidden ? "Unhide" : "Hide"}</button>
+	            </form>
 	          </td>
 	        </tr>
 	      `;
@@ -17142,13 +18836,26 @@ class Handler(BaseHTTPRequestHandler):
 	    function renderProfileRows(profiles, pendingAction, pendingProfile) {
 	      const body = document.getElementById("profileRows");
 	      if (!body) return;
+	      const allProfiles = Array.isArray(profiles) ? profiles : [];
+	      const hiddenCount = allProfiles.filter((profile) => Boolean(profile && profile.hidden)).length;
+	      const toggle = document.getElementById("profileHiddenToggle");
+	      if (toggle) {
+	        toggle.hidden = hiddenCount === 0;
+	        toggle.textContent = showHiddenProfiles
+	          ? `Hide hidden profiles (${hiddenCount})`
+	          : `Show hidden profiles (${hiddenCount})`;
+	        toggle.setAttribute("aria-pressed", showHiddenProfiles ? "true" : "false");
+	      }
+	      const visibleProfiles = showHiddenProfiles
+	        ? allProfiles
+	        : allProfiles.filter((profile) => !Boolean(profile && profile.hidden));
 	      const existing = new Map();
 	      Array.from(body.children).forEach((row) => {
 	        if (row instanceof HTMLElement) existing.set(row.dataset.profileKey || "", row);
 	      });
 	      const seen = new Set();
 	      const template = document.createElement("template");
-	      for (const [index, profile] of (profiles || []).entries()) {
+	      for (const [index, profile] of visibleProfiles.entries()) {
 	        const name = String(profile && profile.name || `profile-${index}`);
 	        const html = profileRow(profile, pendingAction, pendingProfile).trim();
 	        const hash = stableRenderHash(html);
@@ -17192,7 +18899,6 @@ class Handler(BaseHTTPRequestHandler):
       latestLiveBusy = liveBusy;
       latestStats = status.stats || latestStats || { profiles: [], recent: [] };
       latestControlPlane = status.control_plane || latestControlPlane || { sessions: [] };
-      observeControlUserInputs(latestControlPlane);
       latestCodex = status.codex || latestCodex || {};
       if (Array.isArray(status.model_catalog)) latestModelCatalog = status.model_catalog;
 	      if ((pendingAction === "refresh_quota" || pendingAction === "consume_reset_credit") && pendingProfile) {
@@ -17297,6 +19003,36 @@ class Handler(BaseHTTPRequestHandler):
 	      }
 	    }
 
+	    function handleObservedTurnPacket(packet) {
+	      const sessionKey = String(packet.session_key || "");
+	      const turnKey = String(packet.turn_key || "");
+	      const cacheKey = historyCacheKey(sessionKey, turnKey);
+	      for (const key of Object.keys(observedTurnRequests)) {
+	        if (key.startsWith(`${cacheKey}\u0001`)) delete observedTurnRequests[key];
+	      }
+	      if (!packet.ok) {
+	        showUiMessage(packet.error ? `Discussion load failed: ${packet.error}` : "Discussion load failed.");
+	        return;
+	      }
+	      if (packet.payload && typeof packet.payload === "object" && Array.isArray(packet.payload.transcript)) {
+	        const incoming = packet.payload;
+	        const existing = observedTurnCache[cacheKey];
+	        const incomingLast = incoming.transcript.length
+	          ? Number(incoming.transcript[incoming.transcript.length - 1].control_index)
+	          : NaN;
+	        const existingFirst = existing && Array.isArray(existing.transcript) && existing.transcript.length
+	          ? Number(existing.transcript[0].control_index)
+	          : NaN;
+	        if (existing && Number.isFinite(incomingLast) && Number.isFinite(existingFirst) && incomingLast < existingFirst) {
+	          const merged = incoming.transcript.concat(existing.transcript);
+	          observedTurnCache[cacheKey] = { ...existing, transcript: merged, has_more_before: incoming.has_more_before, next_before_index: incoming.next_before_index };
+	        } else {
+	          observedTurnCache[cacheKey] = incoming;
+	        }
+	      }
+	      if (sessionKey === selectedControlSessionKey) renderControlModal(true);
+	    }
+
 	    function handleHistoryIndexPacket(packet) {
 	      const sessionKey = String(packet.session_key || "");
 	      delete historyIndexRequests[sessionKey];
@@ -17323,6 +19059,7 @@ class Handler(BaseHTTPRequestHandler):
 	    }
 
 	    function clearPendingSessionLookups() {
+	      for (const key of Object.keys(observedTurnRequests)) delete observedTurnRequests[key];
 	      for (const key of Object.keys(historyTurnRequests)) delete historyTurnRequests[key];
 	      for (const key of Object.keys(historyIndexRequests)) delete historyIndexRequests[key];
 	      for (const key of Object.keys(resumeCandidateRequests)) delete resumeCandidateRequests[key];
@@ -17352,6 +19089,8 @@ class Handler(BaseHTTPRequestHandler):
             scheduleRender(packet);
 	        } else if (packet.type === "history_turn") {
 	          handleHistoryTurnPacket(packet);
+	        } else if (packet.type === "control_turn") {
+	          handleObservedTurnPacket(packet);
 	        } else if (packet.type === "history_index") {
 	          handleHistoryIndexPacket(packet);
 	        } else if (packet.type === "resume_candidates") {
@@ -17413,6 +19152,15 @@ class Handler(BaseHTTPRequestHandler):
         profile,
         token: TOKEN
 	      }));
+	    });
+
+	    document.getElementById("profileHiddenToggle").addEventListener("click", () => {
+	      showHiddenProfiles = !showHiddenProfiles;
+	      renderProfileRows(
+	        latestStatus && Array.isArray(latestStatus.profiles) ? latestStatus.profiles : [],
+	        "",
+	        ""
+	      );
 	    });
 
 	    document.addEventListener("toggle", (event) => {
@@ -17529,7 +19277,7 @@ class Handler(BaseHTTPRequestHandler):
 	      selectedControlTurnKeys[selectedControlSessionKey] = selectedTurn;
 	      if (selectedTurn) manuallySelectedControlTurnKeys[selectedControlSessionKey] = selectedTurn;
 	      else delete manuallySelectedControlTurnKeys[selectedControlSessionKey];
-	      delete followLatestTurnAfterUserInput[selectedControlSessionKey];
+	      delete controlTurnPresentations[controlTurnPresentationKey(selectedControlSession())];
 	      saveControlScroll();
 	      renderControlModal(true);
 	    });
@@ -17678,6 +19426,56 @@ class Handler(BaseHTTPRequestHandler):
 	    document.getElementById("controlContent").addEventListener("click", (event) => {
 	      const target = event.target;
 	      if (!(target instanceof Element)) return;
+	      const priorShow = target.closest("[data-control-prior-show]");
+	      if (priorShow && selectedControlSessionKey) {
+	        const session = selectedControlSession();
+	        const prior = controlTurnByKey(
+	          controlTurns(session, Array.isArray(session && session.transcript) ? session.transcript : []),
+	          priorShow.dataset.controlPriorShow || ""
+	        );
+	        if (prior) requestObservedTurn(session, prior);
+	        const presentation = controlTurnPresentations[controlTurnPresentationKey(selectedControlSession())];
+	        if (presentation) presentation.revealedKey = priorShow.dataset.controlPriorShow || "";
+	        renderControlModal(true);
+	        return;
+	      }
+	      const priorOpen = target.closest("[data-control-prior-open]");
+	      if (priorOpen && selectedControlSessionKey) {
+	        const priorKey = priorOpen.dataset.controlPriorOpen || "";
+	        if (!priorKey) return;
+	        selectedControlTurnKeys[selectedControlSessionKey] = priorKey;
+	        manuallySelectedControlTurnKeys[selectedControlSessionKey] = priorKey;
+	        delete controlTurnPresentations[controlTurnPresentationKey(selectedControlSession())];
+	        renderControlModal(true);
+	        return;
+	      }
+	      const turnMore = target.closest("[data-control-turn-more]");
+	      if (turnMore && selectedControlSessionKey) {
+	        const session = selectedControlSession();
+	        const turn = controlTurnByKey(
+	          controlTurns(session, Array.isArray(session && session.transcript) ? session.transcript : []),
+	          turnMore.dataset.controlTurnMore || ""
+	        );
+	        const before = Number(turnMore.dataset.controlTurnBefore);
+	        if (turn && Number.isFinite(before)) requestObservedTurn(session, turn, before);
+	        return;
+	      }
+	      const windowButton = target.closest("[data-control-window]");
+	      if (windowButton) {
+	        const direction = windowButton.dataset.controlWindow || "";
+	        const content = document.getElementById("controlContent");
+	        const previousHeight = content ? content.scrollHeight : 0;
+	        if (expandControlTranscriptWindow(direction)) {
+	          renderControlModal(true);
+	          if (direction === "above") {
+	            requestAnimationFrame(() => {
+	              const refreshed = document.getElementById("controlContent");
+	              if (refreshed) refreshed.scrollTop += Math.max(0, refreshed.scrollHeight - previousHeight);
+	            });
+	          }
+	        }
+	        return;
+	      }
 	      const candidate = target.closest("[data-resume-candidate]");
 	      if (candidate && selectedControlSessionKey) {
 	        selectedResumeCandidateIds[selectedControlSessionKey] = candidate.dataset.resumeCandidate || "";
@@ -17699,10 +19497,71 @@ class Handler(BaseHTTPRequestHandler):
 	      renderControlModal(true);
 	    });
 
-		    document.getElementById("controlContent").addEventListener("scroll", () => {
-		      saveControlScroll();
-		      updateControlScrollBadges();
-		    }, { passive: true });
+	    document.getElementById("controlContent").addEventListener("scroll", () => {
+	      saveControlScroll();
+	      updateControlScrollBadges();
+	      finalizeControlTurnBridgeIfScrolledAway();
+	    }, { passive: true });
+
+	    document.getElementById("mobileFocusToggle").addEventListener("click", () => {
+	      setMobileDiscussionFocus(!mobileDiscussionFocused);
+	    });
+
+	    document.getElementById("mobileFocusRestore").addEventListener("click", () => {
+	      setMobileDiscussionFocus(false);
+	      mobileFocusScrollLockUntil = Date.now() + MOBILE_FOCUS_SCROLL_LOCK_MS;
+	      requestAnimationFrame(() => window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "auto" }));
+	    });
+
+	    window.addEventListener("wheel", (event) => {
+	      handleMobileBoundaryGesture(event.deltaY, event);
+	    }, { passive: false });
+
+	    window.addEventListener("touchstart", (event) => {
+	      if (!event.touches.length || mobileGestureTargetsDiscussion(event.target)) {
+	        mobileTouchStartY = null;
+	        return;
+	      }
+	      mobileTouchStartY = event.touches[0].clientY;
+	    }, { passive: true });
+
+	    window.addEventListener("touchmove", (event) => {
+	      if (mobileTouchStartY == null || !event.touches.length) return;
+	      handleMobileBoundaryGesture(mobileTouchStartY - event.touches[0].clientY, event);
+	    }, { passive: false });
+
+	    window.addEventListener("touchend", () => {
+	      mobileTouchStartY = null;
+	    }, { passive: true });
+
+	    window.addEventListener("resize", () => {
+	      mobileControlDockAnchorY = null;
+	      document.body.classList.remove("mobile-control-stuck");
+	      if (!mobileLayoutActive()) {
+	        resetMobileDiscussionFocus();
+	        resetMobileComposerFocus();
+	      }
+	      syncDiscussionPaneVisibility();
+	      updateControlDockGeometry();
+	      requestAnimationFrame(updateMobileControlStickiness);
+	    }, { passive: true });
+
+	    window.addEventListener("scroll", updateMobileControlStickiness, { passive: true });
+
+	    if (window.visualViewport) {
+	      window.visualViewport.addEventListener("resize", updateControlDockGeometry, { passive: true });
+	      window.visualViewport.addEventListener("scroll", updateControlDockGeometry, { passive: true });
+	    }
+
+	    document.getElementById("controlPrompt").addEventListener("focus", () => {
+	      setMobileComposerFocus(true);
+	    });
+
+	    document.getElementById("controlPrompt").addEventListener("blur", () => {
+	      window.setTimeout(() => {
+	        if (document.activeElement !== document.getElementById("controlPrompt")) resetMobileComposerFocus();
+	      }, 0);
+	    });
 
 	    document.getElementById("controlPrompt").addEventListener("input", () => {
 		      resetControlPromptHistory();
@@ -17732,8 +19591,6 @@ class Handler(BaseHTTPRequestHandler):
 	        token: TOKEN
 	      }));
 	      delete manuallySelectedControlTurnKeys[selectedControlSessionKey];
-	      followLatestTurnAfterUserInput[selectedControlSessionKey] = true;
-	      selectedControlTurnKeys[selectedControlSessionKey] = "";
 	      prompt.value = "";
 		      resetControlPromptHistory();
 	      updateControlComposeState(selectedControlSession());
@@ -17957,6 +19814,8 @@ def serve(port: int | None = None, host: str | None = None) -> None:
         server.serve_forever()
     finally:
         server.stop_usage_auto_refresh()
+        server.stop_connector_hub()
+        server.stop_remote_agent_api()
 
 
 def read_state(paths: Paths) -> dict[str, Any] | None:

@@ -12,6 +12,7 @@ import urllib.parse
 from argparse import Namespace
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,14 @@ import provision.cli as cli_module
 import provision.daemon as daemon_module
 import provision.launcher as launcher_module
 from provision.auth import codex_client_id_from_bytes, decode_jwt_claims, extract_metadata
-from provision.cli import cmd_import_default, daemon_switch_profile
+from provision.cli import cmd_import_default, daemon_switch_profile, main as cli_main
+from provision.connector import CONNECTOR_ABI_VERSION
+from provision.connector import ConnectorError
+from provision.connector import connector_abi_payload
+from provision.connector import connector_frame
+from provision.connector import decode_connector_frame
+from provision.connector import decode_connector_message
+from provision.connector import encode_connector_message
 from provision.daemon import analytics_completed_turn_ids
 from provision.daemon import analytics_turn_ids
 from provision.daemon import backend_proxy_prefix
@@ -29,6 +37,7 @@ from provision.daemon import backend_upstream_path
 from provision.daemon import BillingRequiredError
 from provision.daemon import bridge_codex_history_into_app_home
 from provision.daemon import CHATGPT_ANALYTICS_EVENTS_PATH
+from provision.daemon import CODEX_API_POST_PROXY_PATHS
 from provision.daemon import codex_resume_candidates_for_cwd
 from provision.daemon import codex_history_turn_index_for_cwd
 from provision.daemon import codex_history_turn_payload_for_cwd
@@ -81,6 +90,27 @@ from provision.launcher import configured_daemon_host
 from provision.launcher import configured_daemon_port
 from provision.launcher import openai_base_url_override
 from provision.paths import Paths
+from provision.remote import REMOTE_ACTION_IDEMPOTENCY_LIMIT
+from provision.remote import REMOTE_ACTION_STATE_MAX_BYTES
+from provision.remote import REMOTE_ACTION_STATE_VERSION
+from provision.remote import REMOTE_DISCUSSION_PAGE_ENTRIES
+from provision.remote import REMOTE_DISCUSSION_PAGE_MAX_BYTES
+from provision.remote import REMOTE_DELTA_BUFFER_LIMIT
+from provision.remote import REMOTE_DELTA_SYNC_MAX_BYTES
+from provision.remote import REMOTE_DISCUSSION_ENTRY_TEXT_MAX_BYTES
+from provision.remote import REMOTE_INITIAL_STATE_MAX_BYTES
+from provision.remote import REMOTE_MESSAGE_EXPAND_MAX_BYTES
+from provision.remote import RemoteAuthorizationError
+from provision.remote import RemoteActionCache
+from provision.remote import RemoteCursorCodec
+from provision.remote import RemoteCursorError
+from provision.remote import RemoteDeviceRegistry
+from provision.remote import RemoteError
+from provision.remote import RemoteStateSynchronizer
+from provision.remote import build_remote_discussion_page
+from provision.remote import build_remote_message_expand
+from provision.remote import build_remote_session_summaries
+from provision.remote import compact_json_bytes
 from provision.store import Store, StoreError
 
 
@@ -128,6 +158,39 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(metadata["account_id"], "acct_123")
             self.assertTrue(store.auth_path("default").exists())
             self.assertEqual(store.active_profile(), "default")
+
+    def test_profile_visibility_persists_without_changing_profile_routing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            auth = {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": fake_jwt({"email": "user@example.test"}),
+                    "access_token": fake_jwt({"exp": 9999999999}),
+                    "refresh_token": "rt_test",
+                },
+            }
+            source = root / "auth.json"
+            source.write_text(json.dumps(auth), encoding="utf-8")
+            paths = Paths(root / "home")
+            store = Store(paths)
+            store.import_auth_file("default", source, set_active=True)
+            store.import_auth_file("secondary", source)
+
+            store.set_profile_hidden("default", True)
+            profiles = {profile["name"]: profile for profile in store.list_profiles()}
+            self.assertTrue(profiles["default"]["hidden"])
+            self.assertTrue(profiles["default"]["active"])
+            self.assertFalse(profiles["secondary"]["hidden"])
+
+            store.import_auth_file("default", source, overwrite=True)
+            self.assertTrue(store.read_metadata("default")["hidden"])
+
+            reloaded = Store(paths)
+            self.assertEqual(reloaded.active_profile(), "default")
+            self.assertTrue(reloaded.read_metadata("default")["hidden"])
+            reloaded.set_profile_hidden("default", False)
+            self.assertFalse(reloaded.list_profiles()[0]["hidden"])
 
     def test_import_default_command_is_idempotent_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2741,6 +2804,58 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(payload, b"")
             self.assertEqual(store.active_profile(), "work")
 
+    def test_profile_visibility_api_persists_without_switching_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "auth.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "id_token": fake_jwt({"email": "user@example.test"}),
+                            "access_token": fake_jwt({"exp": 9999999999}),
+                            "refresh_token": "rt_test",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            paths = Paths(root / "home")
+            store = Store(paths)
+            store.import_auth_file("default", source, set_active=True)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                def post(token: str) -> tuple[int, bytes]:
+                    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+                    conn.request(
+                        "POST",
+                        "/api/profile-visibility",
+                        body=urllib.parse.urlencode(
+                            {"token": token, "profile": "default", "hidden": "true"}
+                        ),
+                        headers={"content-type": "application/x-www-form-urlencoded"},
+                    )
+                    response = conn.getresponse()
+                    payload = response.read()
+                    conn.close()
+                    return response.status, payload
+
+                denied_status, _denied_payload = post("not-the-proxy-token")
+                allowed_status, allowed_payload = post(server.proxy_token)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+            self.assertEqual(denied_status, 401)
+            self.assertEqual(allowed_status, 303)
+            self.assertEqual(allowed_payload, b"")
+            self.assertTrue(store.read_metadata("default")["hidden"])
+            self.assertEqual(store.active_profile(), "default")
+
     def test_profile_fast_mode_persists(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -2843,7 +2958,7 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(rewritten["model"], "gpt-5.4-mini")
             self.assertEqual(rewritten["reasoning"]["effort"], "high")
 
-    def test_image_generation_proxy_forwards_body_without_response_rewrites(self) -> None:
+    def test_image_api_proxy_forwards_generation_and_multipart_edit_bodies(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             auth = {
@@ -2859,7 +2974,7 @@ class StoreTests(unittest.TestCase):
             paths = Paths(root / "home")
             Store(paths).import_auth_file("default", source)
             server = ProvisionServer(("127.0.0.1", 0), paths)
-            captured: dict[str, object] = {}
+            captured: list[dict[str, object]] = []
             original = Handler._proxy_to_upstream_once
 
             def fake_proxy(
@@ -2872,12 +2987,14 @@ class StoreTests(unittest.TestCase):
                 route: str,
                 profile: str,
             ) -> tuple[int, int]:
-                captured.update(
-                    method=method,
-                    path=parsed.path,
-                    body=body,
-                    route=route,
-                    profile=profile,
+                captured.append(
+                    {
+                        "method": method,
+                        "path": parsed.path,
+                        "body": body,
+                        "route": route,
+                        "profile": profile,
+                    }
                 )
                 handler.send_json({"ok": True})
                 return 200, len(b'{\n  "ok": true\n}')
@@ -2886,19 +3003,133 @@ class StoreTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
-                body = b'{"model":"gpt-image-1","prompt":"a small blue square"}'
-                conn = http.client.HTTPConnection(
-                    "127.0.0.1",
-                    server.server_address[1],
-                    timeout=2,
-                )
+                requests = [
+                    (
+                        "/v1/images/generations",
+                        b'{"model":"gpt-image-1","prompt":"a small blue square"}',
+                        "application/json",
+                    ),
+                    (
+                        "/v1/images/edits",
+                        b"--provision-boundary\r\n"
+                        b'Content-Disposition: form-data; name="image"; filename="source.png"\r\n'
+                        b"Content-Type: image/png\r\n\r\n"
+                        b"PNG-bytes\r\n"
+                        b"--provision-boundary--\r\n",
+                        "multipart/form-data; boundary=provision-boundary",
+                    ),
+                ]
+                for path, body, content_type in requests:
+                    conn = http.client.HTTPConnection(
+                        "127.0.0.1",
+                        server.server_address[1],
+                        timeout=2,
+                    )
+                    conn.request(
+                        "POST",
+                        path,
+                        body=body,
+                        headers={
+                            "authorization": f"Bearer {server.proxy_token}",
+                            "content-type": content_type,
+                        },
+                    )
+                    response = conn.getresponse()
+                    response.read()
+                    conn.close()
+                    self.assertEqual(response.status, 200)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+                Handler._proxy_to_upstream_once = original
+
+            self.assertEqual(
+                captured,
+                [
+                    {
+                        "method": "POST",
+                        "path": path,
+                        "body": body,
+                        "route": UpstreamRoute.CODEX_API,
+                        "profile": "default",
+                    }
+                    for path, body, _content_type in requests
+                ],
+            )
+
+    def test_image_edit_proxy_preserves_multipart_body_and_content_type_upstream(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "auth.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "id_token": fake_jwt({"email": "user@example.test"}),
+                            "access_token": fake_jwt({"exp": 9999999999}),
+                            "refresh_token": "rt_test",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            paths = Paths(root / "home")
+            Store(paths).import_auth_file("default", source)
+            captured: dict[str, object] = {}
+
+            class UpstreamHandler(BaseHTTPRequestHandler):
+                def do_POST(self) -> None:  # noqa: N802 - stdlib callback name
+                    length = int(self.headers.get("content-length", "0"))
+                    captured["path"] = self.path
+                    captured["content_type"] = self.headers.get("content-type")
+                    captured["body"] = self.rfile.read(length)
+                    self.send_response(200)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", "11")
+                    self.end_headers()
+                    self.wfile.write(b'{"ok":true}')
+
+                def log_message(self, _format: str, *_args: object) -> None:
+                    return
+
+            upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
+            upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+            upstream_thread.start()
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            original_upstream_url = Handler.upstream_url
+
+            def local_upstream_url(
+                _handler: Handler,
+                _route: str,
+                _parsed: urllib.parse.ParseResult,
+                _auth: dict[str, Any],
+                *,
+                upstream_path: str | None = None,
+            ) -> str:
+                return f"http://127.0.0.1:{upstream.server_address[1]}{upstream_path or ''}"
+
+            Handler.upstream_url = local_upstream_url
+            server_thread.start()
+            body = (
+                b"--provision-boundary\r\n"
+                b'Content-Disposition: form-data; name="image"; filename="source.png"\r\n'
+                b"Content-Type: image/png\r\n\r\n"
+                b"PNG-bytes\r\n"
+                b"--provision-boundary--\r\n"
+            )
+            content_type = "multipart/form-data; boundary=provision-boundary"
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
                 conn.request(
                     "POST",
-                    "/v1/images/generations",
+                    "/v1/images/edits",
                     body=body,
                     headers={
                         "authorization": f"Bearer {server.proxy_token}",
-                        "content-type": "application/json",
+                        "content-type": content_type,
                     },
                 )
                 response = conn.getresponse()
@@ -2907,15 +3138,29 @@ class StoreTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 server.server_close()
-                thread.join(timeout=2)
-                Handler._proxy_to_upstream_once = original
+                server_thread.join(timeout=2)
+                Handler.upstream_url = original_upstream_url
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=2)
 
             self.assertEqual(response.status, 200)
-            self.assertEqual(captured["method"], "POST")
-            self.assertEqual(captured["path"], "/v1/images/generations")
-            self.assertEqual(captured["route"], UpstreamRoute.CODEX_API)
-            self.assertEqual(captured["profile"], "default")
+            self.assertEqual(captured["path"], "/images/edits")
+            self.assertEqual(captured["content_type"], content_type)
             self.assertEqual(captured["body"], body)
+
+    def test_codex_api_post_proxy_allowlist_includes_supported_image_endpoints(self) -> None:
+        self.assertEqual(
+            CODEX_API_POST_PROXY_PATHS,
+            frozenset(
+                {
+                    "/v1/responses",
+                    "/v1/responses/compact",
+                    "/v1/images/generations",
+                    "/v1/images/edits",
+                }
+            ),
+        )
 
     def test_stats_summary_aggregates_usage_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3104,6 +3349,56 @@ class StoreTests(unittest.TestCase):
             self.assertTrue(
                 any("Token usage" in event["summary"] for event in session["events"])
             )
+
+    def test_control_plane_snapshots_bound_transcripts_and_page_observed_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                session_key = server.observe_session("/workspace/bounded", "default")
+                turn_id = "turn-bounded"
+                server.append_control_transcript(
+                    session_key=session_key,
+                    role="user",
+                    text="Inspect the large observed turn.",
+                    turn_id=turn_id,
+                )
+                for index in range(48):
+                    server.append_control_transcript(
+                        session_key=session_key,
+                        role="tool",
+                        text=f"Tool: example_{index}\n\n" + ("x" * daemon_module.CONTROL_TRANSCRIPT_TEXT_LIMIT),
+                        turn_id=turn_id,
+                        call_id=f"call-{index}",
+                    )
+
+                session = server.control_plane_sessions()["sessions"][0]
+                window = session["transcript_window"]
+                self.assertEqual(session["turns"][0]["key"], turn_id)
+                self.assertGreater(window["start_index"], 0)
+                self.assertTrue(window["has_more_before"])
+                self.assertLessEqual(
+                    len(json.dumps(session["transcript"], separators=(",", ":")).encode("utf-8")),
+                    daemon_module.CONTROL_TRANSCRIPT_SNAPSHOT_MAX_BYTES,
+                )
+
+                page = server.control_turn_payload_for_session(session_key, turn_id)
+                self.assertTrue(page["has_more_before"])
+                self.assertLessEqual(
+                    len(json.dumps(page["transcript"], separators=(",", ":")).encode("utf-8")),
+                    daemon_module.CONTROL_TURN_PAYLOAD_MAX_BYTES,
+                )
+                earlier = server.control_turn_payload_for_session(
+                    session_key,
+                    turn_id,
+                    before_index=page["next_before_index"],
+                )
+                self.assertLess(
+                    max(item["control_index"] for item in earlier["transcript"]),
+                    min(item["control_index"] for item in page["transcript"]),
+                )
+            finally:
+                server.server_close()
 
     def test_control_plane_history_metadata_loads_on_demand(self) -> None:
         previous_codex_home = os.environ.get("CODEX_HOME")
@@ -3377,6 +3672,196 @@ class StoreTests(unittest.TestCase):
         )
         self.assertIn(".control-message {", html)
         self.assertIn("\t      align-self: start;", html)
+
+    def test_discussion_ui_includes_mobile_focus_turn_window_and_patch_preview_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                html = handler.render_ui()
+            finally:
+                server.server_close()
+
+        self.assertIn('id="mobileControlStatus"', html)
+        self.assertIn('id="mobileFocusToggle"', html)
+        self.assertIn('id="mobileFocusRestore"', html)
+        self.assertIn("mobile-discussion-focus", html)
+        self.assertIn("handleMobileBoundaryGesture", html)
+        self.assertIn("mobileGestureTargetsDiscussion", html)
+        self.assertIn("controlTurnPresentations", html)
+        self.assertIn("data-control-turn-boundary", html)
+        self.assertIn("data-control-prior-show", html)
+        self.assertIn("Show full patch", html)
+        self.assertIn("renderPatchToolSummary", html)
+
+    def test_discussion_ui_compacts_context_replay_cards_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                html = handler.render_ui()
+            finally:
+                server.server_close()
+
+        self.assertIn("function isContextCompactionPacket(item)", html)
+        self.assertIn("compactionPacket && !expanded", html)
+        self.assertIn("Show post-compaction packet", html)
+        self.assertIn("Hide post-compaction packet", html)
+        self.assertIn("control-compaction-packet", html)
+        self.assertIn("The post-compaction packet is hidden by default.", html)
+
+    def test_context_summary_uses_the_current_gpt_5_6_context_window(self) -> None:
+        summary = daemon_module.context_summary_from_usage({"input_tokens": 256000})
+
+        self.assertEqual(summary["window_tokens"], 272000)
+        self.assertEqual(summary["remaining_tokens"], 16000)
+        self.assertEqual(summary["remaining_percent"], 6)
+
+    def test_discussion_markdown_keeps_local_file_reference_labels_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                html = handler.render_ui()
+            finally:
+                server.server_close()
+
+        self.assertIn("function isLocalMarkdownFileReference(value)", html)
+        self.assertIn("/^(?:file:|\\/|~\\/|\\.{1,2}\\/)/i.test(raw)", html)
+        self.assertIn("function markdownLinkLabel(label, href)", html)
+        self.assertIn("function replaceMarkdownLinks(value, renderLink)", html)
+        self.assertIn('class="markdown-file-ref" title="${escapeHtml(rawHref)}">${escapeHtml(visibleLabel)}</code>', html)
+        self.assertLess(
+            html.index("if (isLocalMarkdownFileReference(rawHref))"),
+            html.index("const safeHref = safeMarkdownHref(rawHref);"),
+        )
+        self.assertIn("function repairStreamedMarkdownProse(value)", html)
+        self.assertIn("if (inFence) rendered.push(line);", html)
+        self.assertIn("let codeTickCount = 0;", html)
+
+    def test_profile_list_supports_persistent_hidden_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                html = handler.render_ui()
+            finally:
+                server.server_close()
+
+        self.assertIn('id="profileHiddenToggle"', html)
+        self.assertIn('action="/api/profile-visibility"', html)
+        self.assertIn('data-action="set_profile_visibility"', html)
+        self.assertIn("let showHiddenProfiles = false;", html)
+        self.assertIn("Show hidden profiles", html)
+        self.assertIn("Hide hidden profiles", html)
+
+    def test_mobile_discussion_is_layered_sticky_viewport_region(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                html = handler.render_ui()
+            finally:
+                server.server_close()
+
+        self.assertIn("display: flex;\n\t        flex-direction: column;", html)
+        self.assertIn(".profiles {\n\t        order: 2;", html)
+        self.assertIn(".control-dock {\n\t        position: relative;", html)
+        self.assertIn("\t        order: 1;", html)
+        self.assertIn("\t        min-block-size: 0;", html)
+        self.assertIn(".mobile-control-stuck .shell::after {", html)
+        self.assertIn(".mobile-control-stuck .control-dock {", html)
+        self.assertIn("position: fixed;", html)
+        self.assertIn("mobileControlDockAnchorY", html)
+        self.assertIn("function updateMobileControlStickiness()", html)
+        self.assertIn('window.addEventListener("scroll", updateMobileControlStickiness', html)
+        self.assertIn("--mobile-viewport-height", html)
+        self.assertIn("--mobile-control-dock-height", html)
+        self.assertIn("padding-bottom: max(8px, env(safe-area-inset-bottom));", html)
+        self.assertIn("overscroll-behavior: contain;", html)
+        self.assertIn("window.visualViewport.addEventListener(\"resize\", updateControlDockGeometry", html)
+        self.assertIn(".control-compose {\n\t      grid-row: 5;", html)
+        self.assertIn("\t      position: relative;\n\t      z-index: 2;", html)
+        self.assertIn(".control-head {\n\t  grid-row: 1;", html)
+        self.assertIn(".control-status-pills {\n\t      grid-row: 2;", html)
+        self.assertIn(".control-toolbar {\n\t  grid-row: 3;", html)
+        self.assertIn(".control-content {\n\t  grid-row: 4;", html)
+        self.assertIn(".control-compose {\n\t      grid-row: 5;", html)
+
+    def test_discussion_hides_profiles_while_the_composer_is_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                html = handler.render_ui()
+            finally:
+                server.server_close()
+
+        self.assertIn('id="profilesPanel" class="profiles"', html)
+        self.assertIn(".discussion-active .profiles {", html)
+        self.assertIn("function discussionActive()", html)
+        self.assertIn("function syncDiscussionPaneVisibility()", html)
+        self.assertIn('document.body.classList.toggle("discussion-active", active);', html)
+        self.assertIn("if (profiles) profiles.hidden = active;", html)
+
+    def test_mobile_composer_focus_pins_the_keyboard_viewport_and_hides_navigation_chrome(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                html = handler.render_ui()
+            finally:
+                server.server_close()
+
+        self.assertIn(".mobile-composer-focus #sessionTabs,", html)
+        self.assertIn(".mobile-composer-focus #mobileControlStatus,", html)
+        self.assertIn(".mobile-composer-focus .control-modal.discussion-view .control-toolbar,", html)
+        self.assertIn(".mobile-composer-focus .control-modal.discussion-view .control-head {", html)
+        self.assertIn("top: var(--mobile-visual-viewport-top, 0px);", html)
+        self.assertIn("block-size: var(--mobile-viewport-height, 100dvh);", html)
+        self.assertIn("let mobileComposerFocused = false;", html)
+        self.assertIn("function setMobileComposerFocus(focused)", html)
+        self.assertIn("function resetMobileComposerFocus()", html)
+        self.assertIn('root.style.setProperty("--mobile-visual-viewport-top", `${viewportTop}px`);', html)
+        self.assertIn('window.visualViewport.addEventListener("scroll", updateControlDockGeometry', html)
+        self.assertIn('document.getElementById("controlPrompt").addEventListener("focus"', html)
+        self.assertIn('document.getElementById("controlPrompt").addEventListener("blur"', html)
+
+    def test_mobile_discussion_focus_keeps_the_composer_within_the_viewport(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                html = handler.render_ui()
+            finally:
+                server.server_close()
+
+        self.assertIn(".mobile-discussion-focus .control-dock {", html)
+        self.assertIn("top: var(--mobile-visual-viewport-top, 0px);", html)
+        self.assertIn(".mobile-discussion-focus .control-modal.discussion-view .control-toolbar,", html)
+        self.assertIn(".mobile-discussion-focus .control-modal.discussion-view .control-head {", html)
+        self.assertNotIn(
+            ".mobile-discussion-focus .control-modal.discussion-view .control-head,\n"
+            "\t      .mobile-discussion-focus .control-modal.discussion-view .control-compose",
+            html,
+        )
+        self.assertIn("top: max(8px, env(safe-area-inset-top));", html)
 
     def test_session_tabs_keep_observed_order_and_persist_reorder(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -4024,6 +4509,27 @@ class StoreTests(unittest.TestCase):
         self.assertIn("Tool: apply_patch", command_shaped["text"])
         self.assertIn("Input:", command_shaped["text"])
         self.assertNotIn("Command: *** Begin Patch", command_shaped["text"])
+
+    def test_exec_patch_tool_entry_is_normalized_with_source_metadata(self) -> None:
+        entry = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "function_call",
+                "call_id": "patch-exec-1",
+                "name": "exec_command",
+                "status": "completed",
+                "arguments": {
+                    "cmd": "*** Begin Patch\n*** Update File: app.py\n@@\n-old\n+new\n*** End Patch"
+                },
+            }
+        )
+
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertIn("Tool: apply_patch (status completed)", entry["text"])
+        self.assertIn("Source:\nexec_command", entry["text"])
+        self.assertIn("Input:\n*** Begin Patch", entry["text"])
+        self.assertEqual(entry["text"].count("*** Begin Patch"), 1)
+        self.assertNotIn("Command:", entry["text"])
 
     def test_image_generation_tool_result_has_concise_completion_entry(self) -> None:
         image_bytes = "a" * 10_000
@@ -5830,6 +6336,821 @@ class StoreTests(unittest.TestCase):
         )
 
         self.assertIsNone(codex_client_id_from_bytes(payload))
+
+    def test_remote_state_is_opaque_bounded_and_delta_based(self) -> None:
+        secret = b"r" * 32
+        synchronizer = RemoteStateSynchronizer()
+        control_plane = {
+            "sessions": [
+                {
+                    "key": "/private/workspace/provision",
+                    "title": "Remote redesign",
+                    "associated_profile": "default",
+                    "active": True,
+                    "interaction": {"available": True},
+                    "active_details": {"tunnels": [{"turn_id": "turn-current"}]},
+                    "context": {
+                        "input_tokens": 100,
+                        "total_tokens": 120,
+                        "remaining_percent": 99,
+                        "label": "~99% left",
+                    },
+                    "quota_summary": "Updated now; 90% left",
+                    "transcript": [{"full_text": "must never be in state"}],
+                    "search_text": "must never be in state",
+                }
+            ]
+        }
+        summaries = build_remote_session_summaries(control_plane, secret)
+        self.assertEqual(synchronizer.refresh(summaries), 1)
+        payload = synchronizer.state_payload()
+        encoded = compact_json_bytes(payload)
+        self.assertLessEqual(len(encoded), REMOTE_INITIAL_STATE_MAX_BYTES)
+        self.assertNotIn(b"/private/workspace/provision", encoded)
+        self.assertNotIn(b"must never be in state", encoded)
+        self.assertEqual(payload["sessions"][0]["current_turn_id"], "turn-current")
+        self.assertTrue(payload["sessions"][0]["session_id"].startswith("rs_"))
+
+        control_plane["sessions"][0]["active"] = False
+        self.assertEqual(
+            synchronizer.refresh(build_remote_session_summaries(control_plane, secret)),
+            2,
+        )
+        deltas = synchronizer.deltas_since(1)
+        self.assertIsNotNone(deltas)
+        assert deltas is not None
+        self.assertEqual(deltas[0]["type"], "session_metrics")
+        self.assertEqual(deltas[0]["metrics"]["active"], False)
+        self.assertEqual(deltas[0]["metrics"]["unread_revision"], 2)
+        self.assertNotIn("_source_session_key", json.dumps(deltas))
+
+        control_plane["sessions"] = []
+        self.assertEqual(synchronizer.refresh(build_remote_session_summaries(control_plane, secret)), 3)
+        removal = synchronizer.deltas_since(2)
+        self.assertIsNotNone(removal)
+        assert removal is not None
+        self.assertEqual(removal[0]["type"], "session_remove")
+
+    def test_remote_state_stays_bounded_and_discussion_deltas_expire(self) -> None:
+        secret = b"b" * 32
+        synchronizer = RemoteStateSynchronizer()
+        summaries = build_remote_session_summaries(
+            {
+                "sessions": [
+                    {
+                        "key": f"/private/workspace/{index}",
+                        "title": f"Session {index}",
+                        "associated_profile": "default",
+                        "active": index == 0,
+                        "interaction": {"available": True},
+                        "context": {
+                            "total_tokens": 999_999,
+                            "remaining_percent": 50,
+                            "label": "context " + ("c" * 80),
+                        },
+                        "quota_summary": "quota " + ("q" * 230),
+                    }
+                    for index in range(300)
+                ]
+            },
+            secret,
+        )
+        self.assertEqual(synchronizer.refresh(summaries), 1)
+        state = synchronizer.state_payload()
+        self.assertEqual(state["session_count"], 300)
+        self.assertTrue(state["truncated_sessions"])
+        self.assertLessEqual(len(compact_json_bytes(state)), REMOTE_INITIAL_STATE_MAX_BYTES)
+
+        codec = RemoteCursorCodec(secret)
+        first_page = synchronizer.state_payload(cursor_codec=codec)
+        self.assertTrue(first_page["has_more_sessions"])
+        self.assertTrue(first_page["next_session_cursor"])
+        self.assertLessEqual(len(compact_json_bytes(first_page)), REMOTE_INITIAL_STATE_MAX_BYTES)
+        pages = [first_page]
+        while pages[-1]["has_more_sessions"]:
+            pages.append(
+                synchronizer.state_payload(
+                    cursor_codec=codec,
+                    cursor=pages[-1]["next_session_cursor"],
+                )
+            )
+        second_page = pages[1]
+        session_ids = [
+            item["session_id"]
+            for page in pages
+            for item in page["sessions"]
+        ]
+        self.assertEqual(len(session_ids), 300)
+        self.assertEqual(len(set(session_ids)), 300)
+        self.assertTrue(all(len(compact_json_bytes(page)) <= REMOTE_INITIAL_STATE_MAX_BYTES for page in pages))
+
+        metric_summaries = [dict(summary) for summary in summaries]
+        metric_summaries[0]["quota"] = "refreshed quota"
+        self.assertGreater(synchronizer.refresh(metric_summaries), state["revision"])
+        # A metric-only refresh does not change session ordering or expire the
+        # cursor that continues after the first page.
+        self.assertEqual(
+            synchronizer.state_payload(
+                cursor_codec=codec,
+                cursor=first_page["next_session_cursor"],
+            )["sessions"],
+            second_page["sessions"],
+        )
+
+        state = synchronizer.state_payload()
+        session_id = state["sessions"][0]["session_id"]
+        entry = {
+            "message_id": "rm_live_entry",
+            "role": "assistant",
+            "turn_id": "turn-live",
+            "updated_at": "2026-07-18T00:00:00Z",
+            "text": "bounded live content " + ("x" * (REMOTE_DISCUSSION_ENTRY_TEXT_MAX_BYTES * 2)),
+            "truncated": False,
+            "search_text": "must not escape",
+        }
+        baseline = state["revision"]
+        synchronizer.record_discussion_change(session_id, entry, replace=False)
+        # Message traffic does not invalidate a page cursor for an unchanged
+        # session index.
+        self.assertEqual(
+            synchronizer.state_payload(
+                cursor_codec=codec,
+                cursor=first_page["next_session_cursor"],
+            )["sessions"],
+            second_page["sessions"],
+        )
+        synchronizer.record_discussion_change(
+            session_id,
+            {**entry, "text": "updated bounded live content"},
+            replace=True,
+        )
+        synchronizer.record_discussion_remove(session_id, "rm_live_entry")
+        deltas = synchronizer.deltas_since(baseline)
+        self.assertIsNotNone(deltas)
+        assert deltas is not None
+        self.assertEqual([delta["type"] for delta in deltas], ["message_append", "message_replace", "message_remove"])
+        encoded = compact_json_bytes(deltas)
+        self.assertNotIn(b"search_text", encoded)
+        self.assertNotIn(b"/private/workspace", encoded)
+        self.assertLessEqual(
+            len(deltas[0]["message"]["text"].encode("utf-8")),
+            REMOTE_DISCUSSION_ENTRY_TEXT_MAX_BYTES,
+        )
+        self.assertTrue(deltas[0]["message"]["truncated"])
+        with self.assertRaises(ValueError):
+            compact_json_bytes({"unexpected": float("nan")})
+
+        for index in range(REMOTE_DELTA_BUFFER_LIMIT):
+            synchronizer.record_discussion_change(
+                session_id,
+                {**entry, "message_id": f"rm_expire_{index}"},
+                replace=False,
+            )
+        self.assertIsNone(synchronizer.deltas_since(baseline))
+        self.assertIsNone(synchronizer.deltas_since(synchronizer.revision + 1))
+
+        self.assertGreater(synchronizer.refresh(summaries[:-1]), baseline)
+        with self.assertRaises(RemoteCursorError):
+            synchronizer.state_payload(
+                cursor_codec=codec,
+                cursor=first_page["next_session_cursor"],
+            )
+
+    def test_remote_turn_transitions_are_explicit_deltas(self) -> None:
+        secret = b"t" * 32
+        synchronizer = RemoteStateSynchronizer()
+        control_plane = {
+            "sessions": [
+                {
+                    "key": "/private/turn-session",
+                    "title": "Turn session",
+                    "active": True,
+                    "interaction": {"available": True},
+                    "active_details": {"tunnels": [{"turn_id": "turn-one"}]},
+                }
+            ]
+        }
+        self.assertEqual(
+            synchronizer.refresh(build_remote_session_summaries(control_plane, secret)),
+            1,
+        )
+        control_plane["sessions"][0]["active_details"] = {"tunnels": [{"turn_id": "turn-two"}]}
+        self.assertEqual(
+            synchronizer.refresh(build_remote_session_summaries(control_plane, secret)),
+            2,
+        )
+        changed = synchronizer.deltas_since(1)
+        self.assertIsNotNone(changed)
+        assert changed is not None
+        self.assertEqual([delta["type"] for delta in changed], ["turn_completed", "turn_started"])
+        self.assertEqual(changed[0]["turn_id"], "turn-one")
+        self.assertEqual(changed[1]["turn_id"], "turn-two")
+
+        control_plane["sessions"][0]["active_details"] = {"tunnels": []}
+        self.assertEqual(
+            synchronizer.refresh(build_remote_session_summaries(control_plane, secret)),
+            3,
+        )
+        completed = synchronizer.deltas_since(2)
+        self.assertIsNotNone(completed)
+        assert completed is not None
+        self.assertEqual([delta["type"] for delta in completed], ["turn_completed"])
+
+    def test_remote_discussion_and_message_expansion_are_paged_and_tamper_safe(self) -> None:
+        secret = b"d" * 32
+        codec = RemoteCursorCodec(secret)
+        session_id = "rs_example"
+        transcript = [
+            {
+                "item_id": f"cti_{index}",
+                "role": "assistant",
+                "turn_id": "turn-1",
+                "ts": "2026-07-18T00:00:00Z",
+                "text": f"display {index} " + ("x" * 30000),
+                "full_text": f"full {index} " + ("y" * 30000),
+                "truncated": True,
+                "search_text": "server-only search content",
+            }
+            for index in range(100)
+        ]
+        long_text = "z" * (300 * 1024)
+        transcript[-1]["full_text"] = long_text
+        first = build_remote_discussion_page(
+            secret=secret,
+            session_id=session_id,
+            transcript=transcript,
+            cursor_codec=codec,
+        )
+        self.assertLessEqual(len(first["entries"]), REMOTE_DISCUSSION_PAGE_ENTRIES)
+        self.assertLessEqual(len(compact_json_bytes(first)), REMOTE_DISCUSSION_PAGE_MAX_BYTES)
+        self.assertTrue(first["has_more"])
+        self.assertNotIn("full_text", json.dumps(first))
+        self.assertNotIn("search_text", json.dumps(first))
+
+        second = build_remote_discussion_page(
+            secret=secret,
+            session_id=session_id,
+            transcript=transcript,
+            cursor_codec=codec,
+            cursor=first["next_cursor"],
+        )
+        self.assertTrue(
+            set(item["message_id"] for item in first["entries"]).isdisjoint(
+                item["message_id"] for item in second["entries"]
+            )
+        )
+        tampered = ("A" if first["next_cursor"][0] != "A" else "B") + first["next_cursor"][1:]
+        with self.assertRaises(RemoteCursorError):
+            build_remote_discussion_page(
+                secret=secret,
+                session_id=session_id,
+                transcript=transcript,
+                cursor_codec=codec,
+                cursor=tampered,
+            )
+
+        message_id = first["entries"][-1]["message_id"]
+        expanded = build_remote_message_expand(
+            secret=secret,
+            session_id=session_id,
+            transcript=transcript,
+            message_id=message_id,
+            cursor_codec=codec,
+        )
+        self.assertLessEqual(len(compact_json_bytes(expanded)), REMOTE_MESSAGE_EXPAND_MAX_BYTES)
+        self.assertTrue(expanded["has_more"])
+        expanded_next = build_remote_message_expand(
+            secret=secret,
+            session_id=session_id,
+            transcript=transcript,
+            message_id=message_id,
+            cursor_codec=codec,
+            cursor=expanded["next_cursor"],
+        )
+        self.assertEqual(expanded["text"] + expanded_next["text"], long_text)
+
+    def test_remote_device_registry_defaults_to_read_only_and_redacts_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            registry = RemoteDeviceRegistry(root / "devices.json", root / "audit.jsonl")
+            enrolled = registry.enroll("companion-001", "transport:example-fingerprint")
+            self.assertEqual(set(enrolled["capabilities"]), {"read_state", "read_discussion"})
+            registry.authorize("companion-001", "read_discussion")
+            with self.assertRaises(RemoteAuthorizationError):
+                registry.authorize("companion-001", "send_prompt")
+            registry.set_capabilities("companion-001", {"read_state", "read_discussion", "send_prompt"})
+            registry.authorize("companion-001", "send_prompt")
+            registry.append_audit(
+                event="remote_action",
+                device_id="companion-001",
+                capability="send_prompt",
+                session_ref="session_opaque",
+                outcome="ok",
+                request_ref="request_opaque",
+            )
+            audit = (root / "audit.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn("sensitive prompt", audit)
+            self.assertEqual((root / "devices.json").stat().st_mode & 0o777, 0o600)
+            registry.revoke("companion-001")
+            with self.assertRaises(RemoteAuthorizationError):
+                registry.authorize("companion-001", "read_state")
+
+    def test_remote_action_cache_persists_only_redacted_result_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "remote-actions.json"
+            cache = RemoteActionCache(path)
+            cache.remember(
+                "companion-004",
+                "remote-request-004",
+                {
+                    "ok": True,
+                    "action": "send_prompt",
+                    "session_id": "rs_example",
+                    "revision": 4,
+                    "idempotency_key": "remote-request-004",
+                    "_semantic_ref": "request_opaque",
+                    "prompt": "sensitive prompt must not persist",
+                },
+            )
+            persisted = path.read_text(encoding="utf-8")
+            self.assertNotIn("sensitive prompt", persisted)
+            reloaded = RemoteActionCache(path)
+            result = reloaded.get("companion-004", "remote-request-004")
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(result["_semantic_ref"], "request_opaque")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_remote_action_journal_reserves_before_mutation_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "remote-actions.json"
+            cache = RemoteActionCache(path)
+            expiry = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
+            self.assertIsNone(
+                cache.reserve("companion-005", "remote-request-005", "request_opaque", expiry)
+            )
+            reloaded = RemoteActionCache(path)
+            with self.assertRaisesRegex(RemoteError, "indeterminate"):
+                reloaded.reserve("companion-005", "remote-request-005", "request_opaque", expiry)
+            self.assertNotIn("prompt", path.read_text(encoding="utf-8"))
+
+            path.write_text("not json", encoding="utf-8")
+            corrupted = RemoteActionCache(path)
+            with self.assertRaisesRegex(RemoteError, "journal"):
+                corrupted.get("companion-005", "remote-request-005")
+
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": REMOTE_ACTION_STATE_VERSION,
+                        "entries": [{"device_id": "companion-005"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            malformed = RemoteActionCache(path)
+            with self.assertRaisesRegex(RemoteError, "invalid entry"):
+                malformed.get("companion-005", "remote-request-005")
+
+    def test_remote_action_journal_keeps_live_idempotency_keys_without_eviction(self) -> None:
+        expiry = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
+        cache = RemoteActionCache()
+        for index in range(REMOTE_ACTION_IDEMPOTENCY_LIMIT):
+            self.assertIsNone(
+                cache.reserve(
+                    "companion-008",
+                    f"remote-key-{index:04}",
+                    f"request_{index}",
+                    expiry,
+                )
+            )
+        with self.assertRaisesRegex(RemoteError, "capacity"):
+            cache.reserve(
+                "companion-008",
+                "remote-key-overflow",
+                "request_overflow",
+                expiry,
+            )
+
+    def test_remote_action_journal_prunes_expired_records_and_rejects_oversize_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "remote-actions.json"
+            expiry = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
+            cache = RemoteActionCache(path)
+            cache.reserve("companion-009", "remote-request-009", "request_009", expiry)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            persisted["entries"][0]["result"]["_expires_at"] = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat()
+            path.write_text(json.dumps(persisted), encoding="utf-8")
+            expired = RemoteActionCache(path)
+            self.assertIsNone(expired.get("companion-009", "remote-request-009"))
+            self.assertIsNone(
+                expired.reserve("companion-009", "remote-request-009", "request_new", expiry)
+            )
+
+            oversized_path = root / "oversized-actions.json"
+            oversized_path.write_bytes(b"x" * (REMOTE_ACTION_STATE_MAX_BYTES + 1))
+            oversized = RemoteActionCache(oversized_path)
+            with self.assertRaisesRegex(RemoteError, "invalid format"):
+                oversized.get("companion-009", "remote-request-009")
+
+    def test_server_remote_boundary_is_internal_capability_scoped_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "auth.json"
+            source.write_text(json.dumps({"OPENAI_API_KEY": "sk-test"}), encoding="utf-8")
+            paths = Paths(root / "home")
+            Store(paths).import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            sent: list[tuple[str, str]] = []
+            try:
+                session_key = server.observe_session("/private/workspace/provision", "default")
+                server.append_control_transcript(
+                    session_key=session_key,
+                    role="assistant",
+                    text="A short observed answer.",
+                    turn_id="turn-remote",
+                    profile="default",
+                )
+                server.enroll_remote_device("companion-002", "transport:paired")
+                state = server.remote_state_payload("companion-002")
+                self.assertEqual(state["type"], "state")
+                self.assertNotIn(session_key, json.dumps(state))
+                session_id = state["sessions"][0]["session_id"]
+                discussion = server.remote_discussion_payload("companion-002", session_id)
+                self.assertEqual(discussion["entries"][0]["text"], "A short observed answer.")
+                with self.assertRaises(RemoteAuthorizationError):
+                    server.remote_state_payload("unknown-device")
+
+                server.remote_devices.set_capabilities(
+                    "companion-002",
+                    {"read_state", "read_discussion", "send_prompt"},
+                )
+                original_send = server.send_session_prompt
+                server.send_session_prompt = lambda key, prompt: sent.append((key, prompt)) or {"ok": True}  # type: ignore[method-assign]
+                expiry = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
+                result = server.perform_remote_action(
+                    "companion-002",
+                    action="send_prompt",
+                    session_id=session_id,
+                    expected_revision=state["sessions"][0]["unread_revision"],
+                    idempotency_key="remote-request-001",
+                    expires_at=expiry,
+                    prompt="sensitive prompt",
+                )
+                repeat = server.perform_remote_action(
+                    "companion-002",
+                    action="send_prompt",
+                    session_id=session_id,
+                    expected_revision=state["sessions"][0]["unread_revision"],
+                    idempotency_key="remote-request-001",
+                    expires_at=expiry,
+                    prompt="sensitive prompt",
+                )
+                self.assertEqual(result, repeat)
+                self.assertEqual(sent, [(session_key, "sensitive prompt")])
+                with self.assertRaisesRegex(RemoteError, "different action"):
+                    server.perform_remote_action(
+                        "companion-002",
+                        action="send_prompt",
+                        session_id=session_id,
+                        expected_revision=state["sessions"][0]["unread_revision"],
+                        idempotency_key="remote-request-001",
+                        expires_at=expiry,
+                        prompt="a different sensitive prompt",
+                    )
+                self.assertNotIn("sensitive prompt", paths.remote_audit.read_text(encoding="utf-8"))
+                server.send_session_prompt = original_send  # type: ignore[method-assign]
+            finally:
+                server.server_close()
+
+    def test_server_remote_discussion_deltas_and_session_scoped_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            sent: list[tuple[str, str]] = []
+            try:
+                first_key = server.observe_session("/private/first", "default")
+                second_key = server.observe_session("/private/second", "default")
+                server.enroll_remote_device(
+                    "companion-006",
+                    "transport:delta-paired",
+                    capabilities={"read_state", "read_discussion", "send_prompt"},
+                )
+                initial = server.remote_state_payload("companion-006")
+                first = next(item for item in initial["sessions"] if item["label"] == "first")
+                second = next(item for item in initial["sessions"] if item["label"] == "second")
+                baseline = initial["revision"]
+
+                server.append_control_transcript(
+                    session_key=second_key,
+                    role="assistant",
+                    text="first streamed fragment",
+                    turn_id="turn-second",
+                )
+                server.append_control_transcript(
+                    session_key=second_key,
+                    role="assistant",
+                    text=" second streamed fragment",
+                    turn_id="turn-second",
+                    append=True,
+                )
+                changed = server.remote_state_payload("companion-006", since_revision=baseline)
+                self.assertEqual(changed["type"], "state_delta")
+                types = [delta["type"] for delta in changed["deltas"]]
+                self.assertIn("message_append", types)
+                self.assertIn("message_replace", types)
+                self.assertNotIn("/private/second", json.dumps(changed))
+
+                original_send = server.send_session_prompt
+                server.send_session_prompt = lambda key, prompt: sent.append((key, prompt)) or {"ok": True}  # type: ignore[method-assign]
+                expiry = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
+                server.perform_remote_action(
+                    "companion-006",
+                    action="send_prompt",
+                    session_id=first["session_id"],
+                    expected_revision=first["unread_revision"],
+                    idempotency_key="remote-request-006",
+                    expires_at=expiry,
+                    prompt="prompt for only the first session",
+                )
+                self.assertEqual(sent, [(first_key, "prompt for only the first session")])
+                self.assertNotEqual(
+                    server.remote_state.session_payload(second["session_id"])["unread_revision"],
+                    second["unread_revision"],
+                )
+                server.send_session_prompt = original_send  # type: ignore[method-assign]
+            finally:
+                server.server_close()
+
+    def test_server_remote_delta_overflow_resyncs_to_a_bounded_session_page(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                session_key = server.observe_session("/private/overflow", "default")
+                server.enroll_remote_device("companion-007", "transport:overflow-paired")
+                initial = server.remote_state_payload("companion-007")
+                baseline = initial["revision"]
+                for index in range(6):
+                    server.append_control_transcript(
+                        session_key=session_key,
+                        role="assistant",
+                        text=f"fragment {index}: " + ("x" * 12000),
+                        turn_id=f"turn-overflow-{index}",
+                    )
+                raw_deltas = server.remote_state.deltas_since(baseline)
+                self.assertIsNotNone(raw_deltas)
+                assert raw_deltas is not None
+                self.assertGreater(
+                    len(
+                        compact_json_bytes(
+                            {
+                                "type": "state_delta",
+                                "protocol_version": 1,
+                                "revision": server.remote_state.revision,
+                                "deltas": raw_deltas,
+                            }
+                        )
+                    ),
+                    REMOTE_DELTA_SYNC_MAX_BYTES,
+                )
+                response = server.remote_state_payload(
+                    "companion-007",
+                    since_revision=baseline,
+                )
+                self.assertEqual(response["type"], "state")
+                self.assertTrue(response["resync_required"])
+                self.assertLessEqual(len(compact_json_bytes(response)), REMOTE_INITIAL_STATE_MAX_BYTES)
+                self.assertNotIn("fragment 0", json.dumps(response))
+                self.assertNotIn("/private/overflow", json.dumps(response))
+            finally:
+                server.server_close()
+
+    def test_local_remote_agent_socket_requires_its_own_capability(self) -> None:
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("Unix-domain sockets are unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "auth.json"
+            source.write_text(json.dumps({"OPENAI_API_KEY": "sk-test"}), encoding="utf-8")
+            paths = Paths(root / "home")
+            store = Store(paths)
+            store.import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                self.assertFalse(paths.remote_agent_socket.exists())
+                self.assertFalse(paths.remote_secret.exists())
+                self.assertFalse(paths.remote_agent_token.exists())
+                self.assertIsNone(server.remote_state)
+                server.observe_session("/private/socket-test", "default")
+                self.assertFalse(paths.remote_secret.exists())
+                self.assertFalse(paths.remote_agent_token.exists())
+                server.enroll_remote_device("companion-003", "transport:socket-paired")
+                self.assertTrue(paths.remote_secret.exists())
+                self.assertFalse(paths.remote_agent_token.exists())
+                self.assertIsNotNone(server.remote_state)
+                server.start_remote_agent_api()
+                self.assertTrue(paths.remote_agent_socket.exists())
+                self.assertTrue(paths.remote_agent_token.exists())
+                self.assertEqual(paths.remote_agent_socket.stat().st_mode & 0o777, 0o600)
+
+                connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                connection.settimeout(2)
+                connection.connect(str(paths.remote_agent_socket))
+                connection.sendall(
+                    (
+                        json.dumps(
+                            {
+                                "token": store.remote_agent_token(),
+                                "operation": "state",
+                                "device_id": "companion-003",
+                            }
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                )
+                response = json.loads(connection.recv(65536).decode("utf-8"))
+                connection.close()
+                self.assertTrue(response["ok"])
+                self.assertEqual(response["result"]["type"], "state")
+                self.assertNotIn("/private/socket-test", json.dumps(response))
+
+                invalid = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                invalid.settimeout(2)
+                invalid.connect(str(paths.remote_agent_socket))
+                invalid.sendall(
+                    b'{"token":"not-the-agent-token","operation":"state","device_id":"companion-003"}\n'
+                )
+                rejected = json.loads(invalid.recv(65536).decode("utf-8"))
+                invalid.close()
+                self.assertFalse(rejected["ok"])
+                self.assertIn("capability", rejected["error"])
+                self.assertNotEqual(store.remote_agent_token(), server.proxy_token)
+            finally:
+                server.server_close()
+            self.assertFalse(paths.remote_agent_socket.exists())
+
+    def test_connector_abi_is_bounded_and_local_hub_routes_echo_and_remote_lanes(self) -> None:
+        if not hasattr(socket, "AF_UNIX") or not hasattr(socket, "SO_PEERCRED"):
+            self.skipTest("same-user Unix-domain connector sockets are unavailable")
+        import base64
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "auth.json"
+            source.write_text(json.dumps({"OPENAI_API_KEY": "sk-test"}), encoding="utf-8")
+            paths = Paths(root / "home")
+            store = Store(paths)
+            store.import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+            def receive() -> dict[str, Any]:
+                data = bytearray()
+                while b"\n" not in data:
+                    chunk = connection.recv(65536)
+                    if not chunk:
+                        self.fail("connector socket closed before a response")
+                    data.extend(chunk)
+                return decode_connector_message(bytes(data.split(b"\n", 1)[0]))
+
+            try:
+                self.assertFalse(paths.connector_socket.exists())
+                self.assertFalse(paths.connector_token.exists())
+                self.assertFalse(server.connector_status()["enabled"])
+                session_key = server.observe_session("/workspace/connector", "default")
+                server.enroll_remote_device("connector-peer", "test-pairing")
+                status = server.start_connector_hub()
+                self.assertTrue(status["enabled"])
+                self.assertEqual(status["abi"], CONNECTOR_ABI_VERSION)
+                self.assertTrue(paths.connector_socket.exists())
+                self.assertTrue(paths.connector_token.exists())
+                self.assertEqual(paths.connector_socket.stat().st_mode & 0o777, 0o600)
+
+                connection.settimeout(2)
+                connection.connect(str(paths.connector_socket))
+                connection.sendall(
+                    encode_connector_message(
+                        {
+                            "type": "hello",
+                            "abi": CONNECTOR_ABI_VERSION,
+                            "token": store.connector_token(),
+                            "connector_id": "loopback-connector",
+                            "lanes": ["provision.echo/v1", "provision.remote/v1"],
+                        }
+                    )
+                )
+                hello = receive()
+                self.assertEqual(hello["type"], "hello_ack")
+                self.assertEqual(hello["lanes"], ["provision.echo/v1", "provision.remote/v1"])
+
+                connection.sendall(
+                    encode_connector_message(
+                        connector_frame(
+                            link_id="local-loopback",
+                            lane="provision.echo/v1",
+                            payload=b"hello connector",
+                            message_id="message-001",
+                        )
+                    )
+                )
+                echo = receive()
+                self.assertEqual(echo["type"], "frame_ack")
+                self.assertEqual(
+                    base64.urlsafe_b64decode(echo["payload"] + "=" * (-len(echo["payload"]) % 4)),
+                    b"hello connector",
+                )
+
+                connection.sendall(
+                    encode_connector_message(
+                        connector_frame(
+                            link_id="local-loopback",
+                            lane="provision.remote/v1",
+                            payload=json.dumps(
+                                {"operation": "state", "device_id": "connector-peer"}
+                            ).encode("utf-8"),
+                        )
+                    )
+                )
+                remote = receive()
+                remote_payload = json.loads(
+                    base64.urlsafe_b64decode(
+                        remote["payload"] + "=" * (-len(remote["payload"]) % 4)
+                    ).decode("utf-8")
+                )
+                self.assertTrue(remote_payload["ok"])
+                self.assertEqual(remote_payload["result"]["type"], "state")
+                self.assertNotIn(session_key, json.dumps(remote_payload))
+            finally:
+                connection.close()
+                server.stop_connector_hub()
+                server.server_close()
+            self.assertFalse(paths.connector_socket.exists())
+
+    def test_connector_abi_cli_discovery_and_frame_validation(self) -> None:
+        frame = connector_frame(
+            link_id="connector-link",
+            lane="provision.echo/v1",
+            payload=b"hello",
+        )
+        self.assertEqual(
+            decode_connector_frame(frame),
+            ("connector-link", "provision.echo/v1", b"hello", ""),
+        )
+        with self.assertRaises(ConnectorError):
+            decode_connector_frame({**frame, "payload": "%%%%"})
+        with self.assertRaises(ConnectorError):
+            connector_frame(link_id="connector-link", lane="invalid", payload=b"hello")
+        self.assertEqual(connector_abi_payload()["abi"], CONNECTOR_ABI_VERSION)
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(cli_main(["connector", "abi"]), 0)
+        self.assertEqual(json.loads(output.getvalue())["framing"], "jsonl")
+
+    def test_connector_admin_api_requires_proxy_token_and_controls_only_local_socket(self) -> None:
+        if not hasattr(socket, "AF_UNIX") or not hasattr(socket, "SO_PEERCRED"):
+            self.skipTest("same-user Unix-domain connector sockets are unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+
+            def request(action: str, token: str) -> tuple[int, dict[str, Any]]:
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+                conn.request(
+                    "POST",
+                    "/api/connector",
+                    body=urllib.parse.urlencode({"action": action, "token": token}),
+                    headers={"content-type": "application/x-www-form-urlencoded"},
+                )
+                response = conn.getresponse()
+                body = json.loads(response.read().decode("utf-8"))
+                conn.close()
+                return response.status, body
+
+            try:
+                denied_status, denied = request("enable", "not-the-proxy-token")
+                self.assertEqual(denied_status, 401)
+                self.assertFalse(denied["ok"] if "ok" in denied else False)
+                self.assertFalse(paths.connector_socket.exists())
+
+                enabled_status, enabled = request("enable", server.proxy_token)
+                self.assertEqual(enabled_status, 200)
+                self.assertTrue(enabled["connector"]["enabled"])
+                self.assertTrue(paths.connector_socket.exists())
+
+                disabled_status, disabled = request("disable", server.proxy_token)
+                self.assertEqual(disabled_status, 200)
+                self.assertFalse(disabled["connector"]["enabled"])
+                self.assertFalse(paths.connector_socket.exists())
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
 
 if __name__ == "__main__":

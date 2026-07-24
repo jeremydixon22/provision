@@ -59,8 +59,8 @@ its command, exit status, duration, and output:
 
 ## Requirements
 
-- Codex CLI `0.144.0` or newer is the current validation target for the full
-  dashboard, GPT-5.6 model picker, quota, and compatibility-reporting path.
+- Codex CLI `0.144.0` or newer is required for the full dashboard, GPT-5.6
+  model picker, quota, and compatibility-reporting path.
 - The current bundled catalog includes GPT-5.6-Sol, GPT-5.6-Terra, and
   GPT-5.6-Luna.
 - Python 3.11+ is recommended.
@@ -117,6 +117,34 @@ provision --help
 provision help
 provision login --help
 ```
+
+## What’s New In 0.6.0
+
+- Bounds each session's live Discussion snapshot and loads older observed turns
+  only when requested, keeping busy multi-session dashboards responsive while
+  retaining a clear path back through prior discussion.
+- Fully collapses context-compaction packets behind an explicit **Show
+  post-compaction packet** control, keeping routine Discussion views focused.
+- Makes mobile Discussion, Focus discussion, and composer interaction use the
+  visual viewport so the active transcript and send controls remain reachable
+  above a mobile keyboard.
+- Improves Discussion Markdown handling for streamed content, local file
+  references, parenthesized links, fenced code, and tables with escaped or
+  inline-code pipes.
+- Recognizes patch-shaped tool calls more accurately and shows a compact patch
+  preview with file and line-change metadata before expansion.
+- Routes both direct image creation and image edits, including multipart edit
+  uploads, through the active Provision profile.
+- Adds a per-profile **Hide** control to declutter the dashboard without
+  changing an account's active status or routing eligibility; hidden profiles
+  can be revealed from the bottom of the list.
+- Updates GPT-5.6 context accounting to its 272,000-token context window.
+- Keeps the dormant Remote Agent groundwork inert during normal local use: no
+  remote socket, token, or remote state is created until a future agent path is
+  explicitly activated.
+- Adds an experimental generic Connector ABI for trusted local connector
+  processes. It carries bounded, named frames over user-supplied local, direct,
+  or relay transports without bundling a network listener or cryptography.
 
 ## What’s New In 0.5.0
 
@@ -179,7 +207,7 @@ provision login --help
   future native app-server control-plane work.
 - Profile-aware model catalogs from Codex CLI's optional app-server `model/list`
   surface, cached and refreshed in the background with a bundled fallback.
-- Direct image-generation routing and readable completion cards in Discussion,
+- Direct image creation/edit routing and readable completion cards in Discussion,
   rather than a raw generated-image payload or an unexplained empty turn.
 - Resume-compatible launching that keeps Codex CLI's native transcript history
   and `model_provider=openai` session identity intact.
@@ -248,6 +276,11 @@ provision use work
 provision ui
 ```
 
+Use **Hide** on a dashboard profile when you want to keep an enrolled account
+available for routing without showing it in the default list. **Show hidden**
+appears at the bottom of the list whenever any profiles are hidden. Hiding does
+not switch the active profile or disable the account.
+
 ## Dashboard
 
 Open the dashboard URL with:
@@ -270,7 +303,8 @@ The dashboard is localhost-only and shows:
 - Incremental live updates, on-demand history loading, and deferred resume
   candidates, so opening or refreshing the dashboard does not repeatedly read
   every known Codex transcript.
-- All enrolled profiles and their last-known quota.
+- Visible enrolled profiles and their last-known quota, with a **Show hidden**
+  control when dashboard-hidden profiles exist.
 - Stacked quota bars for short-window and weekly limits, including reset times.
 - Available rate-limit reset credits, with a confirmation prompt before one is
   consumed.
@@ -442,6 +476,15 @@ isolation issues. See [SECURITY.md](SECURITY.md).
 - Provision targets Codex CLI. It does not currently manage desktop Codex apps.
 - The dashboard is localhost-only. It is intended for a single local user, not a
   remote multi-user control plane.
+- Provision's dormant private Unix-socket Remote Agent boundary is
+  implementation groundwork only. It has no Internet transport, pairing flow,
+  user-facing remote-control command, default listener, or normal-startup
+  credential material while transport and external-security gates remain
+  incomplete.
+- The experimental Connector ABI is a separate, explicitly enabled same-user
+  Unix socket. It provides neither a relay nor encryption; a connector that
+  holds its local capability is trusted code and must secure any network path
+  it creates. See [the Connector ABI notes](docs/connector-abi.md).
 - Live dashboard input depends on launching Codex CLI through Provision's PTY
   bridge. Sessions that are only observed through proxy traffic can appear in
   the dashboard, but may not be controllable from the browser.

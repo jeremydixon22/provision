@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "provision"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local Codex CLI control plane, profile manager, and session dashboard"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,6 +16,8 @@ keywords = [
   "account-manager",
   "chatgpt",
   "cli",
+  "connector",
+  "context-window",
   "codex",
   "codex-cli",
   "credentials",
@@ -26,6 +28,7 @@ keywords = [
   "gpt-5.6-luna",
   "gpt-5.6-sol",
   "gpt-5.6-terra",
+  "local-control-plane",
   "local-first",
   "model-catalog",
   "openai",
