@@ -1719,7 +1719,8 @@
 	      } else {
 	        pills.push('<span class="pill">Context <strong>unavailable</strong></span>');
 	      }
-	      if (session.quota_compact_html) pills.push(String(session.quota_compact_html));
+	      const compactQuota = renderCompactQuota(session.quota_compact);
+	      if (compactQuota) pills.push(compactQuota);
 	      readouts.innerHTML = pills.join("");
 	      status.hidden = false;
 	      focus.hidden = controlView !== "discussion";
@@ -2801,7 +2802,8 @@
 	        ].filter(Boolean).join(" / ");
 	        pills.push(`<span class="pill" title="${escapeHtml(contextTitle)}">Context <strong>${escapeHtml(session.context.label)}</strong></span>`);
 	      }
-	      if (session.quota_compact_html) pills.push(String(session.quota_compact_html));
+	      const compactQuota = renderCompactQuota(session.quota_compact);
+	      if (compactQuota) pills.push(compactQuota);
 	      document.getElementById("controlStatusPills").innerHTML = pills.join("");
 	      renderMobileControlStatus(session);
 	      const panel = modal.querySelector(".control-modal");
@@ -3585,7 +3587,6 @@
 		    }
 
 	    function renderAuthHealth(profile) {
-	      if (profile.auth_health_html) return profile.auth_health_html;
 	      const health = profile.auth_health && typeof profile.auth_health === "object" ? profile.auth_health : null;
 	      if (!health) return "";
 	      const status = String(health.status || "");
@@ -3715,6 +3716,61 @@
 	      `;
 	    }
 
+	    function compactQuotaPercent(value) {
+	      const parsed = Number(value);
+	      if (!Number.isFinite(parsed)) return 0;
+	      return Math.min(100, Math.max(0, parsed));
+	    }
+
+	    function renderCompactQuotaBucket(bucket, secondary) {
+	      const data = bucket && typeof bucket === "object" ? bucket : {};
+	      const stack = data.stack && typeof data.stack === "object" ? data.stack : {};
+	      const name = String(data.name || "Quota");
+	      const title = String(data.title || `${name} quota`);
+	      const secondaryClass = secondary ? " secondary" : "";
+	      const countRows = Array.isArray(stack.count_rows) ? stack.count_rows : [];
+	      if (countRows.length) {
+	        return `
+	          <span class="control-compact-quota count${secondaryClass}" title="${escapeHtml(title)}">
+	            <span class="control-compact-quota-name">${escapeHtml(name)}</span>
+	            <span class="control-compact-quota-text">available</span>
+	          </span>
+	        `;
+	      }
+	      const primaryStyle = compactQuotaPercent(stack.primary_style);
+	      const weeklyStyle = compactQuotaPercent(stack.weekly_style);
+	      const primaryNotEnforced = Boolean(stack.primary_not_enforced);
+	      const special = String(stack.special || "");
+	      const specialClass = special ? ` ${escapeHtml(special)}` : "";
+	      const primaryClass = primaryNotEnforced
+	        ? "control-compact-quota-primary not-enforced"
+	        : "control-compact-quota-primary";
+	      const stateClass = primaryNotEnforced ? " primary-not-enforced" : "";
+	      const aria = String(stack.aria || title);
+	      return `
+	        <span class="control-compact-quota${specialClass}${stateClass}${secondaryClass}" title="${escapeHtml(aria)}">
+	          <span class="control-compact-quota-name">${escapeHtml(name)}</span>
+	          <span class="control-compact-quota-weekly">${escapeHtml(stack.weekly_text || "")}</span>
+	          <span class="control-compact-quota-bar" role="img" aria-label="${escapeHtml(aria)}">
+	            <span class="control-compact-quota-weekly-fill" style="width: ${weeklyStyle.toFixed(2)}%"></span>
+	            <span class="control-compact-quota-primary-fill" style="width: ${primaryStyle.toFixed(2)}%"></span>
+	          </span>
+	          <span class="${primaryClass}">${escapeHtml(stack.primary_text || "")}</span>
+	        </span>
+	      `;
+	    }
+
+	    function renderCompactQuota(compact) {
+	      const data = compact && typeof compact === "object" ? compact : {};
+	      const state = data.state && typeof data.state === "object" ? data.state : null;
+	      if (state) {
+	        const title = String(state.message || state.title || "Quota unavailable");
+	        return `<span class="control-compact-quota state" title="${escapeHtml(title)}">${escapeHtml(state.title || "Quota unavailable")}</span>`;
+	      }
+	      const buckets = Array.isArray(data.buckets) ? data.buckets : [];
+	      return buckets.map((bucket, index) => renderCompactQuotaBucket(bucket, index > 0)).join("");
+	    }
+
 	    function renderQuotaBucket(bucket) {
 	      const stack = bucket && typeof bucket.stack === "object" ? bucket.stack : {};
 	      return `
@@ -3727,7 +3783,7 @@
 
 	    function renderStructuredQuota(profile, profileName) {
 	      const quota = profile.quota && typeof profile.quota === "object" ? profile.quota : null;
-	      if (!quota) return profile.quota_html || '<div class="quota-empty">No quota cached</div>';
+	      if (!quota) return '<div class="quota-empty">No quota cached</div>';
 	      const updated = String(quota.updated || "No quota cached");
 	      let body = "";
 	      const buckets = Array.isArray(quota.buckets) ? quota.buckets : [];
@@ -3780,7 +3836,7 @@
 	      return String(hash >>> 0);
 	    }
 
-		    function renderProfileChips(profile, name) {
+	    function renderProfileChips(profile, name) {
 		      const chips = [];
 		      if (profile.active) chips.push('<span class="badge active-badge">Active</span>');
 			      const billingRequired = profile.billing_required && typeof profile.billing_required === "object" && profile.billing_required.required;
@@ -3836,7 +3892,110 @@
 	      return `<div class="profile-chips">${chips.join("")}</div>`;
 	    }
 
-		    function renderModelMenu(profile, name) {
+	    function renderProfilePinMenu(profile, name) {
+	      const sessionList = Array.isArray(latestStatus && latestStatus.sessions)
+	        ? latestStatus.sessions
+	        : [];
+	      const sessions = sessionList.filter((session) => (
+	        session && typeof session === "object" && String(session.provider || "codex") === "codex"
+	      ));
+	      if (!sessions.length) {
+	        return `
+	          <details class="pin-menu profile-pin-menu" data-profile="${escapeHtml(name)}">
+	            <summary class="pin-summary"><span>Session Pins</span></summary>
+	            <div class="pin-menu-panel"><div class="pin-menu-empty">No Codex sessions observed</div></div>
+	          </details>
+	        `;
+	      }
+	      const items = sessions.map((session) => {
+	        const sessionKey = String(session.key || "");
+	        if (!sessionKey) return "";
+	        const sessionName = String(session.name || "Session");
+	        const display = String(session.display || sessionKey);
+	        const cwd = String(session.cwd || display);
+	        const pinnedProfile = String(session.pinned_profile || "");
+	        const action = pinnedProfile === name ? "unpin_session" : "pin_session";
+	        const verb = action === "unpin_session" ? "Unpin" : "Pin";
+	        const statusBits = [];
+	        if (session.active) statusBits.push("active");
+	        if (pinnedProfile) statusBits.push(`pinned to ${pinnedProfile}`);
+	        const statusText = statusBits.length ? statusBits.join(" / ") : "idle";
+	        return `
+	          <form method="post" action="/api/pin-session" data-action="${action}" data-profile="${escapeHtml(name)}">
+	            <input type="hidden" name="action" value="${action}">
+	            <input type="hidden" name="profile" value="${escapeHtml(name)}">
+	            <input type="hidden" name="session_key" value="${escapeHtml(sessionKey)}">
+	            <button class="pin-menu-item">
+	              <span class="pin-menu-name">${verb} ${escapeHtml(sessionName)}</span>
+	              <span class="pin-menu-path" title="${escapeHtml(cwd)}">${escapeHtml(display)}</span>
+	              <span class="pin-menu-status">${escapeHtml(statusText)}</span>
+	            </button>
+	          </form>
+	        `;
+	      }).join("");
+	      const activeClass = profile.has_active_pinned_sessions ? " session-active-action" : "";
+	      return `
+	        <details class="pin-menu profile-pin-menu" data-profile="${escapeHtml(name)}">
+	          <summary class="pin-summary${activeClass}"><span>Session Pins</span></summary>
+	          <div class="pin-menu-panel">${items}</div>
+	        </details>
+	      `;
+	    }
+
+	    function renderPinnedSessions(profile) {
+	      const sessions = Array.isArray(profile.pinned_sessions) ? profile.pinned_sessions : [];
+	      const chips = sessions.filter((session) => session && typeof session === "object").map((session) => {
+	        const cwd = String(session.cwd || session.display || "");
+	        const display = String(session.display || cwd);
+	        return `
+	          <span class="session-chip${session.active ? " active" : ""}" title="${escapeHtml(cwd)}">
+	            <span class="session-chip-path">${escapeHtml(display)}</span>
+	          </span>
+	        `;
+	      }).join("");
+	      return chips ? `<div class="pinned-sessions"><div class="session-chips">${chips}</div></div>` : "";
+	    }
+
+	    function renderProfileLoginStatus(profile, name) {
+	      const status = profile.login_status && typeof profile.login_status === "object" ? profile.login_status : null;
+	      if (!status) return "";
+	      const state = String(status.status || "").toLowerCase();
+	      if (!state) return "";
+	      const activeStates = ["running", "canceling"];
+	      const stateClass = ["complete", "error", "canceled"].includes(state) ? state : "running";
+	      const title = {
+	        running: "Login running",
+	        canceling: "Canceling login",
+	        canceled: "Login canceled",
+	        complete: "Login captured",
+	        error: "Login failed"
+	      }[state] || "Login";
+	      const mode = String(status.mode || "browser") === "device" ? "device" : "browser";
+	      const authUrl = String(status.auth_url || "");
+	      const authLink = /^https?:\/\//i.test(authUrl)
+	        ? `<a class="login-link" href="${escapeHtml(authUrl)}" target="_blank" rel="noopener noreferrer">Open login</a>`
+	        : "";
+	      const userCode = String(status.user_code || "");
+	      const code = userCode ? `<span class="login-code">Code <code>${escapeHtml(userCode)}</code></span>` : "";
+	      const cancel = activeStates.includes(state) ? `
+	        <form method="post" action="/api/login" class="login-cancel-form" data-action="cancel_login" data-profile="${escapeHtml(name)}">
+	          <input type="hidden" name="profile" value="${escapeHtml(name)}">
+	          <input type="hidden" name="login_action" value="cancel_login">
+	          <button class="login-cancel-action">Cancel Login</button>
+	        </form>
+	      ` : "";
+	      const detail = String(status.message || status.error || (Array.isArray(status.lines) ? status.lines.at(-1) || "" : ""));
+	      const detailHtml = detail ? `<div class="login-detail">${escapeHtml(detail)}</div>` : "";
+	      return `
+	        <div class="login-status ${stateClass}">
+	          <div class="login-status-top"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(mode)}</span></div>
+	          <div class="login-status-actions">${authLink}${code}${cancel}</div>
+	          ${detailHtml}
+	        </div>
+	      `;
+	    }
+
+	    function renderModelMenu(profile, name) {
 		      const setting = profile.model_setting && typeof profile.model_setting === "object" ? profile.model_setting : {};
 		      const currentModel = String(setting.model || "gpt-5.6-sol");
 		      const currentReasoning = String(setting.reasoning_effort || (currentModel === "gpt-5.6-sol" ? "low" : "medium"));
@@ -3897,9 +4056,6 @@
 	      const quota = isQuotaPending
 	        ? `<div class="quota-panel"><div class="quota-panel-head"><span class="quota-refresh-icon disabled" aria-hidden="true"><span class="spinner quota-spinner-small"></span></span><span class="quota-updated">${quotaPendingLabel}</span></div><div class="quota-loading"><span class="spinner"></span><span>${quotaPendingLabel}</span></div></div>`
 	        : renderStructuredQuota(profile, name);
-	      const pinMenu = profile.pin_menu_html || "";
-	      const pinnedSessions = profile.pinned_sessions_html || "";
-	      const loginStatusHtml = profile.login_status_html || "";
 	      const authHealthHtml = renderAuthHealth(profile);
 	      return `
 	        <tr class="profile-row${profile.active ? " active" : ""}${hidden ? " hidden-profile" : ""}" data-profile="${escapeHtml(name)}" data-profile-key="${escapeHtml(name)}">
@@ -3908,9 +4064,9 @@
 	            <div class="profile-email">${escapeHtml(profile.email || profile.account_id || "")}</div>
 	            ${authHealthHtml}
 	            ${renderProfileChips(profile, name)}
-	            ${pinMenu}
-	            ${pinnedSessions}
-	            ${loginStatusHtml}
+	            ${renderProfilePinMenu(profile, name)}
+	            ${renderPinnedSessions(profile)}
+	            ${renderProfileLoginStatus(profile, name)}
 	          </td>
 	          <td class="model-cell">${renderModelMenu(profile, name)}</td>
 	          <td class="quota-cell">${quota}</td>
