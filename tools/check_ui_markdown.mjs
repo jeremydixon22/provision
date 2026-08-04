@@ -26,6 +26,7 @@ vm.runInContext(
   `${sourceRange("function escapeHtml", "function formatNumber")}
    ${sourceRange("function sessionTitle", "function sessionMeta")}
    ${sourceRange("function splitToolStatusSuffix", "function isControlToolName")}
+   ${sourceRange("function compactQuotaPercent", "function renderQuotaBucket")}
    globalThis.markdownApi = {
      normalizeMarkdownSource,
      parseToolActivityText,
@@ -33,7 +34,8 @@ vm.runInContext(
      renderMarkdownInline,
      repairStreamedMarkdownLabel,
      repairStreamedMarkdownProse,
-     sessionTitle
+     sessionTitle,
+     renderCompactQuota
    };`,
   context
 );
@@ -45,7 +47,8 @@ const {
   renderMarkdownInline,
   repairStreamedMarkdownLabel,
   repairStreamedMarkdownProse,
-  sessionTitle
+  sessionTitle,
+  renderCompactQuota
 } = context.markdownApi;
 
 let checks = 0;
@@ -76,6 +79,21 @@ equal(
   sessionTitle({ display: "~/worktree", title: "Generated summary" }),
   "~/worktree",
   "session tabs fall back to the workspace path before a provider-generated summary"
+);
+const compactQuotaMarkup = renderCompactQuota({
+  state: {
+    title: '<img src=x onerror="alert(1)">',
+    message: '" onmouseover="alert(1)'
+  }
+});
+includes(compactQuotaMarkup, "&lt;img", "compact quota labels escape server data");
+excludes(compactQuotaMarkup, "<img", "compact quota labels never inject HTML");
+excludes(compactQuotaMarkup, 'onmouseover="alert(1)', "compact quota attributes escape server data");
+excludes(appSource, "quota_compact_html", "WebSocket sessions carry structured compact quota data");
+excludes(
+  sourceRange("function profileRow", "function providerProfileRow"),
+  "_html",
+  "profile rows do not accept server-rendered HTML fragments"
 );
 equal(
   renderMarkdown("The API  \nremains stable."),

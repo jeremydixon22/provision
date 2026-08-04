@@ -40,7 +40,7 @@ Provision is not currently published on PyPI. Install the current release from
 the versioned GitHub source with `pipx` (recommended for an isolated CLI):
 
 ```bash
-pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.7.0"
+pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.7.1"
 provision-codex doctor
 ```
 
@@ -182,6 +182,14 @@ provision --help
 provision help
 provision login --help
 ```
+
+## What’s New In 0.7.1
+
+- Renders live compact quota readouts and profile rows from structured payloads,
+  preserving dashboard behavior without inserting server-provided HTML into the
+  page.
+- Makes Codex compatibility diagnostics fully self-contained in CI environments
+  that do not have the Codex CLI installed.
 
 ## What’s New In 0.7.0
 

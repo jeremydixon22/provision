@@ -6593,6 +6593,34 @@ def render_compact_quota_html(entry: dict[str, Any] | None, model: str | None = 
     return "".join(item for item in rendered if item)
 
 
+def compact_quota_payload(
+    entry: dict[str, Any] | None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Return compact quota data for the browser without pre-rendered HTML."""
+    data: dict[str, Any] = {"buckets": [], "state": None}
+    if not isinstance(entry, dict):
+        return data
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+        error = entry.get("error")
+        if error and (state := usage_payload_state(error)):
+            data["state"] = state
+        return data
+    buckets = [
+        item
+        for item in (
+            quota_bucket_payload(bucket) for bucket in compact_quota_buckets(payload, model)
+        )
+        if item
+    ]
+    if buckets:
+        data["buckets"] = buckets
+    elif state := usage_payload_state(payload):
+        data["state"] = state
+    return data
+
+
 def render_quota_state(state: dict[str, str]) -> str:
     level = state.get("level") if state.get("level") in {"warning", "error", "info"} else "warning"
     title = state.get("title") or "Quota unavailable"
@@ -10904,7 +10932,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 snapshot["quota_html"] = (
                     '<div class="quota-empty">Quota data is not exposed by this provider.</div>'
                 )
-                snapshot["quota_compact_html"] = ""
+                snapshot["quota_compact"] = {"buckets": [], "state": None}
                 continue
             profile = str(snapshot.get("associated_profile") or "")
             if not profile:
@@ -10920,7 +10948,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 profile or None,
                 "",
             )
-            snapshot["quota_compact_html"] = render_compact_quota_html(
+            snapshot["quota_compact"] = compact_quota_payload(
                 quota_snapshot,
                 str(model_setting.get("model") or ""),
             )
@@ -15020,14 +15048,14 @@ class Handler(BaseHTTPRequestHandler):
                 name,
                 pinned_only=True,
             )
-            profile["login_status_html"] = render_login_status_html(
-                profile["login_status"],
-                name,
-                "",
-            )
-            profile["pin_menu_html"] = self.render_pin_menu(profile, status)
-            profile["pinned_sessions_html"] = self.render_pinned_sessions(profile)
             if include_html:
+                profile["login_status_html"] = render_login_status_html(
+                    profile["login_status"],
+                    name,
+                    "",
+                )
+                profile["pin_menu_html"] = self.render_pin_menu(profile, status)
+                profile["pinned_sessions_html"] = self.render_pinned_sessions(profile)
                 profile["auth_health_html"] = render_auth_health_html(profile["auth_health"])
                 profile["quota_html"] = render_quota_html(
                     snapshot,

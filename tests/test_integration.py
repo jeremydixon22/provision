@@ -56,6 +56,7 @@ from provision.daemon import (
     codex_history_turn_index_for_cwd,
     codex_history_turn_payload_for_cwd,
     codex_resume_candidates_for_cwd,
+    compact_quota_payload,
     daemon_url_host,
     decode_project_session_sentinel,
     error_requires_billing,
@@ -1603,6 +1604,29 @@ class StoreTests(unittest.TestCase):
         primary_pos = markup.find('<span class="control-compact-quota-primary">10%</span>')
         self.assertLess(weekly_pos, bar_pos)
         self.assertLess(bar_pos, primary_pos)
+
+    def test_compact_quota_payload_exposes_structured_bucket_data(self) -> None:
+        payload = compact_quota_payload(
+            {
+                "payload": {
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 25,
+                            "limit_window_seconds": 18000,
+                        },
+                        "secondary_window": {
+                            "used_percent": 16,
+                            "limit_window_seconds": 604800,
+                        },
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(payload["buckets"][0]["name"], "Codex")
+        self.assertEqual(payload["buckets"][0]["stack"]["primary_text"], "75%")
+        self.assertEqual(payload["buckets"][0]["stack"]["weekly_text"], "84%")
+        self.assertIsNone(payload["state"])
 
     def test_quota_html_renders_nonzero_credits_pill(self) -> None:
         markup = render_quota_html(
@@ -4966,8 +4990,8 @@ class StoreTests(unittest.TestCase):
             self.assertTrue(session["working"])
             self.assertIn("quota_html", session)
             self.assertIn("No quota cached", session["quota_html"])
-            self.assertIn("quota_compact_html", session)
-            self.assertEqual(session["quota_compact_html"], "")
+            self.assertIn("quota_compact", session)
+            self.assertEqual(session["quota_compact"], {"buckets": [], "state": None})
             self.assertEqual(session["active_details"]["requests"][0]["profile"], "default")
             self.assertEqual(session["active_details"]["tunnels"][0]["turn_id"], "turn-123")
             self.assertEqual(session["active_details"]["tunnels"][0]["thread_id"], "thread-456")
@@ -8320,6 +8344,7 @@ class StoreTests(unittest.TestCase):
             source.write_text(json.dumps({"OPENAI_API_KEY": "sk-test"}), encoding="utf-8")
             store.import_auth_file("default", source)
             original_compat = cli_module.codex_compatibility_payload
+            original_client_id = cli_module.codex_client_id
             original_running = cli_module.daemon_running
             try:
                 cli_module.codex_compatibility_payload = lambda: {
@@ -8331,6 +8356,7 @@ class StoreTests(unittest.TestCase):
                         "control_plane": {"read_only": True},
                     },
                 }
+                cli_module.codex_client_id = lambda: "app_test_client_id"
                 cli_module.daemon_running = lambda _paths: {
                     "pid": 123,
                     "host": "127.0.0.1",
@@ -8341,6 +8367,7 @@ class StoreTests(unittest.TestCase):
                     result = cli_module.cmd_doctor(paths, store)
             finally:
                 cli_module.codex_compatibility_payload = original_compat
+                cli_module.codex_client_id = original_client_id
                 cli_module.daemon_running = original_running
 
             self.assertEqual(result, 0)
