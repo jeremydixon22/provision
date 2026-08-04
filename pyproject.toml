@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "provision"
-version = "0.6.0"
-description = "Local Codex CLI control plane, profile manager, and session dashboard"
+version = "0.7.0"
+description = "Local-first AI coding CLI control plane, profile manager, and session dashboard"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -14,7 +14,10 @@ authors = [
 ]
 keywords = [
   "account-manager",
+  "ai-coding",
+  "anthropic",
   "chatgpt",
+  "claude-code",
   "cli",
   "connector",
   "context-window",
@@ -28,6 +31,8 @@ keywords = [
   "gpt-5.6-luna",
   "gpt-5.6-sol",
   "gpt-5.6-terra",
+  "grok",
+  "grok-build",
   "local-control-plane",
   "local-first",
   "model-catalog",
@@ -39,6 +44,7 @@ keywords = [
   "terminal",
   "usage-monitoring",
   "websocket",
+  "xai",
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -52,6 +58,14 @@ classifiers = [
 
 [project.scripts]
 provision = "provision.cli:main"
+provision-codex = "provision.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "coverage>=7.9",
+  "mypy>=1.16",
+  "ruff>=0.12",
+]
 
 [project.urls]
 Homepage = "https://github.com/jeremydixon22/provision"
@@ -62,4 +76,24 @@ Issues = "https://github.com/jeremydixon22/provision/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-provision = ["assets/*.png"]
+provision = ["assets/*.png", "ui/*.html", "ui/*.css", "ui/*.js"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+pretty = true
+
+[tool.coverage.run]
+branch = true
+source = ["provision"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

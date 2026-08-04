@@ -14,18 +14,17 @@ terminal workflow, dashboard, and OpenAI proxy out of the connector path.
 from __future__ import annotations
 
 import base64
-from collections.abc import Callable, Mapping
 import hmac
 import json
 import os
-from pathlib import Path
 import re
 import socket
 import stat
 import struct
 import threading
+from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
-
 
 CONNECTOR_ABI_VERSION = 1
 CONNECTOR_MAX_MESSAGE_BYTES = 384 * 1024
@@ -152,6 +151,158 @@ def decode_connector_frame(value: Mapping[str, Any]) -> tuple[str, str, bytes, s
 ConnectorFrameHandler = Callable[[str, str, str, bytes], bytes | None]
 
 
+class LocalConnectorClient:
+    """Small same-user client for the generic Connector ABI.
+
+    This is deliberately only a local JSONL client.  It has no transport,
+    relay, or peer-authentication behavior, so a connector remains responsible
+    for any route it creates beyond this Unix socket.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        token: str,
+        *,
+        connector_id: str,
+        lanes: list[str],
+        timeout: float = 5.0,
+    ) -> None:
+        self.path = path
+        self.token = token
+        self.connector_id = _validate_identifier(connector_id, CONNECTOR_ID_RE, "ID")
+        self.lanes = validate_connector_lanes(lanes)
+        self.timeout = timeout
+        self.connection: socket.socket | None = None
+        self.accepted_lanes: frozenset[str] = frozenset()
+        self.buffered = bytearray()
+        self.lock = threading.RLock()
+
+    def __enter__(self) -> LocalConnectorClient:
+        self.connect()
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        self.close()
+
+    def connect(self) -> None:
+        if not hasattr(socket, "AF_UNIX"):
+            raise ConnectorError("local connector sockets are unsupported on this platform")
+        with self.lock:
+            if self.connection is not None:
+                return
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.settimeout(self.timeout)
+            try:
+                connection.connect(str(self.path))
+                self._send_message(
+                    connection,
+                    {
+                        "type": "hello",
+                        "abi": CONNECTOR_ABI_VERSION,
+                        "token": self.token,
+                        "connector_id": self.connector_id,
+                        "lanes": self.lanes,
+                    },
+                )
+                reply = self._receive_message(connection)
+                if reply.get("type") == "error":
+                    raise ConnectorError(
+                        str(reply.get("error") or "connector authorization failed")
+                    )
+                if (
+                    reply.get("type") != "hello_ack"
+                    or reply.get("connector_id") != self.connector_id
+                ):
+                    raise ConnectorError("invalid connector hello acknowledgement")
+                accepted = reply.get("lanes")
+                if not isinstance(accepted, list) or any(
+                    lane not in self.lanes for lane in accepted
+                ):
+                    raise ConnectorError("invalid connector hello acknowledgement")
+            except BaseException:
+                connection.close()
+                raise
+            self.connection = connection
+            self.accepted_lanes = frozenset(str(lane) for lane in accepted)
+
+    def close(self) -> None:
+        with self.lock:
+            connection = self.connection
+            self.connection = None
+            self.accepted_lanes = frozenset()
+            self.buffered.clear()
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _send_message(connection: socket.socket, value: Mapping[str, Any]) -> None:
+        connection.sendall(encode_connector_message(value))
+
+    def _receive_message(self, connection: socket.socket) -> dict[str, Any]:
+        while b"\n" not in self.buffered:
+            if len(self.buffered) >= CONNECTOR_MAX_MESSAGE_BYTES:
+                raise ConnectorError("connector message exceeds its byte limit")
+            chunk = connection.recv(min(4096, CONNECTOR_MAX_MESSAGE_BYTES + 1 - len(self.buffered)))
+            if not chunk:
+                raise ConnectorError("connector connection closed")
+            self.buffered.extend(chunk)
+        line, _, remainder = self.buffered.partition(b"\n")
+        self.buffered[:] = remainder
+        return decode_connector_message(bytes(line))
+
+    def request(
+        self,
+        *,
+        link_id: str,
+        lane: str,
+        payload: bytes,
+        message_id: str = "",
+    ) -> bytes | None:
+        frame = connector_frame(
+            link_id=link_id,
+            lane=lane,
+            payload=payload,
+            message_id=message_id,
+        )
+        with self.lock:
+            connection = self.connection
+            if connection is None:
+                raise ConnectorError("connector client is not connected")
+            if lane not in self.accepted_lanes:
+                raise ConnectorError("connector lane is not available")
+            self._send_message(connection, frame)
+            reply = self._receive_message(connection)
+        if reply.get("type") == "error":
+            raise ConnectorError(str(reply.get("error") or "connector request failed"))
+        if (
+            reply.get("type") != "frame_ack"
+            or reply.get("link_id") != link_id
+            or reply.get("lane") != lane
+            or (message_id and reply.get("message_id") != message_id)
+        ):
+            raise ConnectorError("invalid connector frame acknowledgement")
+        encoded = reply.get("payload")
+        if encoded is None:
+            return None
+        if not isinstance(encoded, str) or len(encoded) > CONNECTOR_MAX_FRAME_BYTES * 2:
+            raise ConnectorError("invalid connector frame acknowledgement")
+        try:
+            response = base64.b64decode(
+                encoded + "=" * (-len(encoded) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+        except (ValueError, UnicodeEncodeError) as exc:
+            raise ConnectorError("invalid connector frame acknowledgement") from exc
+        if len(response) > CONNECTOR_MAX_FRAME_BYTES:
+            raise ConnectorError("connector response exceeds its byte limit")
+        return response
+
+
 class LocalConnectorHub:
     """A same-user Unix-socket endpoint for a trusted connector process.
 
@@ -247,7 +398,9 @@ class LocalConnectorHub:
                 continue
             except OSError:
                 return
-            thread = threading.Thread(target=self._handle_connection, args=(connection,), daemon=True)
+            thread = threading.Thread(
+                target=self._handle_connection, args=(connection,), daemon=True
+            )
             thread.start()
 
     @staticmethod
@@ -259,7 +412,7 @@ class LocalConnectorHub:
             _pid, uid, _gid = struct.unpack("3i", raw)
         except OSError:
             return False
-        return uid == os.geteuid()
+        return bool(uid == os.geteuid())
 
     @staticmethod
     def _receive_message(connection: socket.socket, buffered: bytearray) -> dict[str, Any]:
@@ -299,7 +452,9 @@ class LocalConnectorHub:
                 if hello.get("type") != "hello":
                     raise ConnectorError("connector hello is required")
                 token = hello.get("token")
-                connector_id = _validate_identifier(hello.get("connector_id"), CONNECTOR_ID_RE, "ID")
+                connector_id = _validate_identifier(
+                    hello.get("connector_id"), CONNECTOR_ID_RE, "ID"
+                )
                 lanes = validate_connector_lanes(hello.get("lanes"))
                 if not isinstance(token, str) or not hmac.compare_digest(token, self.token):
                     raise ConnectorError("invalid local connector capability")
@@ -333,7 +488,9 @@ class LocalConnectorHub:
                     if message_id:
                         ack["message_id"] = message_id
                     if response is not None:
-                        ack["payload"] = base64.urlsafe_b64encode(response).rstrip(b"=").decode("ascii")
+                        ack["payload"] = (
+                            base64.urlsafe_b64encode(response).rstrip(b"=").decode("ascii")
+                        )
                     self._send_message(connection, ack)
             except ConnectorError as exc:
                 self._send_error(connection, str(exc))

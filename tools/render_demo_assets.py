@@ -14,7 +14,6 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -24,10 +23,10 @@ from provision.daemon import (  # noqa: E402
     DEFAULT_MODEL_CATALOG,
     Handler,
     compact_session_path,
-    logo_asset_bytes,
     normalize_session_key,
     session_display_name,
 )
+from provision.ui_assets import logo_asset_bytes, ui_asset  # noqa: E402
 
 
 class DemoStore:
@@ -56,6 +55,9 @@ class DemoStore:
 
     def active_profile(self, *, required: bool = True) -> str | None:
         return self._active
+
+    def default_provider(self) -> str:
+        return "codex"
 
     def list_profiles(self) -> list[dict[str, Any]]:
         return [dict(profile) for profile in self._profiles]
@@ -98,21 +100,75 @@ class DemoServer:
 
     def _session_rows(self, now: float) -> list[dict[str, Any]]:
         rows = [
-            ("/workspace/provision", "work", "work", True, 0, 1, 1, 1),
-            ("/workspace/client-app", "research", "research", True, 1, 1, 0, 1),
-            ("/workspace/notes-cli", "work", "", False, 0, 0, 0, 0),
+            {
+                "cwd": "/workspace/provision",
+                "provider": "codex",
+                "last_profile": "work",
+                "pinned_profile": "work",
+                "active": True,
+                "working": True,
+                "requests": 0,
+                "tunnels": 1,
+                "pending": 1,
+                "recent": 1,
+            },
+            {
+                "cwd": "/workspace/client-app",
+                "provider": "codex",
+                "last_profile": "research",
+                "pinned_profile": "research",
+                "active": True,
+                "working": False,
+                "requests": 1,
+                "tunnels": 1,
+                "pending": 0,
+                "recent": 1,
+            },
+            {
+                "cwd": "/workspace/notes-cli",
+                "provider": "codex",
+                "last_profile": "work",
+                "pinned_profile": "",
+                "active": False,
+                "working": False,
+                "requests": 0,
+                "tunnels": 0,
+                "pending": 0,
+                "recent": 0,
+            },
+            {
+                "cwd": "/workspace/design-system",
+                "provider": "claude",
+                "provider_profile": "studio",
+                "provider_model": "claude-opus-4-5",
+                "active": True,
+                "working": True,
+                "requests": 0,
+                "tunnels": 0,
+                "pending": 0,
+                "recent": 0,
+            },
+            {
+                "cwd": "/workspace/incident-notes",
+                "provider": "grok",
+                "provider_model": "grok-code-fast-1",
+                "provider_usage": {
+                    "totalTokens": 18420,
+                    "inputTokens": 14790,
+                    "outputTokens": 3630,
+                    "numTurns": 1,
+                },
+                "active": True,
+                "working": False,
+                "requests": 0,
+                "tunnels": 0,
+                "pending": 0,
+                "recent": 0,
+            },
         ]
         sessions: list[dict[str, Any]] = []
-        for index, (
-            cwd,
-            last_profile,
-            pinned_profile,
-            active,
-            requests,
-            tunnels,
-            pending,
-            recent,
-        ) in enumerate(rows):
+        for index, row in enumerate(rows):
+            cwd = str(row["cwd"])
             key = normalize_session_key(cwd)
             sessions.append(
                 {
@@ -120,20 +176,30 @@ class DemoServer:
                     "cwd": cwd,
                     "display": compact_session_path(cwd),
                     "name": session_display_name(cwd),
-                    "last_profile": last_profile,
-                    "pinned_profile": pinned_profile,
-                    "active_requests": requests,
-                    "active_tunnels": tunnels,
-                    "pending_websocket_work": pending,
-                    "recent_websocket_activity": recent,
-                    "active": active,
+                    "provider": str(row["provider"]),
+                    "provider_profile": str(row.get("provider_profile") or ""),
+                    "provider_model": str(row.get("provider_model") or ""),
+                    "provider_usage": dict(row.get("provider_usage") or {}),
+                    "last_profile": str(row.get("last_profile") or ""),
+                    "pinned_profile": str(row.get("pinned_profile") or ""),
+                    "associated_profile": str(row.get("last_profile") or ""),
+                    "active_requests": int(row["requests"]),
+                    "active_tunnels": int(row["tunnels"]),
+                    "pending_websocket_work": int(row["pending"]),
+                    "recent_websocket_activity": int(row["recent"]),
+                    "active": bool(row["active"]),
+                    "working": bool(row["working"]),
+                    "pty_managed": True,
+                    "pty_control_available": True,
                     "last_seen_monotonic": now - index,
                 }
             )
         return sessions
 
     def _usage_cache(self) -> dict[str, dict[str, Any]]:
-        fetched_at = datetime.now().astimezone().replace(second=0, microsecond=0) - timedelta(minutes=4)
+        fetched_at = datetime.now().astimezone().replace(second=0, microsecond=0) - timedelta(
+            minutes=4
+        )
         return {
             "work": {
                 "payload": usage_payload(
@@ -229,10 +295,88 @@ class DemoServer:
     def switch_block_reason(self) -> str | None:
         return None
 
+    def connector_status(self) -> dict[str, Any]:
+        return {"enabled": False, "socket": None, "clients": 0}
+
     def session_snapshots(self) -> list[dict[str, Any]]:
         return [dict(session) for session in self.sessions]
 
-    def control_plane_sessions(self, session_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def provider_profile_snapshots(
+        self, sessions: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "key": "provider:claude:studio",
+                "provider": "claude",
+                "provider_label": "Claude",
+                "name": "studio",
+                "display_name": "studio",
+                "managed": True,
+                "profile_kind_label": "Managed provider profile",
+                "identity_label": "Provision-managed CLAUDE_CONFIG_DIR",
+                "account_label": "claude@example.test · Example Studio",
+                "auth_status": "Logged in",
+                "logged_in": True,
+                "subscription_label": "Max",
+                "selected_for_provider": True,
+                "selection_label": "Claude default",
+                "default_provider": False,
+                "session_count": 1,
+                "active_session_count": 1,
+                "working_session_count": 1,
+                "models": ["claude-opus-4-5"],
+                "usage": {},
+                "usage_empty": "No completed-turn usage observed yet.",
+                "usage_updated_at": "",
+                "usage_session": "design-system",
+                "quota": {
+                    "available": False,
+                    "source": "claude_native_usage_command",
+                    "status": "Use /usage in Claude",
+                    "detail": "Provider account quota remains available in Claude's native interface.",
+                },
+            },
+            {
+                "key": "provider:grok:native",
+                "provider": "grok",
+                "provider_label": "Grok",
+                "name": "",
+                "display_name": "Native",
+                "managed": False,
+                "profile_kind_label": "Provider native",
+                "identity_label": "Vendor-managed Grok identity",
+                "account_label": "",
+                "auth_status": "",
+                "logged_in": None,
+                "subscription_label": "",
+                "selected_for_provider": False,
+                "selection_label": "Grok default",
+                "default_provider": False,
+                "session_count": 1,
+                "active_session_count": 1,
+                "working_session_count": 0,
+                "models": ["grok-code-fast-1"],
+                "usage": {
+                    "totalTokens": 18420,
+                    "inputTokens": 14790,
+                    "outputTokens": 3630,
+                    "numTurns": 1,
+                },
+                "usage_empty": "No completed-turn usage observed yet.",
+                "usage_updated_at": datetime.now().isoformat(),
+                "usage_session": "incident-notes",
+                "quota": {
+                    "available": False,
+                    "source": "grok_native_usage_command",
+                    "status": "Use /usage in Grok",
+                    "detail": "Provider account quota remains available in Grok's native interface.",
+                },
+            },
+        ]
+
+    def control_plane_sessions(
+        self, session_rows: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
         session_rows = self.sessions if session_rows is None else session_rows
         sessions: list[dict[str, Any]] = []
         for session in session_rows:
@@ -283,7 +427,9 @@ class DemoServer:
                         "profile": tunnel.get("profile"),
                         "pending_work": tunnel.get("pending_work"),
                         "turn_id": "turn_demo" if tunnel.get("pending_work") else "",
-                        "service_tier": "priority" if tunnel.get("profile") == "work" else "default",
+                        "service_tier": "priority"
+                        if tunnel.get("profile") == "work"
+                        else "default",
                         "age_seconds": 94.2,
                         "last_data_age_seconds": 3.0,
                         "bytes_up": 12432,
@@ -380,7 +526,11 @@ class DemoServer:
         }
 
     def profile_login_required(self, profile: str) -> dict[str, Any]:
-        return {"required": profile == "sandbox", "error": "Refresh login required.", "error_at": ""}
+        return {
+            "required": profile == "sandbox",
+            "error": "Refresh login required.",
+            "error_at": "",
+        }
 
     def profile_auth_health(self, profile: str) -> dict[str, Any]:
         if profile == "sandbox":
@@ -469,11 +619,7 @@ class DemoServer:
         sessions: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         sessions = self.sessions if sessions is None else sessions
-        return [
-            dict(session)
-            for session in sessions
-            if session.get("pinned_profile") == profile
-        ]
+        return [dict(session) for session in sessions if session.get("pinned_profile") == profile]
 
     def profile_has_active_sessions(self, profile: str, *, pinned_only: bool = False) -> bool:
         for request in self.requests:
@@ -536,7 +682,9 @@ def additional_limit(
     }
 
 
-def quota_window(remaining_percent: float, window_seconds: int, reset_seconds: int) -> dict[str, Any]:
+def quota_window(
+    remaining_percent: float, window_seconds: int, reset_seconds: int
+) -> dict[str, Any]:
     return {
         "used_percent": max(0.0, min(100.0, 100.0 - remaining_percent)),
         "limit_window_seconds": window_seconds,
@@ -551,12 +699,12 @@ def render_demo_html() -> str:
     handler.server = DemoServer()
     original_compatibility_payload = daemon_module.codex_compatibility_payload
     daemon_module.codex_compatibility_payload = lambda: {
-        "cli": {"available": True, "version": "0.144.3", "error": ""},
-        "runtime_cli": {"available": True, "version": "0.144.3", "error": ""},
+        "cli": {"available": True, "version": "0.146.0", "error": ""},
+        "runtime_cli": {"available": True, "version": "0.146.0", "error": ""},
         "restart_required": {
             "required": False,
-            "startup_version": "0.144.3",
-            "runtime_version": "0.144.3",
+            "startup_version": "0.146.0",
+            "runtime_version": "0.146.0",
             "reason": "",
         },
         "model_catalog": {"source": "demo", "available": True, "count": 6, "error": ""},
@@ -566,7 +714,7 @@ def render_demo_html() -> str:
         html = handler.render_ui()
     finally:
         daemon_module.codex_compatibility_payload = original_compatibility_payload
-    return html.replace("\n\t    connect();", "\n\t    // Demo page: the live daemon WebSocket is intentionally disabled.")
+    return html
 
 
 def write_demo_site(directory: Path) -> None:
@@ -577,6 +725,21 @@ def write_demo_site(directory: Path) -> None:
         payload = logo_asset_bytes(name)
         if payload:
             (assets / name).write_bytes(payload)
+    for path, name in (
+        ("/assets/provision-ui.css", "provision-ui.css"),
+        ("/assets/provision-ui.js", "provision-ui.js"),
+    ):
+        asset = ui_asset(path)
+        if asset is None:
+            continue
+        payload, _content_type = asset
+        if name.endswith(".js"):
+            script = payload.decode("utf-8").replace(
+                "\n\t    connect();",
+                "\n\t    // Demo page: the live daemon WebSocket is intentionally disabled.",
+            )
+            payload = script.encode("utf-8")
+        (assets / name).write_bytes(payload)
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
@@ -796,7 +959,9 @@ def encode_video(frame_dir: Path, output_path: Path) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Render sanitized Provision dashboard demo assets.")
+    parser = argparse.ArgumentParser(
+        description="Render sanitized Provision dashboard demo assets."
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,

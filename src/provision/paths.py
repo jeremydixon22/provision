@@ -30,6 +30,8 @@ class Paths:
     def __init__(self, home: Path | None = None) -> None:
         self.home = (home or provision_home()).expanduser()
         self.codex = self.home / "codex"
+        self.providers = self.home / "providers"
+        self.default_provider = self.home / "default-provider"
         self.profiles = self.codex / "profiles"
         self.capture = self.codex / "capture"
         self.launchers = self.codex / "launchers"
@@ -53,6 +55,13 @@ class Paths:
         self.log = self.home / "daemon.log"
 
     def ensure_base(self) -> None:
-        for path in (self.home, self.codex, self.profiles, self.capture, self.launchers):
+        for path in (
+            self.home,
+            self.codex,
+            self.providers,
+            self.profiles,
+            self.capture,
+            self.launchers,
+        ):
             path.mkdir(parents=True, exist_ok=True)
             path.chmod(0o700)

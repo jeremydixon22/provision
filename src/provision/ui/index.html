@@ -1,0 +1,182 @@
+<!doctype html>
+<html>
+	<head>
+		  <meta charset="utf-8">
+		  <meta name="viewport" content="width=device-width, initial-scale=1">
+		  <title>Provision</title>
+		  <script>
+		    (function() {
+		      try {
+		        const theme = localStorage.getItem("provision-theme");
+		        if (theme === "light" || theme === "dark") {
+		          document.documentElement.dataset.theme = theme;
+		        }
+		      } catch {
+		      }
+		    })();
+		  </script>
+		  <link rel="stylesheet" href="/assets/provision-ui.css">
+</head>
+<body>
+	  <main class="shell">
+	    <header class="topbar">
+		      <img class="logo" src="/assets/provision-wordmark.png" alt="Provision">
+	      <div class="top-meta">
+	        <span class="pill">Default <strong id="defaultProvider">__DEFAULT_PROVIDER__</strong></span>
+	        <span class="pill">Codex profile <strong id="activeProfile">__ACTIVE_PROFILE__</strong></span>
+	        <span class="pill">Codex CLI <strong id="codexVersion">__CODEX_VERSION__</strong></span>
+	        <span id="codexRestartRequired" class="pill" hidden>Restart Provision</span>
+	        <span class="pill">Requests <strong id="activeRequests">__ACTIVE_REQUESTS__</strong></span>
+	        <span class="pill">Tunnels <strong id="activeTunnels">__ACTIVE_WEBSOCKETS__</strong></span>
+	        <span class="pill"><span id="proxyDot" class="dot"></span><span id="connectionState">Live (__BUSY__)</span></span>
+	      </div>
+	      <div class="top-actions">
+	        <button id="statsToggle" class="stats-toggle" type="button" aria-label="Open stats" title="Open stats"></button>
+	        <button id="themeToggle" class="theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle color theme"></button>
+	      </div>
+    </header>
+    <div id="message" class="message" aria-live="polite"></div>
+    <section id="sessionTabs" class="session-tabs" aria-label="Provision-managed CLI sessions"></section>
+    <section id="mobileControlStatus" class="mobile-control-status" aria-label="Current session context and quota" hidden>
+      <div id="mobileControlReadouts" class="mobile-control-status-readouts"></div>
+      <button id="mobileFocusToggle" class="mobile-focus-toggle" type="button" aria-pressed="false">Focus discussion</button>
+    </section>
+    <section id="launcherBar" class="launcher-dock" aria-label="Launch Codex CLI session" hidden>
+      <div class="launcher-modal" role="dialog" aria-modal="false" aria-labelledby="launcherTitle">
+        <div class="launcher-head">
+          <h2 id="launcherTitle">Launch Codex CLI</h2>
+          <button id="launcherClose" class="control-close" type="button" aria-label="Close launcher">x</button>
+        </div>
+        <div class="launcher-grid">
+          <label class="launcher-field workdir">
+            <span>Workdir</span>
+            <select id="launcherSession"></select>
+          </label>
+          <label class="launcher-field">
+            <span>Mode</span>
+            <select id="launcherMode">
+              <option value="new">New session</option>
+              <option value="resume-last">Resume latest</option>
+              <option value="resume-session">Resume selected</option>
+            </select>
+          </label>
+          <label class="launcher-field">
+            <span>Permissions</span>
+            <select id="launcherPermission">
+              <option value="workspace-write">Workspace write</option>
+              <option value="read-only">Read only</option>
+              <option value="full-access">Full access</option>
+              <option value="bypass">Bypass prompts</option>
+            </select>
+          </label>
+          <div class="launcher-actions">
+            <button id="launcherStart" type="button">Launch</button>
+          </div>
+          <label id="launcherResumeField" class="launcher-field resume-session" hidden>
+            <span>Resume Session</span>
+            <select id="launcherResumeSession"></select>
+          </label>
+        </div>
+      </div>
+    </section>
+    <div id="controlModal" class="control-dock" hidden>
+      <section class="control-modal" role="dialog" aria-modal="false" aria-labelledby="controlTitle">
+        <button id="mobileFocusRestore" class="mobile-focus-restore" type="button" hidden>Show controls</button>
+        <div class="control-head">
+          <div class="control-title-block">
+            <h2 id="controlTitle">Session</h2>
+          </div>
+          <div class="control-head-actions">
+            <button id="controlPermissionsToggle" class="control-permissions-toggle" type="button" aria-pressed="false" hidden>Approvals: terminal</button>
+            <select id="controlTurnSelect" class="control-turn-select" aria-label="Observed turn"></select>
+            <button id="controlForget" type="button">Forget</button>
+            <button id="controlClose" class="control-close" type="button" aria-label="Close session">x</button>
+          </div>
+	        </div>
+	        <div id="controlStatusPills" class="control-status-pills"></div>
+	        <div class="control-toolbar">
+          <div class="control-view-tabs" role="tablist" aria-label="Session view">
+            <button id="controlDiscussionView" class="control-view-button active" type="button" data-control-view="discussion">Discussion</button>
+            <button id="controlTerminalView" class="control-view-button" type="button" data-control-view="terminal">Terminal</button>
+            <button id="controlDetailsView" class="control-view-button" type="button" data-control-view="details">Session Details</button>
+            <button id="controlResumeView" class="control-view-button" type="button" data-control-view="resume">Resume</button>
+          </div>
+          <input id="controlSearch" class="control-search" type="search" placeholder="Search discussion">
+        </div>
+        <div id="controlContent" class="control-content"></div>
+        <div id="controlWorkingState" class="control-working-state" role="status" aria-live="polite" aria-atomic="true" hidden>Working &hellip;</div>
+        <form id="controlCompose" class="control-compose">
+          <textarea id="controlPrompt" placeholder="Live CLI input is not connected yet" disabled></textarea>
+          <button id="controlSend" type="submit" disabled>Send</button>
+        </form>
+      </section>
+    </div>
+    <div id="statsModal" class="modal-backdrop stats-backdrop" hidden>
+      <section class="stats-modal" role="dialog" aria-modal="true" aria-labelledby="statsTitle">
+        <div class="stats-head">
+          <h2 id="statsTitle">Stats</h2>
+          <button id="statsClose" class="stats-close" type="button" aria-label="Close stats">x</button>
+        </div>
+        <div id="statsContent" class="stats-content"></div>
+      </section>
+    </div>
+    <div id="confirmModal" class="modal-backdrop" hidden>
+      <section class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+        <h2 id="confirmTitle">Confirm action</h2>
+        <p id="confirmMessage"></p>
+        <div id="confirmDetails" class="confirm-details" hidden></div>
+        <div class="confirm-actions">
+          <button id="confirmCancel" type="button">Cancel</button>
+          <button id="confirmAccept" class="danger" type="button">Confirm</button>
+        </div>
+      </section>
+    </div>
+    <div id="permissionModal" class="modal-backdrop permission-backdrop" hidden>
+      <section class="permission-modal" role="alertdialog" aria-modal="true" aria-labelledby="permissionTitle" aria-describedby="permissionReason">
+        <div class="permission-head">
+          <div>
+            <div id="permissionProvider" class="permission-provider"></div>
+            <h2 id="permissionTitle">Permission requested</h2>
+          </div>
+          <span id="permissionQueueCount" class="permission-queue-count"></span>
+        </div>
+        <div class="permission-meta">
+          <span id="permissionCategory" class="permission-category"></span>
+          <strong id="permissionTool"></strong>
+        </div>
+        <p id="permissionReason" class="permission-reason"></p>
+        <pre id="permissionPreview" class="permission-preview"></pre>
+        <p class="permission-safety">Approve only if this matches the work you expect. Otherwise deny it or return the decision to the terminal.</p>
+        <div class="permission-actions">
+          <button id="permissionTerminal" type="button">Use terminal</button>
+          <button id="permissionDeny" class="danger" type="button">Deny</button>
+          <button id="permissionAllow" class="primary" type="button">Allow once</button>
+        </div>
+      </section>
+    </div>
+    <div id="uiTooltip" class="ui-tooltip" hidden></div>
+	    <section id="profilesPanel" class="profiles">
+      <table>
+        <colgroup>
+          <col class="profile-col">
+          <col class="model-col">
+          <col class="quota-col">
+          <col class="actions-col">
+        </colgroup>
+        <thead>
+          <tr><th>Profile</th><th>Model</th><th>Usage / Quota</th><th></th></tr>
+        </thead>
+        <tbody id="profileRows">__ROWS__</tbody>
+      </table>
+      <button id="profileHiddenToggle" class="profile-hidden-toggle" type="button" hidden></button>
+    </section>
+  </main>
+  <script>
+    window.PROVISION_BOOTSTRAP = {
+      initial: __INITIAL_STATE__,
+      loginBrowserRemoteNote: __LOGIN_BROWSER_REMOTE_NOTE__
+    };
+  </script>
+  <script src="/assets/provision-ui.js"></script>
+</body>
+</html>

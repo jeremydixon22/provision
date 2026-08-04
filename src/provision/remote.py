@@ -14,23 +14,22 @@ transcript text unless a caller requests one bounded message page.
 from __future__ import annotations
 
 import base64
-from collections import deque
-from collections.abc import Iterable, Mapping
 import copy
-from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
 import math
 import os
-from pathlib import Path
 import re
 import socket
 import stat
 import struct
 import threading
+from collections import deque
+from collections.abc import Iterable, Mapping
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
-
 
 REMOTE_PROTOCOL_VERSION = 1
 REMOTE_DELTA_BUFFER_LIMIT = 500
@@ -288,10 +287,24 @@ class RemoteDeviceRegistry:
         now = utc_now()
         with self.lock:
             existing = self.devices.get(device_id)
+            if existing:
+                existing_fingerprint = str(existing.get("identity_fingerprint") or "")
+                if hmac.compare_digest(
+                    existing_fingerprint.encode("utf-8"), fingerprint.encode("utf-8")
+                ) and not existing.get("revoked_at"):
+                    # A transport retry must never reset grants or metadata on
+                    # an already-paired device. Returning the current record
+                    # makes a completed enrollment safely idempotent.
+                    return self._public_device(device_id, existing)
+                if existing.get("revoked_at"):
+                    raise RemoteAuthorizationError(
+                        "remote device is revoked; enroll a new device ID"
+                    )
+                raise RemoteError("remote device ID is already paired")
             self.devices[device_id] = {
                 "identity_fingerprint": fingerprint,
                 "capabilities": validated_capabilities,
-                "created_at": str(existing.get("created_at") or now) if existing else now,
+                "created_at": now,
                 "updated_at": now,
                 "revoked_at": "",
             }
@@ -398,12 +411,20 @@ def session_current_turn_id(session: Mapping[str, Any]) -> str:
         tunnels = active_details.get("tunnels")
         if isinstance(tunnels, list):
             for tunnel in tunnels:
-                if isinstance(tunnel, Mapping) and isinstance(tunnel.get("turn_id"), str) and tunnel.get("turn_id"):
+                if (
+                    isinstance(tunnel, Mapping)
+                    and isinstance(tunnel.get("turn_id"), str)
+                    and tunnel.get("turn_id")
+                ):
                     return bounded_string(tunnel["turn_id"], 160)
     turns = session.get("turns")
     if isinstance(turns, list):
         for turn in reversed(turns):
-            if isinstance(turn, Mapping) and isinstance(turn.get("turn_id"), str) and turn.get("turn_id"):
+            if (
+                isinstance(turn, Mapping)
+                and isinstance(turn.get("turn_id"), str)
+                and turn.get("turn_id")
+            ):
                 return bounded_string(turn["turn_id"], 160)
     return ""
 
@@ -428,9 +449,12 @@ def build_remote_session_summaries(control_plane: Any, secret: bytes) -> list[di
             {
                 "session_id": remote_session_id(secret, key),
                 "label": bounded_string(label, 240),
+                "provider": bounded_string(raw.get("provider") or "codex", 32),
                 "profile": bounded_string(raw.get("associated_profile"), 96),
                 "active": bool(raw.get("active")),
-                "interactive": bool(isinstance(interaction, Mapping) and interaction.get("available")),
+                "interactive": bool(
+                    isinstance(interaction, Mapping) and interaction.get("available")
+                ),
                 "current_turn_id": session_current_turn_id(raw),
                 "context": safe_context_summary(raw.get("context")),
                 "quota": bounded_string(raw.get("quota_summary"), 240),
@@ -446,7 +470,13 @@ def public_remote_session(summary: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     if isinstance(session_id, str) and session_id:
         result["session_id"] = bounded_string(session_id, 80)
-    for key, limit in (("label", 240), ("profile", 96), ("current_turn_id", 160), ("quota", 240)):
+    for key, limit in (
+        ("label", 240),
+        ("provider", 32),
+        ("profile", 96),
+        ("current_turn_id", 160),
+        ("quota", 240),
+    ):
         value = summary.get(key)
         if isinstance(value, str):
             result[key] = bounded_string(value, limit)
@@ -457,7 +487,11 @@ def public_remote_session(summary: Mapping[str, Any]) -> dict[str, Any]:
     if context:
         result["context"] = context
     unread_revision = summary.get("unread_revision")
-    if isinstance(unread_revision, int) and not isinstance(unread_revision, bool) and unread_revision >= 0:
+    if (
+        isinstance(unread_revision, int)
+        and not isinstance(unread_revision, bool)
+        and unread_revision >= 0
+    ):
         result["unread_revision"] = unread_revision
     return result
 
@@ -466,7 +500,14 @@ class RemoteStateSynchronizer:
     """Maintains a bounded session-index snapshot and replayable typed deltas."""
 
     _METRIC_FIELDS = frozenset(
-        {"active", "interactive", "current_turn_id", "context", "quota", "unread_revision"}
+        {
+            "active",
+            "interactive",
+            "current_turn_id",
+            "context",
+            "quota",
+            "unread_revision",
+        }
     )
 
     def __init__(self) -> None:
@@ -496,7 +537,12 @@ class RemoteStateSynchronizer:
         for raw in summaries:
             session_id = raw.get("session_id")
             source_key = raw.get("_source_session_key")
-            if not isinstance(session_id, str) or not session_id or not isinstance(source_key, str) or not source_key:
+            if (
+                not isinstance(session_id, str)
+                or not session_id
+                or not isinstance(source_key, str)
+                or not source_key
+            ):
                 continue
             candidate[session_id] = dict(raw)
             candidate_keys[session_id] = source_key
@@ -629,7 +675,12 @@ class RemoteStateSynchronizer:
         """Append one bounded live Discussion delta without rebuilding history."""
         public_entry = public_remote_discussion_entry(entry)
         message_id = public_entry.get("message_id")
-        if not isinstance(session_id, str) or not session_id or not isinstance(message_id, str) or not message_id:
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or not isinstance(message_id, str)
+            or not message_id
+        ):
             raise RemoteError("invalid remote discussion delta")
         with self.lock:
             self.revision += 1
@@ -687,7 +738,13 @@ class RemoteStateSynchronizer:
     ) -> dict[str, Any]:
         with self.lock:
             sessions = [public_remote_session(item) for item in self.sessions.values()]
-            sessions.sort(key=lambda item: (not bool(item.get("active")), str(item.get("label") or ""), str(item.get("session_id") or "")))
+            sessions.sort(
+                key=lambda item: (
+                    not bool(item.get("active")),
+                    str(item.get("label") or ""),
+                    str(item.get("session_id") or ""),
+                )
+            )
             start = 0
             if cursor:
                 if cursor_codec is None:
@@ -753,7 +810,11 @@ class RemoteStateSynchronizer:
         with self.lock:
             if revision < self.history_floor_revision or revision > self.revision:
                 return None
-            return [copy.deepcopy(delta) for delta in self.deltas if int(delta.get("revision") or 0) > revision]
+            return [
+                copy.deepcopy(delta)
+                for delta in self.deltas
+                if int(delta.get("revision") or 0) > revision
+            ]
 
 
 def transcript_item_local_id(item: Mapping[str, Any], index: int) -> str:
@@ -829,7 +890,9 @@ def build_remote_discussion_page(
         before = decoded.get("before_message_id")
         if not isinstance(before, str):
             raise RemoteCursorError("invalid remote discussion cursor")
-        matches = [index for index, entry in enumerate(entries) if entry.get("message_id") == before]
+        matches = [
+            index for index, entry in enumerate(entries) if entry.get("message_id") == before
+        ]
         if not matches:
             raise RemoteCursorError("remote discussion cursor has expired")
         end = matches[0]
@@ -845,7 +908,10 @@ def build_remote_discussion_page(
             "has_more": index > 0,
             "next_cursor": "cursor" if index > 0 else "",
         }
-        if len(proposed) > REMOTE_DISCUSSION_PAGE_ENTRIES or len(compact_json_bytes(response)) > REMOTE_DISCUSSION_PAGE_MAX_BYTES:
+        if (
+            len(proposed) > REMOTE_DISCUSSION_PAGE_ENTRIES
+            or len(compact_json_bytes(response)) > REMOTE_DISCUSSION_PAGE_MAX_BYTES
+        ):
             break
         selected = proposed
         start = index
@@ -921,7 +987,9 @@ def build_remote_message_expand(
             raise RemoteCursorError("invalid remote expansion cursor")
         offset = raw_offset
     full_text = str(matched_item.get("full_text") or matched_item.get("text") or "")
-    text, next_offset = bounded_utf8_chunk(full_text, offset, REMOTE_MESSAGE_EXPAND_CONTENT_MAX_BYTES)
+    text, next_offset = bounded_utf8_chunk(
+        full_text, offset, REMOTE_MESSAGE_EXPAND_CONTENT_MAX_BYTES
+    )
     has_more = next_offset < len(full_text.encode("utf-8"))
     next_cursor = ""
     if has_more:
@@ -1157,9 +1225,13 @@ class RemoteActionCache:
                     raise RemoteError("remote idempotency key was reused for a different action")
                 if existing.get("_state") == "completed":
                     return dict(existing)
-                raise RemoteError("remote action outcome is indeterminate; inspect the session before retrying")
+                raise RemoteError(
+                    "remote action outcome is indeterminate; inspect the session before retrying"
+                )
             if len(self.results) >= REMOTE_ACTION_IDEMPOTENCY_LIMIT:
-                raise RemoteError("remote action journal is at capacity; wait for pending actions to expire")
+                raise RemoteError(
+                    "remote action journal is at capacity; wait for pending actions to expire"
+                )
             self.results[key] = {
                 "_semantic_ref": semantic_ref,
                 "_state": "pending",
@@ -1185,7 +1257,9 @@ class RemoteActionCache:
         if not REMOTE_IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
             raise RemoteError("invalid remote idempotency key")
         key = (device_id, idempotency_key)
-        safe_result = {key: copy.deepcopy(result[key]) for key in self._RESULT_KEYS if key in result}
+        safe_result = {
+            key: copy.deepcopy(result[key]) for key in self._RESULT_KEYS if key in result
+        }
         if not isinstance(safe_result.get("_semantic_ref"), str):
             raise RemoteError("remote action result is missing its semantic reference")
         supplied_expiry = safe_result.get("_expires_at")
@@ -1207,7 +1281,9 @@ class RemoteActionCache:
                 safe_result["_expires_at"] = expires_at
             if key not in self.results:
                 if len(self.results) >= REMOTE_ACTION_IDEMPOTENCY_LIMIT:
-                    raise RemoteError("remote action journal is at capacity; wait for pending actions to expire")
+                    raise RemoteError(
+                        "remote action journal is at capacity; wait for pending actions to expire"
+                    )
                 self.order.append(key)
             self.results[key] = safe_result
             self._save_locked()
@@ -1348,7 +1424,7 @@ class LocalRemoteAgentSocket:
             _pid, uid, _gid = struct.unpack("3i", credentials)
         except (OSError, struct.error):
             return False
-        return uid == os.geteuid()
+        return bool(uid == os.geteuid())
 
     @staticmethod
     def _receive_request(connection: socket.socket) -> dict[str, Any]:
@@ -1376,9 +1452,15 @@ class LocalRemoteAgentSocket:
     def _send_response(connection: socket.socket, value: Mapping[str, Any]) -> None:
         encoded = compact_json_bytes(dict(value)) + b"\n"
         if len(encoded) > REMOTE_AGENT_RESPONSE_MAX_BYTES:
-            encoded = compact_json_bytes(
-                {"ok": False, "error": "local remote-agent response exceeds its byte limit"}
-            ) + b"\n"
+            encoded = (
+                compact_json_bytes(
+                    {
+                        "ok": False,
+                        "error": "local remote-agent response exceeds its byte limit",
+                    }
+                )
+                + b"\n"
+            )
         connection.sendall(encoded)
 
     def _handle_connection(self, connection: socket.socket) -> None:
@@ -1389,17 +1471,24 @@ class LocalRemoteAgentSocket:
             request = self._receive_request(connection)
             token = request.pop("token", "")
             if not isinstance(token, str) or not hmac.compare_digest(token, self.token):
-                self._send_response(connection, {"ok": False, "error": "invalid local remote-agent capability"})
+                self._send_response(
+                    connection,
+                    {"ok": False, "error": "invalid local remote-agent capability"},
+                )
                 return
             result = self.request_handler(request)
             self._send_response(connection, {"ok": True, "result": result})
         except RemoteError as exc:
             self._send_response(connection, {"ok": False, "error": str(exc)})
         except (OSError, ValueError):
-            self._send_response(connection, {"ok": False, "error": "invalid local remote-agent request"})
+            self._send_response(
+                connection, {"ok": False, "error": "invalid local remote-agent request"}
+            )
         except Exception:
             # Do not disclose daemon internals, credentials, or request body.
-            self._send_response(connection, {"ok": False, "error": "local remote-agent request failed"})
+            self._send_response(
+                connection, {"ok": False, "error": "local remote-agent request failed"}
+            )
 
 
 def random_remote_secret() -> bytes:

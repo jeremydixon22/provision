@@ -1,9 +1,14 @@
 # Codex CLI App-Server Integration Notes
 
 Provision currently uses Codex CLI's normal TUI/exec surfaces and observes the
-traffic that Codex CLI sends through Provision's local proxy. Codex CLI `0.144.0`
-exposes the current app-server protocol and bundled GPT-5.6 model catalog that
-can supplement some of Provision's inferred traffic parsing.
+traffic that Codex CLI sends through Provision's local proxy. The stable Codex
+CLI `0.146.0` schema continues to expose every app-server capability method
+Provision probes, plus the bundled GPT-5.6 model catalog that supplements some
+of Provision's inferred traffic parsing.
+
+The optional standalone `RateLimitResetCreditsSummary` schema is absent from
+both `0.145.0` and `0.146.0`; Provision therefore treats it as supplemental and
+does not make ordinary quota or reset-credit behavior depend on that file.
 
 This note records the current shape so the next integration step can be
 intentional rather than tied to chat history.

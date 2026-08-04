@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import os
+import select
+import shlex
 import shutil
 import signal
-import select
 import socket
 import struct
 import subprocess
 import sys
 import tempfile
-import time
 import threading
+import time
 import urllib.parse
 import uuid
 from pathlib import Path
@@ -33,15 +35,22 @@ from .daemon import (
     DEFAULT_DAEMON_HOST,
     PROTOCOL_VERSION,
     bridge_codex_history_into_app_home,
+    daemon_host_is_loopback,
     daemon_running,
     daemon_url_host,
     health,
     project_session_sentinel,
     wait_until_running,
 )
+from .daemon_logging import (
+    DAEMON_LOG_BACKUP_COUNT,
+    DAEMON_LOG_MAX_BYTES,
+    rotate_daemon_log,
+)
 from .paths import Paths, default_codex_home, launcher_path, source_root
+from .permissions import PERMISSION_CONTROL_MAX_BYTES, PERMISSION_HOOK_SOCKET_ENV
+from .providers import ProviderError, provider_environment, provider_spec
 from .store import Store
-
 
 PROVIDER_ID = "provision"
 CODEX_MODEL_COMMANDS = {"debug", "e", "exec", "fork", "resume", "review"}
@@ -68,6 +77,34 @@ CODEX_PASSTHROUGH_COMMANDS = {
 }
 CODEX_PTY_BYPASS_COMMANDS = CODEX_PASSTHROUGH_COMMANDS | {"e", "exec"}
 LAUNCHER_SESSION_HEARTBEAT_SECONDS = 5.0
+PTY_TERMINAL_CAPTURE_MAX_BYTES = 128 * 1024
+PTY_TERMINAL_SNAPSHOT_MAX_BYTES = 16 * 1024
+PERMISSION_BRIDGE_HTTP_TIMEOUT_SECONDS = 70.0
+
+
+class TerminalCapture:
+    """A bounded, in-memory tail of a Provision-owned terminal stream."""
+
+    def __init__(self, limit: int = PTY_TERMINAL_CAPTURE_MAX_BYTES) -> None:
+        self.limit = limit
+        self._data = bytearray()
+        self._dropped = False
+        self._lock = threading.Lock()
+
+    def append(self, data: bytes) -> None:
+        if not data:
+            return
+        with self._lock:
+            self._data.extend(data)
+            if len(self._data) > self.limit:
+                del self._data[: len(self._data) - self.limit]
+                self._dropped = True
+
+    def snapshot(self, limit: int = PTY_TERMINAL_SNAPSHOT_MAX_BYTES) -> tuple[bytes, bool]:
+        with self._lock:
+            data = bytes(self._data[-limit:])
+            truncated = self._dropped or len(self._data) > len(data)
+        return data, truncated
 
 
 def toml_string(value: str) -> str:
@@ -79,11 +116,11 @@ def provider_override(port: int, host: str | None = None) -> str:
     base_url = f"http://{daemon_url_host(host)}:{port}/v1"
     return (
         f"model_providers.{PROVIDER_ID}={{ "
-        f"name = \"Provision\", "
+        f'name = "Provision", '
         f"base_url = {toml_string(base_url)}, "
-        f"wire_api = \"responses\", "
+        f'wire_api = "responses", '
         f"supports_websockets = false, "
-        f"auth = {{ command = {toml_string(launcher)}, args = [\"token\"], timeout_ms = 5000, refresh_interval_ms = 0 }} "
+        f'auth = {{ command = {toml_string(launcher)}, args = ["token"], timeout_ms = 5000, refresh_interval_ms = 0 }} '
         f"}}"
     )
 
@@ -130,10 +167,33 @@ def configured_daemon_host() -> str | None:
     return raw.strip()
 
 
-def ensure_daemon(paths: Paths, port: int | None = None, host: str | None = None) -> dict[str, Any]:
+def configured_allow_non_loopback() -> bool:
+    return os.environ.get("PROVISION_ALLOW_NON_LOOPBACK", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def ensure_daemon(
+    paths: Paths,
+    port: int | None = None,
+    host: str | None = None,
+    *,
+    allow_non_loopback: bool | None = None,
+) -> dict[str, Any]:
+    if allow_non_loopback is None:
+        allow_non_loopback = configured_allow_non_loopback()
     status = daemon_running(paths)
     specific_port = port not in (None, 0)
     requested_host = host or None
+    if requested_host and not daemon_host_is_loopback(requested_host) and not allow_non_loopback:
+        raise RuntimeError(
+            f"refusing non-loopback daemon bind {requested_host!r}; "
+            "pass --allow-non-loopback or set PROVISION_ALLOW_NON_LOOPBACK=1 only behind "
+            "an authenticated, encrypted boundary"
+        )
     specific_host = requested_host is not None
     if (
         status
@@ -150,14 +210,23 @@ def ensure_daemon(paths: Paths, port: int | None = None, host: str | None = None
     existing = env.get("PYTHONPATH")
     env["PYTHONPATH"] = src if not existing else src + os.pathsep + existing
     paths.log.parent.mkdir(parents=True, exist_ok=True)
+    rotate_daemon_log(
+        paths.log,
+        max_bytes=DAEMON_LOG_MAX_BYTES,
+        backup_count=DAEMON_LOG_BACKUP_COUNT,
+    )
+    env["PROVISION_DAEMON_LOG"] = str(paths.log)
     argv = [sys.executable, "-m", "provision", "daemon"]
     if port is not None:
         argv.extend(["--port", str(port)])
     if requested_host is not None:
         argv.extend(["--host", requested_host])
+    if allow_non_loopback:
+        argv.append("--allow-non-loopback")
     # Popen duplicates the descriptor for the daemon. Closing the parent's copy
     # immediately avoids retaining a log descriptor for the caller's lifetime.
     with paths.log.open("ab") as log:
+        paths.log.chmod(0o600)
         subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,
@@ -198,10 +267,16 @@ def register_session(
     control_path: str | None = None,
     launcher_pid: int | None = None,
     pty_managed: bool = False,
+    provider: str = "codex",
+    provider_profile: str | None = None,
+    provider_pid: int | None = None,
+    provider_state_root: str | None = None,
+    permission_bridge: str | None = None,
 ) -> None:
     fields: dict[str, str] = {
         "token": proxy_token,
         "cwd": cwd,
+        "provider": provider,
     }
     if session_key:
         fields["session_key"] = session_key
@@ -211,6 +286,14 @@ def register_session(
         fields["launcher_pid"] = str(launcher_pid)
     if pty_managed:
         fields["pty_managed"] = "1"
+    if provider_profile:
+        fields["provider_profile"] = provider_profile
+    if provider_pid is not None:
+        fields["provider_pid"] = str(provider_pid)
+    if provider_state_root:
+        fields["provider_state_root"] = provider_state_root
+    if permission_bridge:
+        fields["permission_bridge"] = permission_bridge
     body = urllib.parse.urlencode(fields)
     conn = http.client.HTTPConnection(daemon_url_host(host), port, timeout=0.5)
     try:
@@ -235,6 +318,11 @@ def register_pty_session(
     *,
     session_key: str | None,
     control_path: Path,
+    provider: str = "codex",
+    provider_profile: str | None = None,
+    provider_pid: int | None = None,
+    provider_state_root: str | None = None,
+    permission_bridge: str | None = None,
 ) -> None:
     register_session(
         port,
@@ -245,17 +333,39 @@ def register_pty_session(
         control_path=str(control_path),
         launcher_pid=os.getpid(),
         pty_managed=True,
+        provider=provider,
+        provider_profile=provider_profile,
+        provider_pid=provider_pid,
+        provider_state_root=provider_state_root,
+        permission_bridge=permission_bridge,
     )
 
 
-def should_use_pty(codex_args: list[str]) -> bool:
+def should_use_pty(
+    command_args: list[str],
+    *,
+    bypass_commands: tuple[str, ...] = (),
+    bypass_options: tuple[str, ...] = (),
+) -> bool:
     if os.environ.get("PROVISION_DISABLE_PTY"):
         return False
     if os.name != "posix":
         return False
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return False
-    if codex_args and codex_args[0] in CODEX_PTY_BYPASS_COMMANDS:
+    if command_args and command_args[0].lower() in {
+        "-h",
+        "--help",
+        "-v",
+        "--version",
+        "help",
+        "version",
+    }:
+        return False
+    if command_args and command_args[0].lower() in set(bypass_commands):
+        return False
+    option_set = set(bypass_options)
+    if any(argument.split("=", 1)[0].lower() in option_set for argument in command_args):
         return False
     return True
 
@@ -285,7 +395,182 @@ def encode_terminal_prompt(text: str) -> bytes:
     return ("\x1b[200~" + normalized + "\x1b[201~\r").encode("utf-8")
 
 
-def control_server(control_path: Path, master_fd: int, stop: threading.Event) -> None:
+def permission_hook_command(provider: str) -> str:
+    return shlex.join([provision_command(), "permission-hook", "--provider", provider])
+
+
+def provider_permission_bridge_argv(provider: str, argv: list[str]) -> tuple[list[str], str | None]:
+    """Add a session-only native hook without editing vendor configuration."""
+    if provider != "claude":
+        return argv, None
+    if any(argument == "--settings" or argument.startswith("--settings=") for argument in argv[1:]):
+        # Replacing an explicit settings overlay could discard user policy.
+        return argv, None
+    settings = {
+        "hooks": {
+            "PermissionRequest": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": permission_hook_command(provider),
+                            "timeout": 65,
+                            "statusMessage": "Waiting for Provision approval",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    return [
+        argv[0],
+        "--settings",
+        json.dumps(settings, separators=(",", ":")),
+        *argv[1:],
+    ], "claude-permission-hook-v1"
+
+
+def forward_permission_request(
+    *,
+    port: int,
+    host: str,
+    proxy_token: str,
+    session_key: str,
+    provider: str,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    body = json.dumps(
+        {
+            "token": proxy_token,
+            "session_key": session_key,
+            "provider": provider,
+            "request": request,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(body) > PERMISSION_CONTROL_MAX_BYTES:
+        return {"ok": True, "decision": "terminal"}
+    connection = http.client.HTTPConnection(
+        daemon_url_host(host),
+        port,
+        timeout=PERMISSION_BRIDGE_HTTP_TIMEOUT_SECONDS,
+    )
+    try:
+        connection.request(
+            "POST",
+            "/api/permission-request",
+            body=body,
+            headers={"content-type": "application/json"},
+        )
+        response = connection.getresponse()
+        raw = response.read(PERMISSION_CONTROL_MAX_BYTES + 1)
+        if response.status != 200 or len(raw) > PERMISSION_CONTROL_MAX_BYTES:
+            return {"ok": True, "decision": "terminal"}
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"ok": True, "decision": "terminal"}
+    finally:
+        connection.close()
+    return value if isinstance(value, dict) else {"ok": True, "decision": "terminal"}
+
+
+def handle_control_connection(
+    conn: socket.socket,
+    *,
+    master_fd: int,
+    capture: TerminalCapture | None,
+    port: int,
+    host: str,
+    proxy_token: str,
+    session_key: str,
+    provider: str,
+) -> None:
+    with conn:
+        try:
+            raw_buffer = bytearray()
+            while len(raw_buffer) <= PERMISSION_CONTROL_MAX_BYTES:
+                chunk = conn.recv(min(8192, PERMISSION_CONTROL_MAX_BYTES + 1 - len(raw_buffer)))
+                if not chunk:
+                    break
+                raw_buffer.extend(chunk)
+                candidate = bytes(raw_buffer).split(b"\n", 1)[0]
+                if b"\n" in raw_buffer:
+                    break
+                try:
+                    json.loads(candidate.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                break
+            raw = bytes(raw_buffer)
+            if len(raw) > PERMISSION_CONTROL_MAX_BYTES:
+                conn.sendall(b'{"ok":false,"error":"control message too large"}\n')
+                return
+            payload = json.loads(raw.split(b"\n", 1)[0].decode("utf-8"))
+            if not isinstance(payload, dict):
+                conn.sendall(b'{"ok":false,"error":"unsupported action"}\n')
+                return
+            action = payload.get("action")
+            if action == "permission_request":
+                request = payload.get("request")
+                if not isinstance(request, dict):
+                    conn.sendall(b'{"ok":true,"decision":"terminal"}\n')
+                    return
+                response = forward_permission_request(
+                    port=port,
+                    host=host,
+                    proxy_token=proxy_token,
+                    session_key=session_key,
+                    provider=provider,
+                    request=request,
+                )
+                conn.sendall(json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n")
+                return
+            if action == "terminal_snapshot":
+                if capture is None:
+                    conn.sendall(b'{"ok":false,"error":"terminal capture unavailable"}\n')
+                    return
+                output, truncated = capture.snapshot()
+                response = {
+                    "ok": True,
+                    "encoding": "base64",
+                    "output": base64.b64encode(output).decode("ascii"),
+                    "truncated": truncated,
+                }
+                conn.sendall(json.dumps(response, separators=(",", ":")).encode("utf-8") + b"\n")
+                return
+            if action == "send_escape":
+                os.write(master_fd, b"\x1b")
+                conn.sendall(b'{"ok":true}\n')
+                return
+            if action != "send_text":
+                conn.sendall(b'{"ok":false,"error":"unsupported action"}\n')
+                return
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip():
+                conn.sendall(b'{"ok":false,"error":"empty text"}\n')
+                return
+            os.write(master_fd, encode_terminal_prompt(text))
+            conn.sendall(b'{"ok":true}\n')
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            try:
+                conn.sendall(json.dumps({"ok": False, "error": str(exc)}).encode("utf-8") + b"\n")
+            except OSError:
+                pass
+
+
+def control_server(
+    control_path: Path,
+    master_fd: int,
+    stop: threading.Event,
+    capture: TerminalCapture | None = None,
+    *,
+    port: int,
+    host: str,
+    proxy_token: str,
+    session_key: str,
+    provider: str,
+) -> None:
     try:
         if control_path.exists():
             control_path.unlink()
@@ -304,32 +589,21 @@ def control_server(control_path: Path, master_fd: int, stop: threading.Event) ->
                 continue
             except OSError:
                 break
-            with conn:
-                try:
-                    raw = conn.recv(1024 * 1024)
-                    payload = json.loads(raw.decode("utf-8"))
-                    if not isinstance(payload, dict):
-                        conn.sendall(b'{"ok":false,"error":"unsupported action"}')
-                        continue
-                    action = payload.get("action")
-                    if action == "send_escape":
-                        os.write(master_fd, b"\x1b")
-                        conn.sendall(b'{"ok":true}')
-                        continue
-                    if action != "send_text":
-                        conn.sendall(b'{"ok":false,"error":"unsupported action"}')
-                        continue
-                    text = payload.get("text")
-                    if not isinstance(text, str) or not text.strip():
-                        conn.sendall(b'{"ok":false,"error":"empty text"}')
-                        continue
-                    os.write(master_fd, encode_terminal_prompt(text))
-                    conn.sendall(b'{"ok":true}')
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    try:
-                        conn.sendall(json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"))
-                    except OSError:
-                        pass
+            threading.Thread(
+                target=handle_control_connection,
+                kwargs={
+                    "conn": conn,
+                    "master_fd": master_fd,
+                    "capture": capture,
+                    "port": port,
+                    "host": host,
+                    "proxy_token": proxy_token,
+                    "session_key": session_key,
+                    "provider": provider,
+                },
+                name="provision-pty-control-client",
+                daemon=True,
+            ).start()
     finally:
         server.close()
         try:
@@ -346,7 +620,8 @@ def wait_status_to_exit_code(status: int) -> int:
     return 1
 
 
-def run_codex_pty(
+def run_managed_pty(
+    executable: str,
     argv: list[str],
     env: dict[str, str],
     *,
@@ -356,17 +631,34 @@ def run_codex_pty(
     cwd: str,
     host: str,
     session_key: str | None = None,
+    provider: str = "codex",
+    provider_profile: str | None = None,
+    provider_state_root: str | None = None,
 ) -> int:
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
+    argv, permission_bridge = provider_permission_bridge_argv(provider, argv)
+    if permission_bridge:
+        permission_bridge = f"{permission_bridge}:{uuid.uuid4().hex}"
+    child_env = dict(env)
+    if permission_bridge:
+        child_env[PERMISSION_HOOK_SOCKET_ENV] = str(control_path)
     child_pid, master_fd = pty.fork()
     if child_pid == 0:
-        os.execvpe("codex", argv, env)
+        os.execvpe(executable, argv, child_env)
 
     stop = threading.Event()
+    capture = TerminalCapture()
     control_thread = threading.Thread(
         target=control_server,
-        args=(control_path, master_fd, stop),
+        args=(control_path, master_fd, stop, capture),
+        kwargs={
+            "port": port,
+            "host": host,
+            "proxy_token": proxy_token,
+            "session_key": session_key or cwd,
+            "provider": provider,
+        },
         name="provision-pty-control",
         daemon=True,
     )
@@ -381,6 +673,11 @@ def run_codex_pty(
         host,
         session_key=session_key,
         control_path=control_path,
+        provider=provider,
+        provider_profile=provider_profile,
+        provider_pid=child_pid,
+        provider_state_root=provider_state_root,
+        permission_bridge=permission_bridge,
     )
 
     old_attrs = termios.tcgetattr(stdin_fd)
@@ -410,6 +707,11 @@ def run_codex_pty(
                         host,
                         session_key=session_key,
                         control_path=control_path,
+                        provider=provider,
+                        provider_profile=provider_profile,
+                        provider_pid=child_pid,
+                        provider_state_root=provider_state_root,
+                        permission_bridge=permission_bridge,
                     )
                 next_heartbeat = now + LAUNCHER_SESSION_HEARTBEAT_SECONDS
             if not readable:
@@ -429,6 +731,7 @@ def run_codex_pty(
                     break
                 if not data:
                     break
+                capture.append(data)
                 os.write(stdout_fd, data)
     finally:
         stop.set()
@@ -451,6 +754,32 @@ def run_codex_pty(
 
     _, status = os.waitpid(child_pid, 0)
     return wait_status_to_exit_code(status)
+
+
+def run_codex_pty(
+    argv: list[str],
+    env: dict[str, str],
+    *,
+    control_path: Path,
+    port: int,
+    proxy_token: str,
+    cwd: str,
+    host: str,
+    session_key: str | None = None,
+) -> int:
+    """Backward-compatible Codex wrapper around the generic managed PTY."""
+    return run_managed_pty(
+        "codex",
+        argv,
+        env,
+        control_path=control_path,
+        port=port,
+        proxy_token=proxy_token,
+        cwd=cwd,
+        host=host,
+        session_key=session_key,
+        provider="codex",
+    )
 
 
 def launch_codex(codex_args: list[str]) -> int:
@@ -481,7 +810,7 @@ def launch_codex(codex_args: list[str]) -> int:
         argv = ["codex", *provider_args, *codex_args]
     env = os.environ.copy()
     env["OPENAI_PROJECT"] = project_session_sentinel(proxy_token, cwd, session_key=session_key)
-    if should_use_pty(codex_args):
+    if should_use_pty(codex_args, bypass_commands=tuple(CODEX_PTY_BYPASS_COMMANDS)):
         return run_codex_pty(
             argv,
             env,
@@ -503,6 +832,81 @@ def launch_codex(codex_args: list[str]) -> int:
         )
     os.execvpe("codex", argv, env)
     return 127
+
+
+def launch_native_provider(
+    provider: str, provider_args: list[str], *, profile: str | None = None
+) -> int:
+    """Launch a non-Codex vendor CLI without proxying its upstream traffic.
+
+    A terminal session Provision launches is owned through the same local PTY
+    bridge used by Codex.  This lets the dashboard send input to that exact
+    terminal while the vendor binary, its native login, and its upstream
+    connection remain authoritative.  Non-interactive management commands are
+    passed through directly and never start the Provision daemon.
+    """
+    try:
+        spec = provider_spec(provider)
+    except ProviderError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if spec.name == "codex":
+        if profile:
+            raise RuntimeError("use `provision use <profile>` to choose a Codex profile")
+        return launch_codex(provider_args)
+    if not shutil.which(spec.executable):
+        raise RuntimeError(
+            f"{spec.name} CLI is not installed or not on PATH (expected `{spec.executable}`)"
+        )
+
+    paths = Paths()
+    store = Store(paths)
+    selected_profile = profile or store.active_provider_profile(spec.name)
+    if profile and not store.provider_profile_exists(spec.name, profile):
+        raise RuntimeError(
+            f"{spec.name} profile does not exist: {profile}; "
+            f"run `provision provider login {spec.name} {profile}` first"
+        )
+    env = os.environ.copy()
+    try:
+        env.update(provider_environment(paths.home, spec.name, selected_profile))
+    except ProviderError as exc:
+        raise RuntimeError(str(exc)) from exc
+    argv = [spec.executable, *provider_args]
+    if not should_use_pty(
+        provider_args,
+        bypass_commands=spec.pty_bypass_commands,
+        bypass_options=spec.pty_bypass_options,
+    ):
+        os.execvpe(spec.executable, argv, env)
+        return 127
+
+    status = ensure_daemon(paths, configured_daemon_port(), configured_daemon_host())
+    port = int(status["port"])
+    host = str(status.get("host") or DEFAULT_DAEMON_HOST)
+    cwd = os.getcwd()
+    inherited_session_key = os.environ.get("PROVISION_SESSION_KEY") or ""
+    session_key = inherited_session_key or f"{spec.name}::{os.path.abspath(cwd)}"
+    return run_managed_pty(
+        spec.executable,
+        argv,
+        env,
+        control_path=launcher_control_path(paths),
+        port=port,
+        proxy_token=store.proxy_token(),
+        cwd=cwd,
+        host=host,
+        session_key=session_key,
+        provider=spec.name,
+        provider_profile=selected_profile,
+        provider_state_root=(
+            env.get(spec.profile_environment) if spec.profile_environment else None
+        )
+        or (
+            str(Path.home() / (".grok" if spec.name == "grok" else ".claude"))
+            if spec.name in {"grok", "claude"}
+            else None
+        ),
+    )
 
 
 def run_profiled_passthrough_codex(
@@ -534,7 +938,9 @@ def run_profiled_passthrough_codex(
             source_config_text = ""
         runtime_config_text = source_config_text
         if "cli_auth_credentials_store" not in runtime_config_text:
-            runtime_config_text = runtime_config_text.rstrip() + '\ncli_auth_credentials_store = "file"\n'
+            runtime_config_text = (
+                runtime_config_text.rstrip() + '\ncli_auth_credentials_store = "file"\n'
+            )
         config.write_text(runtime_config_text, encoding="utf-8")
         config.chmod(0o600)
         profiled_env = dict(env)

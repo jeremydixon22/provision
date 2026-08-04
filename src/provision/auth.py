@@ -15,7 +15,6 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-
 CHATGPT_BACKEND_BASE_URL = "https://chatgpt.com/backend-api"
 CHATGPT_CODEX_BASE_URL = f"{CHATGPT_BACKEND_BASE_URL}/codex"
 OPENAI_API_BASE_URL = "https://api.openai.com/v1"
@@ -48,7 +47,9 @@ CODEX_CLIENT_ID_FALSE_CONTEXT_TERMS = (
     b"plugin_id",
     b"marketplace",
 )
-CODEX_CLIENT_ID_PRECEDING_TOKEN_BYTES = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+CODEX_CLIENT_ID_PRECEDING_TOKEN_BYTES = (
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+)
 
 
 class AuthError(RuntimeError):
@@ -131,7 +132,8 @@ def auth_claims(auth: dict[str, Any]) -> dict[str, Any]:
 
 
 def extract_metadata(auth: dict[str, Any]) -> dict[str, Any]:
-    tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+    raw_tokens = auth.get("tokens")
+    tokens: dict[str, Any] = raw_tokens if isinstance(raw_tokens, dict) else {}
     id_claims = decode_jwt_claims(tokens.get("id_token")) if tokens else {}
     access_claims = decode_jwt_claims(tokens.get("access_token")) if tokens else {}
     nested = id_claims.get(AUTH_CLAIMS_KEY)
@@ -144,9 +146,7 @@ def extract_metadata(auth: dict[str, Any]) -> dict[str, Any]:
         profile = {}
 
     account_id = (
-        tokens.get("account_id")
-        or nested.get("chatgpt_account_id")
-        or nested.get("account_id")
+        tokens.get("account_id") or nested.get("chatgpt_account_id") or nested.get("account_id")
     )
     email = id_claims.get("email") or profile.get("email")
     name = id_claims.get("name")
@@ -177,7 +177,10 @@ def access_token_expired(auth: dict[str, Any], skew_seconds: int = 300) -> bool:
 
 
 def codex_client_id_match_score(data: bytes, match: re.Match[bytes]) -> int:
-    if match.start() > 0 and data[match.start() - 1 : match.start()] in CODEX_CLIENT_ID_PRECEDING_TOKEN_BYTES:
+    if (
+        match.start() > 0
+        and data[match.start() - 1 : match.start()] in CODEX_CLIENT_ID_PRECEDING_TOKEN_BYTES
+    ):
         return 0
     strict_start = max(0, match.start() - 256)
     strict_end = min(len(data), match.end() + 256)
@@ -189,7 +192,9 @@ def codex_client_id_match_score(data: bytes, match: re.Match[bytes]) -> int:
         return 0
     if all(term in strict_context for term in CODEX_CLIENT_ID_CONTEXT_TERMS):
         return 100
-    login_context_matches = sum(1 for term in CODEX_CLIENT_ID_LOGIN_CONTEXT_TERMS if term in context)
+    login_context_matches = sum(
+        1 for term in CODEX_CLIENT_ID_LOGIN_CONTEXT_TERMS if term in context
+    )
     if login_context_matches >= 2:
         return 50 + login_context_matches
     return 0

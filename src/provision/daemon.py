@@ -4,16 +4,17 @@ import base64
 import binascii
 import functools
 import hashlib
+import hmac
 import html
-import importlib.resources as package_resources
 import json
 import os
 import pty
 import queue
 import re
-import signal
+import secrets
 import shlex
 import shutil
+import signal
 import socket
 import ssl
 import struct
@@ -28,6 +29,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -45,11 +47,38 @@ from .connector import (
     ConnectorError,
     LocalConnectorHub,
 )
+from .daemon_host import (
+    DEFAULT_DAEMON_HOST,
+    daemon_connect_host,
+    daemon_host_is_loopback,
+    daemon_url_host,
+    normalize_daemon_host,
+)
+from .daemon_logging import configure_daemon_log_rotation
 from .paths import Paths, default_codex_home, launcher_path
+from .permissions import (
+    PERMISSION_CONTROL_MAX_BYTES,
+    PERMISSION_ID_MAX_CHARS,
+    PERMISSION_PATH_MAX_CHARS,
+    PERMISSION_PREVIEW_MAX_CHARS,
+    PERMISSION_REASON_MAX_CHARS,
+    bounded_permission_text,
+)
+from .provider_sessions import ClaudeSessionReader, GrokSessionReader, process_is_running
+from .providers import ProviderError, canonical_provider
+from .proxy_policy import (
+    RESPONSE_HOP_BY_HOP_HEADERS,
+    UPSTREAM_IDENTITY_HEADERS,
+    backend_proxy_prefix,
+    backend_upstream_path,
+    ensure_default_upstream_user_agent,
+    redact_proxy_token,
+    should_forward_incoming_header,
+)
 from .remote import (
     REMOTE_ACTION_PROMPT_MAX_BYTES,
-    REMOTE_DELTA_SYNC_MAX_BYTES,
     REMOTE_DEFAULT_CAPABILITIES,
+    REMOTE_DELTA_SYNC_MAX_BYTES,
     LocalRemoteAgentSocket,
     RemoteActionCache,
     RemoteControlLeases,
@@ -63,57 +92,25 @@ from .remote import (
     compact_json_bytes,
     opaque_identifier,
     remote_discussion_entry,
-    remote_session_id,
     remote_session_audit_ref,
+    remote_session_id,
 )
 from .store import Store, StoreError
+from .ui_assets import UI_ASSETS, dashboard_template, logo_asset_bytes, ui_asset
 
-
-REQUEST_HOP_BY_HOP_HEADERS = {
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "host",
-    "content-length",
-    "authorization",
-}
-
-RESPONSE_HOP_BY_HOP_HEADERS = {
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-}
-
-UPSTREAM_IDENTITY_HEADERS = {
-    "authorization",
-    "chatgpt-account-id",
-    "openai-organization",
-    "openai-project",
-    "x-openai-fedramp",
-}
-DEFAULT_UPSTREAM_USER_AGENT = "OpenAI Codex CLI (Provision local proxy)"
 CODEX_API_POST_PROXY_PATHS = frozenset(
     {
         "/v1/responses",
         "/v1/responses/compact",
+        "/v1/alpha/search",
         "/v1/images/generations",
         "/v1/images/edits",
     }
 )
 
-PROTOCOL_VERSION = 28
-DEFAULT_DAEMON_HOST = "127.0.0.1"
+PROTOCOL_VERSION = 29
 DEFAULT_DAEMON_PORT = 4888
+UI_SESSION_COOKIE = "provision_ui_session"
 CHATGPT_USAGE_PATH = "/wham/usage"
 CHATGPT_ANALYTICS_EVENTS_PATH = "/codex/analytics-events/events"
 USAGE_CACHE_MIN_INTERVAL_SECONDS = 1.0
@@ -132,9 +129,23 @@ RESET_CREDIT_COOLDOWN_SECONDS = 86400.0
 WEBSOCKET_SWITCH_IDLE_SECONDS = 10.0
 WEBSOCKET_COMPLETION_FALLBACK_SECONDS = 180.0
 WEBSOCKET_TOOL_COMPLETION_FALLBACK_SECONDS = 600.0
+# HTTP proxy reads use a 10 minute socket timeout. Keep a modest grace period
+# so an interrupted request cannot hold session state hostage indefinitely.
+STALE_HTTP_REQUEST_SECONDS = 15 * 60
 UI_STATE_CHECK_SECONDS = 1.0
 UI_HEARTBEAT_SECONDS = 15.0
 UI_SAFETY_SNAPSHOT_SECONDS = 60.0
+PROVIDER_SESSION_REFRESH_SECONDS = 0.5
+PROVIDER_TRANSCRIPT_SOURCE_TEXT_LIMIT = 24 * 1024
+PROVIDER_IDENTITY_CACHE_SECONDS = 60.0
+PROVIDER_IDENTITY_ERROR_CACHE_SECONDS = 15.0
+CLAUDE_AUTH_STATUS_TIMEOUT_SECONDS = 3.0
+CLAUDE_AUTH_STATUS_MAX_BYTES = 64 * 1024
+PROVIDER_IDENTITY_TEXT_MAX_CHARS = 320
+PERMISSION_REQUEST_TIMEOUT_SECONDS = 60.0
+PERMISSION_MAX_PENDING = 32
+PERMISSION_RESOLVED_TTL_SECONDS = 5 * 60.0
+PERMISSION_MAX_RESOLVED = 256
 WEBSOCKET_APPLICATION_OPCODES = {0x0, 0x1, 0x2}
 WEBSOCKET_RESPONSE_START_EVENT_TYPES = {
     "response.create",
@@ -217,10 +228,25 @@ RESUME_CANDIDATE_CACHE_SECONDS = 10.0
 APP_SERVER_MODEL_CATALOG_CACHE_SECONDS = 300.0
 APP_SERVER_MODEL_CATALOG_ERROR_BACKOFF_SECONDS = 60.0
 CODEX_RUNTIME_VERSION_RECHECK_SECONDS = 60.0
+# A terminal which has exited should leave enough time for its final events to
+# reach the Discussion view, but it should not remain a dashboard tab for the
+# lifetime of a long-running daemon.  Session history remains available from
+# Codex; this bounds only the daemon's live-observation state.
+OBSERVED_SESSION_RETENTION_SECONDS = 90.0
 UI_LAUNCHER_PERMISSION_PRESETS = {
     "read-only": ("--sandbox", "read-only", "--ask-for-approval", "on-request"),
-    "workspace-write": ("--sandbox", "workspace-write", "--ask-for-approval", "on-request"),
-    "full-access": ("--sandbox", "danger-full-access", "--ask-for-approval", "on-request"),
+    "workspace-write": (
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+    ),
+    "full-access": (
+        "--sandbox",
+        "danger-full-access",
+        "--ask-for-approval",
+        "on-request",
+    ),
     "bypass": ("--dangerously-bypass-approvals-and-sandbox",),
 }
 CODEX_HISTORY_BRIDGE_NAMES = (
@@ -253,13 +279,19 @@ CODEX_HISTORY_BRIDGE_NAMES = (
     ".personality_migration",
 )
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\a]*(?:\a|\x1b\\)")
-ENVIRONMENT_CONTEXT_RE = re.compile(r"\s*<environment_context>.*?</environment_context>\s*", re.DOTALL)
+ENVIRONMENT_CONTEXT_RE = re.compile(
+    r"\s*<environment_context>.*?</environment_context>\s*", re.DOTALL
+)
 CODEX_GOAL_CONTEXT_RE = re.compile(
     r"<codex_internal_context\b(?=[^>]*\bsource\s*=\s*[\"']goal[\"'])[^>]*>.*?</codex_internal_context>",
     re.IGNORECASE | re.DOTALL,
 )
-CODEX_GOAL_OBJECTIVE_RE = re.compile(r"<objective>\s*(.*?)\s*</objective>", re.IGNORECASE | re.DOTALL)
-CONTROL_TRANSCRIPT_EDGE_RE = re.compile(r"^[\s\ufeff\u200b\u200c\u200d]+|[\s\ufeff\u200b\u200c\u200d]+$")
+CODEX_GOAL_OBJECTIVE_RE = re.compile(
+    r"<objective>\s*(.*?)\s*</objective>", re.IGNORECASE | re.DOTALL
+)
+CONTROL_TRANSCRIPT_EDGE_RE = re.compile(
+    r"^[\s\ufeff\u200b\u200c\u200d]+|[\s\ufeff\u200b\u200c\u200d]+$"
+)
 USER_SHELL_COMMAND_RE = re.compile(
     r"<user_shell_command\b[^>]*>(?P<body>.*?)</user_shell_command\s*>",
     re.IGNORECASE | re.DOTALL,
@@ -272,8 +304,12 @@ USER_SHELL_COMMAND_RESULT_RE = re.compile(
     r"<result\b[^>]*>\s*(?P<result>.*?)\s*</result\s*>",
     re.IGNORECASE | re.DOTALL,
 )
-USER_SHELL_RESULT_EXIT_CODE_RE = re.compile(r"^\s*Exit code:\s*(?P<value>.+?)\s*$", re.IGNORECASE | re.MULTILINE)
-USER_SHELL_RESULT_DURATION_RE = re.compile(r"^\s*Duration:\s*(?P<value>.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+USER_SHELL_RESULT_EXIT_CODE_RE = re.compile(
+    r"^\s*Exit code:\s*(?P<value>.+?)\s*$", re.IGNORECASE | re.MULTILINE
+)
+USER_SHELL_RESULT_DURATION_RE = re.compile(
+    r"^\s*Duration:\s*(?P<value>.+?)\s*$", re.IGNORECASE | re.MULTILINE
+)
 USER_SHELL_RESULT_OUTPUT_RE = re.compile(
     r"^\s*Output:\s*(?P<value>.*)$",
     re.IGNORECASE | re.MULTILINE | re.DOTALL,
@@ -283,7 +319,10 @@ DEVICE_CODE_RE = re.compile(r"\b[A-Z0-9]{4,}(?:-[A-Z0-9]{4,})+\b")
 CONTROL_TOOL_CALL_RE = re.compile(r"^ctc_[a-f0-9]{16,}$", re.IGNORECASE)
 WEB_SEARCH_TOOL_CALL_RE = re.compile(r"^ws_[A-Za-z0-9_-]+$", re.IGNORECASE)
 PROGRAMMATIC_TOOL_INVOCATION_RE = re.compile(r"\btools\.([A-Za-z_][A-Za-z0-9_.]*)\s*\(")
-PROGRAMMATIC_TOOL_COMMAND_RE = re.compile(r"[\"']cmd[\"']\s*:\s*(\"(?:\\.|[^\"\\])*\")", re.DOTALL)
+PROGRAMMATIC_TOOL_COMMAND_RE = re.compile(
+    r"(?:[\"']cmd[\"']|\bcmd)\s*:\s*(\"(?:\\.|[^\"\\])*\")",
+    re.DOTALL,
+)
 PROGRAMMATIC_TOOL_PATCH_RE = re.compile(
     r"\b(?:const|let|var)\s+patch\s*=\s*(\"(?:\\.|[^\"\\])*\")",
     re.DOTALL,
@@ -294,6 +333,40 @@ PROGRAMMATIC_TOOL_PLAN_STEP_RE = re.compile(
     re.DOTALL,
 )
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+TOOL_TRANSCRIPT_SECTION_LABELS = frozenset(
+    {
+        "agent path",
+        "agent states",
+        "agent thread",
+        "arguments",
+        "caller",
+        "code",
+        "content",
+        "details",
+        "error",
+        "fingerprint",
+        "fragments",
+        "input",
+        "message",
+        "model",
+        "output",
+        "parameters",
+        "patch",
+        "prompt",
+        "query",
+        "reasoning",
+        "receiver agents",
+        "receiver threads",
+        "result",
+        "results",
+        "source",
+        "status",
+        "stderr",
+        "stdout",
+        "summary",
+    }
+)
 PROFILE_MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
 REASONING_LEVEL_PATTERN = re.compile(r"^[a-z0-9_-]{1,32}$")
 REASONING_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
@@ -318,7 +391,11 @@ DEFAULT_MODEL_CATALOG = [
         "note": "Latest frontier agentic coding model. Requires Codex CLI 0.144.0 or newer.",
         "minimal_client_version": "0.144.0",
         "service_tiers": [
-            {"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"},
+            {
+                "id": "priority",
+                "name": "Fast",
+                "description": "1.5x speed, increased usage",
+            },
         ],
         "additional_speed_tiers": ["fast"],
     },
@@ -330,7 +407,11 @@ DEFAULT_MODEL_CATALOG = [
         "note": "Balanced agentic coding model for everyday work. Requires Codex CLI 0.144.0 or newer.",
         "minimal_client_version": "0.144.0",
         "service_tiers": [
-            {"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"},
+            {
+                "id": "priority",
+                "name": "Fast",
+                "description": "1.5x speed, increased usage",
+            },
         ],
         "additional_speed_tiers": ["fast"],
     },
@@ -342,7 +423,11 @@ DEFAULT_MODEL_CATALOG = [
         "note": "Fast and affordable agentic coding model. Requires Codex CLI 0.144.0 or newer.",
         "minimal_client_version": "0.144.0",
         "service_tiers": [
-            {"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"},
+            {
+                "id": "priority",
+                "name": "Fast",
+                "description": "1.5x speed, increased usage",
+            },
         ],
         "additional_speed_tiers": ["fast"],
     },
@@ -354,7 +439,11 @@ DEFAULT_MODEL_CATALOG = [
         "note": "Frontier model for complex coding, research, and real-world work.",
         "minimal_client_version": "0.124.0",
         "service_tiers": [
-            {"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"},
+            {
+                "id": "priority",
+                "name": "Fast",
+                "description": "1.5x speed, increased usage",
+            },
         ],
         "additional_speed_tiers": ["fast"],
     },
@@ -366,7 +455,11 @@ DEFAULT_MODEL_CATALOG = [
         "note": "Strong model for everyday coding.",
         "minimal_client_version": "0.98.0",
         "service_tiers": [
-            {"id": "priority", "name": "Fast", "description": "1.5x speed, increased usage"},
+            {
+                "id": "priority",
+                "name": "Fast",
+                "description": "1.5x speed, increased usage",
+            },
         ],
         "additional_speed_tiers": ["fast"],
     },
@@ -445,41 +538,6 @@ class WebSocketHandshakeRejected(RuntimeError):
 
 class WebSocketClosed(RuntimeError):
     pass
-
-
-def should_forward_incoming_header(name: str) -> bool:
-    lower = name.lower()
-    return lower not in REQUEST_HOP_BY_HOP_HEADERS and lower not in UPSTREAM_IDENTITY_HEADERS
-
-
-def ensure_default_upstream_user_agent(headers: dict[str, str]) -> dict[str, str]:
-    if not any(key.lower() == "user-agent" for key in headers):
-        headers["User-Agent"] = DEFAULT_UPSTREAM_USER_AGENT
-    return headers
-
-
-def backend_proxy_prefix(proxy_token: str | None = None) -> str:
-    if proxy_token:
-        return f"/backend-api/provision-{proxy_token}"
-    return "/backend-api/provision"
-
-
-def backend_upstream_path(path: str, proxy_token: str) -> str:
-    for prefix in (backend_proxy_prefix(proxy_token), backend_proxy_prefix()):
-        if path == prefix:
-            return ""
-        if path.startswith(prefix + "/"):
-            return path[len(prefix):]
-    raise AuthError("invalid ChatGPT backend proxy path token")
-
-
-def redact_proxy_token(text: str, proxy_token: str) -> str:
-    if not proxy_token:
-        return text
-    return text.replace(f"provision-{proxy_token}", "provision-<redacted>").replace(
-        proxy_token,
-        "<redacted>",
-    )
 
 
 def normalize_reasoning_level(value: Any) -> str | None:
@@ -575,6 +633,12 @@ def normalize_codex_model_catalog_item(value: Any) -> dict[str, Any] | None:
     if not isinstance(additional_speed_tiers, list):
         additional_speed_tiers = []
 
+    input_modalities = value.get("input_modalities")
+    if input_modalities is None:
+        input_modalities = value.get("inputModalities")
+    if not isinstance(input_modalities, list):
+        input_modalities = []
+
     return {
         "id": model_id,
         "display": display.strip(),
@@ -582,8 +646,15 @@ def normalize_codex_model_catalog_item(value: Any) -> dict[str, Any] | None:
         "default_reasoning": default_reasoning,
         "note": codex_model_note(value),
         "service_tiers": [tier for tier in service_tiers if isinstance(tier, dict)],
-        "additional_speed_tiers": [tier for tier in additional_speed_tiers if isinstance(tier, str)],
-        "minimal_client_version": first_string_value(value, ("minimal_client_version", "minimalClientVersion")),
+        "additional_speed_tiers": [
+            tier for tier in additional_speed_tiers if isinstance(tier, str)
+        ],
+        "input_modalities": [
+            modality for modality in input_modalities if isinstance(modality, str)
+        ],
+        "minimal_client_version": first_string_value(
+            value, ("minimal_client_version", "minimalClientVersion")
+        ),
         "priority": value.get("priority") if isinstance(value.get("priority"), int) else None,
     }
 
@@ -618,6 +689,91 @@ def subprocess_error_message(error: BaseException) -> str:
     if isinstance(error, subprocess.TimeoutExpired):
         return "command timed out"
     return str(error)
+
+
+def provider_identity_text(value: Any, limit: int = PROVIDER_IDENTITY_TEXT_MAX_CHARS) -> str:
+    """Return a short display-safe identity field without retaining raw output."""
+
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return ""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value)).strip()
+    return text[:limit]
+
+
+def normalize_claude_auth_status(value: Any) -> dict[str, Any]:
+    """Allowlist the documented, non-secret portion of ``claude auth status``."""
+
+    if not isinstance(value, dict):
+        return {
+            "available": False,
+            "logged_in": None,
+            "status": "Authentication status unavailable",
+        }
+    logged_in_value = value.get("loggedIn")
+    logged_in = logged_in_value if isinstance(logged_in_value, bool) else None
+    status = (
+        "Logged in"
+        if logged_in is True
+        else "Not logged in"
+        if logged_in is False
+        else "Authentication status unavailable"
+    )
+    return {
+        "available": logged_in is not None,
+        "logged_in": logged_in,
+        "status": status,
+        "auth_method": provider_identity_text(value.get("authMethod"), 80),
+        "api_provider": provider_identity_text(value.get("apiProvider"), 80),
+        "email": provider_identity_text(value.get("email")),
+        "organization": provider_identity_text(value.get("orgName")),
+        "subscription": provider_identity_text(value.get("subscriptionType"), 120),
+    }
+
+
+def claude_auth_status_probe(config_dir: Path | None = None) -> dict[str, Any]:
+    """Read Claude's supported JSON auth summary for one effective profile root."""
+
+    executable = shutil.which("claude")
+    if not executable:
+        return {
+            "available": False,
+            "logged_in": None,
+            "status": "Claude CLI unavailable",
+        }
+    env = os.environ.copy()
+    if config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    try:
+        result = subprocess.run(
+            [executable, "auth", "status", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=CLAUDE_AUTH_STATUS_TIMEOUT_SECONDS,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return {
+            "available": False,
+            "logged_in": None,
+            "status": "Authentication status unavailable",
+        }
+    encoded = result.stdout.encode("utf-8", errors="replace")
+    if not encoded or len(encoded) > CLAUDE_AUTH_STATUS_MAX_BYTES:
+        return {
+            "available": False,
+            "logged_in": None,
+            "status": "Authentication status unavailable",
+        }
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {
+            "available": False,
+            "logged_in": None,
+            "status": "Authentication status unavailable",
+        }
+    return normalize_claude_auth_status(value)
 
 
 def codex_cli_version_probe() -> dict[str, Any]:
@@ -670,6 +826,23 @@ def codex_runtime_version() -> dict[str, Any]:
     with _codex_runtime_version_lock:
         _codex_runtime_version_cache = (now, dict(value))
     return value
+
+
+def reported_codex_cli(compatibility: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the best available CLI identity for user-facing status.
+
+    ``cli`` is intentionally frozen when the daemon starts so we can tell the
+    user a restart is needed.  It is not, however, the version currently
+    installed on disk.  Prefer the periodically refreshed probe in displays
+    while preserving the startup value in the compatibility payload.
+    """
+    if not isinstance(compatibility, dict):
+        return {}
+    runtime = compatibility.get("runtime_cli")
+    if isinstance(runtime, dict) and isinstance(runtime.get("version"), str):
+        return runtime
+    startup = compatibility.get("cli")
+    return startup if isinstance(startup, dict) else {}
 
 
 def codex_restart_requirement(
@@ -743,8 +916,13 @@ APP_SERVER_CAPABILITY_METHODS = {
     "model_provider_capabilities_read": "modelProvider/capabilities/read",
     "model_verification": "model/verification",
     "thread_list": "thread/list",
+    "thread_search": "thread/search",
+    "thread_search_occurrences": "thread/searchOccurrences",
     "thread_read": "thread/read",
     "thread_resume": "thread/resume",
+    "thread_turns_list": "thread/turns/list",
+    "thread_items_list": "thread/items/list",
+    "thread_metadata_update": "thread/metadata/update",
     "thread_settings_update": "thread/settings/update",
     "thread_settings_updated": "thread/settings/updated",
     "thread_status_changed": "thread/status/changed",
@@ -787,6 +965,13 @@ APP_SERVER_CAPABILITY_GROUPS = {
         "thread_settings_update",
         "thread_settings_updated",
         "thread_status_changed",
+    ),
+    "history": (
+        "thread_search",
+        "thread_search_occurrences",
+        "thread_turns_list",
+        "thread_items_list",
+        "thread_metadata_update",
     ),
     "token_usage": ("thread_token_usage_updated",),
     "turn": (
@@ -875,9 +1060,13 @@ def codex_app_server_schema_probe() -> dict[str, Any]:
                 text=True,
                 timeout=CODEX_APP_SERVER_SCHEMA_TIMEOUT_SECONDS,
             )
-            schema_files = sorted(path.relative_to(out_dir).as_posix() for path in out_dir.rglob("*.json"))
+            schema_files = sorted(
+                path.relative_to(out_dir).as_posix() for path in out_dir.rglob("*.json")
+            )
             client_request = out_dir / "ClientRequest.json"
-            schema_text = client_request.read_text(encoding="utf-8") if client_request.exists() else ""
+            schema_text = (
+                client_request.read_text(encoding="utf-8") if client_request.exists() else ""
+            )
             schema_text += "\n".join(
                 path.read_text(encoding="utf-8", errors="ignore")
                 for path in out_dir.rglob("*.json")
@@ -901,12 +1090,16 @@ def codex_app_server_schema_probe() -> dict[str, Any]:
             "error": subprocess_error_message(exc),
         }
 
-    methods = {name: method in schema_text for name, method in APP_SERVER_CAPABILITY_METHODS.items()}
+    methods = {
+        name: method in schema_text for name, method in APP_SERVER_CAPABILITY_METHODS.items()
+    }
     response_types = {
         "rate_limits_response": "v2/GetAccountRateLimitsResponse.json" in schema_files,
         "usage_response": "v2/GetAccountTokenUsageResponse.json" in schema_files,
-        "reset_credit_response": "v2/ConsumeAccountRateLimitResetCreditResponse.json" in schema_files,
+        "reset_credit_response": "v2/ConsumeAccountRateLimitResetCreditResponse.json"
+        in schema_files,
         "reset_credit_summary": "v2/RateLimitResetCreditsSummary.json" in schema_files,
+        "raw_response_completed": "v2/RawResponseCompletedNotification.json" in schema_files,
     }
     available = (
         methods["account_rate_limits"]
@@ -966,7 +1159,9 @@ class CodexAppServerClient:
         )
         if self.process.stdin is None or self.process.stdout is None:
             raise CodexAppServerError("codex app-server did not expose stdio")
-        self._reader = threading.Thread(target=self._read_stdout, name="provision-codex-app-server", daemon=True)
+        self._reader = threading.Thread(
+            target=self._read_stdout, name="provision-codex-app-server", daemon=True
+        )
         self._reader.start()
         self.initialize()
 
@@ -1070,21 +1265,103 @@ class CodexAppServerClient:
             raise CodexAppServerError("account/usage/read returned a non-object result")
         return result
 
-    def consume_account_rate_limit_reset_credit(self, idempotency_key: str) -> dict[str, Any]:
+    def consume_account_rate_limit_reset_credit(
+        self,
+        idempotency_key: str,
+        *,
+        credit_id: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, str] = {"idempotencyKey": idempotency_key}
+        if isinstance(credit_id, str) and credit_id:
+            params["creditId"] = credit_id
         result = self.request(
             "account/rateLimitResetCredit/consume",
-            {"idempotencyKey": idempotency_key},
+            params,
         )
         if not isinstance(result, dict):
-            raise CodexAppServerError("account/rateLimitResetCredit/consume returned a non-object result")
+            raise CodexAppServerError(
+                "account/rateLimitResetCredit/consume returned a non-object result"
+            )
         return result
 
-    def list_threads(self, *, limit: int = 25) -> Any:
+    def list_threads(
+        self,
+        *,
+        limit: int = 25,
+        cursor: str | None = None,
+        is_pinned: bool | None = None,
+    ) -> Any:
         params: dict[str, Any] = {
             "limit": limit,
             "sortKey": "updated_at",
         }
+        if cursor:
+            params["cursor"] = cursor
+        if isinstance(is_pinned, bool):
+            params["isPinned"] = is_pinned
         return self.request("thread/list", params)
+
+    def list_thread_turns(
+        self,
+        thread_id: str,
+        *,
+        limit: int = 25,
+        cursor: str | None = None,
+        sort_direction: str = "desc",
+        items_view: str = "summary",
+    ) -> Any:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "limit": limit,
+            "sortDirection": sort_direction,
+            "itemsView": items_view,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        return self.request("thread/turns/list", params)
+
+    def list_thread_items(
+        self,
+        thread_id: str,
+        *,
+        turn_id: str | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+        sort_direction: str = "asc",
+    ) -> Any:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "limit": limit,
+            "sortDirection": sort_direction,
+        }
+        if turn_id:
+            params["turnId"] = turn_id
+        if cursor:
+            params["cursor"] = cursor
+        return self.request("thread/items/list", params)
+
+    def search_thread_occurrences(
+        self,
+        thread_id: str,
+        search_term: str,
+        *,
+        limit: int = 25,
+        cursor: str | None = None,
+    ) -> Any:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "searchTerm": search_term,
+            "limit": limit,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        return self.request("thread/searchOccurrences", params)
+
+    def update_thread_pin(self, thread_id: str, *, is_pinned: bool) -> Any:
+        return self.request(
+            "thread/metadata/update",
+            {"threadId": thread_id, "isPinned": is_pinned},
+        )
 
     def list_models(self) -> Any:
         return self.request("model/list", {})
@@ -1247,10 +1524,7 @@ def resume_candidate_text_is_useful(text: str) -> bool:
     identity = transcript_identity_text(text).lower()
     if not identity:
         return False
-    return not any(
-        identity.startswith(prefix)
-        for prefix in RESUME_CANDIDATE_INSTRUCTION_PREFIXES
-    )
+    return not any(identity.startswith(prefix) for prefix in RESUME_CANDIDATE_INSTRUCTION_PREFIXES)
 
 
 def resume_candidate_label_from_text(text: str) -> str:
@@ -1447,7 +1721,9 @@ def codex_history_entry(
     return entry
 
 
-def codex_history_entries_from_response_item(payload: dict[str, Any], timestamp: str) -> list[dict[str, Any]]:
+def codex_history_entries_from_response_item(
+    payload: dict[str, Any], timestamp: str
+) -> list[dict[str, Any]]:
     item_type = str(payload.get("type") or "")
     source_turn_id = codex_history_source_turn_id(payload)
     if item_type == "message":
@@ -1471,9 +1747,11 @@ def codex_history_entries_from_response_item(payload: dict[str, Any], timestamp:
         return []
     if item_type == "reasoning":
         text = codex_history_summary_text(payload.get("summary") or payload.get("content"))
-        return [
-            codex_history_entry("assistant_progress", text, timestamp, turn_id=source_turn_id)
-        ] if text else []
+        return (
+            [codex_history_entry("assistant_progress", text, timestamp, turn_id=source_turn_id)]
+            if text
+            else []
+        )
     tool_entry = tool_activity_entry_from_value(payload)
     if tool_entry:
         return [
@@ -1488,17 +1766,25 @@ def codex_history_entries_from_response_item(payload: dict[str, Any], timestamp:
     return []
 
 
-def codex_history_entries_from_event_msg(payload: dict[str, Any], timestamp: str) -> list[dict[str, Any]]:
+def codex_history_entries_from_event_msg(
+    payload: dict[str, Any], timestamp: str
+) -> list[dict[str, Any]]:
     event_type = str(payload.get("type") or "")
     source_turn_id = codex_history_source_turn_id(payload)
     if event_type == "agent_reasoning":
         text = clean_transcript_text(str(payload.get("text") or ""))
-        return [
-            codex_history_entry("assistant_progress", text, timestamp, turn_id=source_turn_id)
-        ] if text else []
+        return (
+            [codex_history_entry("assistant_progress", text, timestamp, turn_id=source_turn_id)]
+            if text
+            else []
+        )
     if event_type in {"agent_message", "assistant_message"}:
         text = clean_transcript_text(str(payload.get("message") or payload.get("text") or ""))
-        return [codex_history_entry("assistant", text, timestamp, turn_id=source_turn_id)] if text else []
+        return (
+            [codex_history_entry("assistant", text, timestamp, turn_id=source_turn_id)]
+            if text
+            else []
+        )
     return []
 
 
@@ -1566,11 +1852,34 @@ def codex_history_turns_from_session_file(path: Path) -> list[dict[str, Any]]:
             for index, item in enumerate(transcript):
                 item["control_index"] = index
             current["search_text"] = transcript_identity_text(
-                " ".join(str(item.get("full_text") or item.get("text") or "") for item in transcript)
+                " ".join(
+                    str(item.get("full_text") or item.get("text") or "") for item in transcript
+                )
             )[:CONTROL_HISTORY_TURN_SEARCH_TEXT_LIMIT]
             current["end_index"] = max(0, len(transcript) - 1)
         turns.append(current)
         current = None
+
+    def append_current_entry(entry: dict[str, Any]) -> None:
+        if current is None:
+            return
+        transcript = current["transcript"]
+        call_id = str(entry.get("call_id") or "")
+        if entry.get("role") == "tool" and call_id:
+            for existing in reversed(transcript):
+                if existing.get("role") != "tool" or existing.get("call_id") != call_id:
+                    continue
+                existing_text = str(existing.get("full_text") or existing.get("text") or "")
+                merged = merge_tool_transcript_text(existing_text, str(entry.get("text") or ""))
+                display, truncated = codex_history_display_text(merged)
+                existing["text"] = display
+                existing["full_text"] = merged
+                existing["truncated"] = truncated
+                if entry.get("ts"):
+                    existing["updated_at"] = str(entry["ts"])
+                    current["updated_at"] = str(entry["ts"])
+                return
+        transcript.append(codex_history_transcript_item(entry, turn_key=str(current["key"])))
 
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -1588,9 +1897,7 @@ def codex_history_turns_from_session_file(path: Path) -> list[dict[str, Any]]:
                         if current is None:
                             pending_context.append(entry)
                         else:
-                            current["transcript"].append(
-                                codex_history_transcript_item(entry, turn_key=str(current["key"]))
-                            )
+                            append_current_entry(entry)
                         continue
                     if role == "user":
                         if not codex_history_user_text_is_prompt(text):
@@ -1624,13 +1931,13 @@ def codex_history_turns_from_session_file(path: Path) -> list[dict[str, Any]]:
                                 )
                             )
                         pending_context = []
-                        current["transcript"].append(codex_history_transcript_item(entry, turn_key=turn_key))
+                        current["transcript"].append(
+                            codex_history_transcript_item(entry, turn_key=turn_key)
+                        )
                         continue
                     if current is None:
                         continue
-                    current["transcript"].append(
-                        codex_history_transcript_item(entry, turn_key=str(current["key"]))
-                    )
+                    append_current_entry(entry)
                     if entry.get("ts"):
                         current["updated_at"] = str(entry.get("ts") or "")
     except OSError:
@@ -1668,7 +1975,9 @@ def control_turn_timestamp(value: Any) -> float | None:
         return None
 
 
-def history_turn_duplicates_observed(history_turn: dict[str, Any], observed_turn: dict[str, Any]) -> bool:
+def history_turn_duplicates_observed(
+    history_turn: dict[str, Any], observed_turn: dict[str, Any]
+) -> bool:
     history_id = str(history_turn.get("turn_id") or "")
     observed_id = str(observed_turn.get("turn_id") or "")
     if history_id and observed_id and not history_id.startswith("history:"):
@@ -1743,7 +2052,9 @@ def codex_history_turn_payload_for_cwd(
             turn["archived"] = archived
             metadata = codex_history_turn_metadata(turn)
             metadata["loaded"] = True
-            transcript = [dict(item) for item in turn.get("transcript") or [] if isinstance(item, dict)]
+            transcript = [
+                dict(item) for item in turn.get("transcript") or [] if isinstance(item, dict)
+            ]
             for index, item in enumerate(transcript):
                 item["control_index"] = index
             return {
@@ -1774,7 +2085,11 @@ def codex_compatibility_payload() -> dict[str, Any]:
 
 def load_codex_model_catalog() -> tuple[dict[str, Any], ...]:
     catalog = codex_model_catalog_probe().get("catalog")
-    return catalog if isinstance(catalog, tuple) else tuple(dict(item) for item in DEFAULT_MODEL_CATALOG)
+    return (
+        catalog
+        if isinstance(catalog, tuple)
+        else tuple(dict(item) for item in DEFAULT_MODEL_CATALOG)
+    )
 
 
 def model_catalog() -> list[dict[str, Any]]:
@@ -1951,7 +2266,10 @@ def billing_required_message(error: BaseException | str | None = None) -> str:
         "Billing required: this Codex CLI profile returned HTTP 402 Payment Required. "
         "Provision has paused automatic quota refreshes for this profile."
     )
-    if not detail or detail.lower() in {"http error 402: payment required", "payment required"}:
+    if not detail or detail.lower() in {
+        "http error 402: payment required",
+        "payment required",
+    }:
         return base
     return f"{base} Upstream detail: {detail}"
 
@@ -1991,7 +2309,7 @@ def decode_project_session_sentinel(value: str, proxy_token: str) -> dict[str, s
     prefix = sentinel + "."
     if not value.startswith(prefix):
         return None
-    raw = value[len(prefix):]
+    raw = value[len(prefix) :]
     try:
         decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8")
         payload = json.loads(decoded)
@@ -2003,7 +2321,11 @@ def decode_project_session_sentinel(value: str, proxy_token: str) -> dict[str, s
     if not isinstance(cwd, str) or not cwd:
         return {}
     raw_key = payload.get("key")
-    key = normalize_session_key(raw_key) if isinstance(raw_key, str) and raw_key else normalize_session_key(cwd)
+    key = (
+        normalize_session_key(raw_key)
+        if isinstance(raw_key, str) and raw_key
+        else normalize_session_key(cwd)
+    )
     return {"key": key, "cwd": cwd} if key else {}
 
 
@@ -2020,7 +2342,7 @@ def compact_session_path(cwd: str) -> str:
     if normalized == home:
         return "~"
     if normalized.startswith(home + os.sep):
-        return "~" + normalized[len(home):]
+        return "~" + normalized[len(home) :]
     return normalized
 
 
@@ -2033,36 +2355,6 @@ def session_display_name(cwd: str) -> str:
 def websocket_accept_key(key: str) -> str:
     digest = hashlib.sha1((key.strip() + WEBSOCKET_GUID).encode("ascii")).digest()
     return base64.b64encode(digest).decode("ascii")
-
-
-def normalize_daemon_host(host: str | None) -> str:
-    value = (host or DEFAULT_DAEMON_HOST).strip()
-    return value or DEFAULT_DAEMON_HOST
-
-
-def daemon_connect_host(host: str | None) -> str:
-    value = normalize_daemon_host(host)
-    if value in {"0.0.0.0", "::", "[::]"}:
-        return DEFAULT_DAEMON_HOST
-    return value
-
-
-def daemon_url_host(host: str | None) -> str:
-    value = daemon_connect_host(host)
-    if ":" in value and not value.startswith("["):
-        return f"[{value}]"
-    return value
-
-
-def daemon_bind_host(host: str | None) -> str:
-    value = normalize_daemon_host(host)
-    if ":" in value and not value.startswith("["):
-        return f"[{value}]"
-    return value
-
-
-def daemon_bind_address(host: str | None, port: object) -> str:
-    return f"{daemon_bind_host(host)}:{port}"
 
 
 def websocket_handshake_status(response: bytes) -> int | None:
@@ -2092,12 +2384,12 @@ def websocket_chunk_has_application_data(data: bytes) -> bool:
         if length == 126:
             if offset + 4 > len(data):
                 return False
-            length = struct.unpack("!H", data[offset + 2:offset + 4])[0]
+            length = struct.unpack("!H", data[offset + 2 : offset + 4])[0]
             header_length = 4
         elif length == 127:
             if offset + 10 > len(data):
                 return False
-            length = struct.unpack("!Q", data[offset + 2:offset + 10])[0]
+            length = struct.unpack("!Q", data[offset + 2 : offset + 10])[0]
             header_length = 10
         if second & 0x80:
             header_length += 4
@@ -2157,25 +2449,25 @@ class WebSocketMessageTracker:
         if length == 126:
             if len(self.buffer) - cursor < 2:
                 return None
-            length = struct.unpack("!H", self.buffer[cursor:cursor + 2])[0]
+            length = struct.unpack("!H", self.buffer[cursor : cursor + 2])[0]
             cursor += 2
         elif length == 127:
             if len(self.buffer) - cursor < 8:
                 return None
-            length = struct.unpack("!Q", self.buffer[cursor:cursor + 8])[0]
+            length = struct.unpack("!Q", self.buffer[cursor : cursor + 8])[0]
             cursor += 8
 
         mask = b""
         if masked:
             if len(self.buffer) - cursor < 4:
                 return None
-            mask = bytes(self.buffer[cursor:cursor + 4])
+            mask = bytes(self.buffer[cursor : cursor + 4])
             cursor += 4
 
         if len(self.buffer) - cursor < length:
             return None
 
-        payload = bytes(self.buffer[cursor:cursor + length])
+        payload = bytes(self.buffer[cursor : cursor + length])
         if mask:
             payload = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
         return cursor + length - offset, fin, opcode, payload
@@ -2278,19 +2570,19 @@ class WebSocketMessageRewriter:
         if length == 126:
             if len(self.buffer) - cursor < 2:
                 return None
-            length = struct.unpack("!H", self.buffer[cursor:cursor + 2])[0]
+            length = struct.unpack("!H", self.buffer[cursor : cursor + 2])[0]
             cursor += 2
         elif length == 127:
             if len(self.buffer) - cursor < 8:
                 return None
-            length = struct.unpack("!Q", self.buffer[cursor:cursor + 8])[0]
+            length = struct.unpack("!Q", self.buffer[cursor : cursor + 8])[0]
             cursor += 8
 
         mask = b""
         if masked:
             if len(self.buffer) - cursor < 4:
                 return None
-            mask = bytes(self.buffer[cursor:cursor + 4])
+            mask = bytes(self.buffer[cursor : cursor + 4])
             cursor += 4
 
         if len(self.buffer) - cursor < length:
@@ -2455,6 +2747,19 @@ def response_create_payload_session(value: Any) -> dict[str, str] | None:
     return None
 
 
+TERMINAL_ESCAPE_SEQUENCE_RE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[ -/]*[@-~])"
+)
+
+
+def terminal_display_text(value: bytes, *, limit: int = 16 * 1024) -> str:
+    """Produce safe, bounded plain text for the local terminal-tail view."""
+    text = value.decode("utf-8", errors="replace")
+    text = TERMINAL_ESCAPE_SEQUENCE_RE.sub("", text)
+    text = "".join(character for character in text if character in "\n\r\t" or ord(character) >= 32)
+    return text[-limit:]
+
+
 def clean_transcript_text(value: str, *, preserve_edges: bool = False) -> str:
     text = value.replace("\r\n", "\n").replace("\r", "\n")
     if not text.strip():
@@ -2481,8 +2786,7 @@ def transcript_text_from_content(value: Any, *, preserve_edges: bool = False) ->
         return clean_transcript_text(value, preserve_edges=preserve_edges)
     if isinstance(value, list):
         pieces = [
-            transcript_text_from_content(item, preserve_edges=preserve_edges)
-            for item in value
+            transcript_text_from_content(item, preserve_edges=preserve_edges) for item in value
         ]
         return "\n".join(piece for piece in pieces if piece)
     if not isinstance(value, dict):
@@ -2738,10 +3042,7 @@ def split_user_entries_by_prompt_suffix(
 
 def output_text_from_response(value: Any, *, preserve_edges: bool = False) -> str:
     if isinstance(value, list):
-        pieces = [
-            output_text_from_response(item, preserve_edges=preserve_edges)
-            for item in value
-        ]
+        pieces = [output_text_from_response(item, preserve_edges=preserve_edges) for item in value]
         return "\n".join(piece for piece in pieces if piece)
     if not isinstance(value, dict):
         return ""
@@ -2838,9 +3139,469 @@ def compact_tool_detail(value: Any) -> str:
     return clean_transcript_text(encoded)
 
 
+def provider_update_timestamp(value: Any) -> str:
+    """Normalize a provider event timestamp for Discussion rendering."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return (
+                datetime.fromtimestamp(float(value), timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+        except (OverflowError, OSError, ValueError):
+            return ""
+    return ""
+
+
+def grok_update_payload(value: Any) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    if not isinstance(value, dict):
+        return "", {}, {}
+    params = value.get("params")
+    if not isinstance(params, dict):
+        return "", {}, {}
+    update = params.get("update")
+    if not isinstance(update, dict):
+        return "", params, {}
+    return str(update.get("sessionUpdate") or ""), params, update
+
+
+GROK_USAGE_FIELDS = (
+    "inputTokens",
+    "outputTokens",
+    "totalTokens",
+    "cachedReadTokens",
+    "cacheCreationTokens",
+    "reasoningTokens",
+    "modelCalls",
+    "apiDurationMs",
+    "costUsdTicks",
+    "numTurns",
+)
+
+
+def normalize_grok_turn_usage(value: Any) -> dict[str, int]:
+    """Keep the documented numeric portion of a Grok turn usage packet.
+
+    Grok's ``turn_completed`` session update reports work performed for that
+    turn.  It is useful provider usage, but it is intentionally not treated as
+    an account quota or accumulated across turns.
+    """
+    if not isinstance(value, dict):
+        return {}
+    usage: dict[str, int] = {}
+    for field in GROK_USAGE_FIELDS:
+        raw = value.get(field)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            continue
+        if raw < 0:
+            continue
+        usage[field] = int(raw)
+    return usage
+
+
+def grok_content_text(value: Any) -> str:
+    if (
+        isinstance(value, dict)
+        and value.get("type") == "text"
+        and isinstance(value.get("text"), str)
+    ):
+        text = clean_transcript_text(value["text"], preserve_edges=True)
+        return text[:PROVIDER_TRANSCRIPT_SOURCE_TEXT_LIMIT]
+    text = transcript_text_from_content(value, preserve_edges=True)
+    return (text or compact_tool_detail(value))[:PROVIDER_TRANSCRIPT_SOURCE_TEXT_LIMIT]
+
+
+PROVIDER_TOOL_INPUT_LIMIT = 8 * 1024
+PROVIDER_TOOL_OUTPUT_LIMIT = 12 * 1024
+PROVIDER_TOOL_PATCH_LIMIT = 16 * 1024
+
+
+def bounded_provider_tool_text(value: Any, limit: int) -> str:
+    text = clean_transcript_text(str(value or ""), preserve_edges=True)
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n…[truncated]"
+
+
+def provider_tool_header(
+    name: str,
+    *,
+    status: str = "",
+    exit_code: Any = "",
+    duration: Any = "",
+) -> str:
+    suffixes = []
+    if status:
+        suffixes.append(f"status {status}")
+    if exit_code != "" and exit_code is not None:
+        suffixes.append(f"exit {exit_code}")
+    if duration != "" and duration is not None:
+        try:
+            duration_text = f"{float(duration):.1f}s"
+        except (TypeError, ValueError):
+            duration_text = str(duration)
+        suffixes.append(f"duration {duration_text}")
+    header = f"Tool: {name or 'tool'}"
+    return f"{header} ({', '.join(suffixes)})" if suffixes else header
+
+
+def grok_diff_patch(value: Any) -> tuple[str, str]:
+    if not isinstance(value, list):
+        return "", ""
+    pieces = ["*** Begin Patch"]
+    summaries: list[str] = []
+    found = False
+    for item in value:
+        if not isinstance(item, dict) or str(item.get("type") or "") != "diff":
+            continue
+        path = str(item.get("path") or "")
+        if not path:
+            continue
+        old = str(item.get("oldText") or "")
+        new = str(item.get("newText") or "")
+        operation = "Update"
+        if not old:
+            operation = "Add"
+        elif not new:
+            operation = "Delete"
+        pieces.append(f"*** {operation} File: {path}")
+        pieces.append("@@")
+        pieces.extend(f"-{line}" for line in old.splitlines())
+        pieces.extend(f"+{line}" for line in new.splitlines())
+        added = len(new.splitlines())
+        deleted = len(old.splitlines())
+        summaries.append(f"{operation.lower()} {path} (+{added}/-{deleted})")
+        found = True
+    if not found:
+        return "", ""
+    pieces.append("*** End Patch")
+    return (
+        bounded_provider_tool_text("\n".join(pieces), PROVIDER_TOOL_PATCH_LIMIT),
+        "; ".join(summaries),
+    )
+
+
+def grok_tool_input_text(value: Any, name: str) -> str:
+    if not isinstance(value, dict):
+        return bounded_provider_tool_text(compact_tool_detail(value), PROVIDER_TOOL_INPUT_LIMIT)
+    normalized_name = name.lower()
+    compact = dict(value)
+    if normalized_name in {"edit", "write", "search_replace"}:
+        for key in ("content", "old_string", "new_string", "oldText", "newText"):
+            content = compact.pop(key, None)
+            if isinstance(content, str):
+                compact[f"{key}_chars"] = len(content)
+    if normalized_name in {"bash", "run_terminal_command"}:
+        compact.pop("command", None)
+        compact.pop("description", None)
+    return bounded_provider_tool_text(compact_tool_detail(compact), PROVIDER_TOOL_INPUT_LIMIT)
+
+
+def grok_search_result_text(raw_output: dict[str, Any]) -> str:
+    matches = raw_output.get("file_matches")
+    if not isinstance(matches, list):
+        return ""
+    lines = [f"{int(raw_output.get('match_count') or 0)} matches"]
+    for file_match in matches[:8]:
+        if not isinstance(file_match, dict):
+            continue
+        path = str(file_match.get("path") or "")
+        if path:
+            lines.append(path)
+        entries = file_match.get("matches")
+        if isinstance(entries, list):
+            for entry in entries[:4]:
+                if not isinstance(entry, dict):
+                    continue
+                number = entry.get("line_number")
+                content = str(entry.get("content") or "").strip()
+                lines.append(f"  {number}: {content}" if number else f"  {content}")
+            if len(entries) > 4:
+                lines.append(f"  … {len(entries) - 4} more matches in this file")
+    if len(matches) > 8:
+        lines.append(f"… {len(matches) - 8} more files")
+    return bounded_provider_tool_text("\n".join(lines), PROVIDER_TOOL_OUTPUT_LIMIT)
+
+
+def update_grok_tool_state(
+    state: dict[str, Any],
+    update: dict[str, Any],
+    *,
+    name: str,
+) -> None:
+    state["name"] = state.get("name") or name or "tool"
+    update_title = str(update.get("title") or "").strip()
+    if update_title and update_title != state["name"]:
+        state["summary"] = update_title
+    update_kind = str(update.get("kind") or "").strip()
+    if update_kind:
+        state["kind"] = update_kind
+    metadata = update.get("_meta")
+    tool_metadata = metadata.get("x.ai/tool") if isinstance(metadata, dict) else None
+    if isinstance(tool_metadata, dict):
+        if tool_metadata.get("kind"):
+            state["kind"] = str(tool_metadata["kind"])
+        if tool_metadata.get("label") and not state.get("label"):
+            state["label"] = str(tool_metadata["label"])
+
+    raw_input = update.get("rawInput")
+    if raw_input is not None:
+        state["input_text"] = grok_tool_input_text(raw_input, str(state["name"]))
+        if isinstance(raw_input, dict):
+            command = raw_input.get("command") or raw_input.get("cmd")
+            if isinstance(command, str) and command.strip():
+                state["command"] = command.strip()
+            description = raw_input.get("description")
+            if isinstance(description, str) and description.strip():
+                state["description"] = description.strip()
+            if state["name"] in {"write", "search_replace"}:
+                path = str(raw_input.get("file_path") or raw_input.get("path") or "")
+                old = str(raw_input.get("old_string") or "")
+                new = str(raw_input.get("new_string") or raw_input.get("content") or "")
+                if path and (old or new):
+                    patch, summary = grok_diff_patch(
+                        [{"type": "diff", "path": path, "oldText": old, "newText": new}]
+                    )
+                    state["patch"] = patch
+                    state["summary"] = state.get("summary") or summary
+
+    content = update.get("content")
+    patch, patch_summary = grok_diff_patch(content)
+    if patch:
+        state["patch"] = patch
+        state["summary"] = state.get("summary") or patch_summary
+    elif content is not None:
+        content_text = grok_content_text(content)
+        if content_text:
+            state["output_text"] = bounded_provider_tool_text(
+                content_text, PROVIDER_TOOL_OUTPUT_LIMIT
+            )
+
+    raw_output = update.get("rawOutput")
+    raw_type = str(raw_output.get("type") or "") if isinstance(raw_output, dict) else ""
+    if isinstance(raw_output, dict):
+        if raw_type == "Bash":
+            state["command"] = str(raw_output.get("command") or state.get("command") or "")
+            state["description"] = str(
+                raw_output.get("description") or state.get("description") or ""
+            )
+            state["cwd"] = str(raw_output.get("current_dir") or state.get("cwd") or "")
+            state["exit_code"] = raw_output.get("exit_code")
+            state["output_file"] = str(raw_output.get("output_file") or "")
+            state["truncated"] = bool(raw_output.get("truncated"))
+            if not state.get("output_text") and isinstance(
+                raw_output.get("output_for_prompt"), str
+            ):
+                state["output_text"] = bounded_provider_tool_text(
+                    raw_output["output_for_prompt"], PROVIDER_TOOL_OUTPUT_LIMIT
+                )
+        elif raw_type == "BackgroundTaskStarted":
+            state["background"] = True
+            state["status"] = "backgrounded"
+            task = raw_output.get("BackgroundTaskStarted")
+            if isinstance(task, dict):
+                state["output_file"] = str(task.get("output_file") or "")
+        elif raw_type == "TaskOutput":
+            result = raw_output.get("Result")
+            if isinstance(result, dict):
+                state["command"] = str(result.get("command") or state.get("command") or "")
+                state["exit_code"] = result.get("exit_code")
+                state["duration"] = result.get("duration_secs")
+                state["output_file"] = str(result.get("output_file") or "")
+                state["truncated"] = bool(result.get("truncated"))
+                if isinstance(result.get("output"), str):
+                    state["output_text"] = bounded_provider_tool_text(
+                        result["output"], PROVIDER_TOOL_OUTPUT_LIMIT
+                    )
+        elif raw_type == "GrepSearch":
+            state["exit_code"] = raw_output.get("exit_code")
+            search_text = grok_search_result_text(raw_output)
+            if search_text:
+                state["output_text"] = search_text
+        elif raw_type == "ReadFile":
+            value = raw_output.get("FileContent")
+            if isinstance(value, dict):
+                path = str(value.get("absolute_path") or "")
+                total_lines = value.get("total_lines")
+                if path:
+                    state["summary"] = f"Read {path}"
+                    if total_lines is not None:
+                        state["summary"] += f" ({total_lines} lines)"
+                read_text = value.get("content_concise") or value.get("content")
+                if isinstance(read_text, str):
+                    state["output_text"] = bounded_provider_tool_text(
+                        read_text, PROVIDER_TOOL_OUTPUT_LIMIT
+                    )
+        elif raw_type == "ListDir":
+            value = raw_output.get("Content")
+            if isinstance(value, dict):
+                root = str(value.get("absolute_root_path") or "")
+                if root:
+                    state["summary"] = f"Listed {root}"
+                if isinstance(value.get("content"), str):
+                    state["output_text"] = bounded_provider_tool_text(
+                        value["content"], PROVIDER_TOOL_OUTPUT_LIMIT
+                    )
+        elif raw_type == "Todo":
+            value = raw_output.get("TodosUpdated")
+            if isinstance(value, dict) and isinstance(value.get("summary_for_prompt"), str):
+                state["output_text"] = bounded_provider_tool_text(
+                    value["summary_for_prompt"], PROVIDER_TOOL_OUTPUT_LIMIT
+                )
+                todos = value.get("todos")
+                if isinstance(todos, list):
+                    state["input_text"] = bounded_provider_tool_text(
+                        json.dumps({"todos": todos}, ensure_ascii=False, indent=2),
+                        PROVIDER_TOOL_INPUT_LIMIT,
+                    )
+        elif raw_type == "WebFetch":
+            value = raw_output.get("Content")
+            if isinstance(value, dict):
+                url = str(value.get("url") or "")
+                status_code = value.get("status_code")
+                size = value.get("bytes")
+                details = [
+                    part
+                    for part in (
+                        url,
+                        f"HTTP {status_code}" if status_code else "",
+                        f"{size} bytes" if size else "",
+                    )
+                    if part
+                ]
+                if details:
+                    state["summary"] = " / ".join(details)
+        elif raw_type == "SearchReplace":
+            value = raw_output.get("EditsApplied")
+            if isinstance(value, dict):
+                message = value.get("tool_output_for_prompt_concise")
+                if isinstance(message, str):
+                    state["summary"] = message
+
+    incoming_status = str(update.get("status") or "").strip()
+    if raw_type == "BackgroundTaskStarted":
+        incoming_status = "backgrounded"
+    terminal_status = str(state.get("terminal_status") or "")
+    if (
+        incoming_status in {"completed", "failed", "cancelled", "canceled"}
+        and raw_type != "BackgroundTaskStarted"
+    ):
+        state["terminal_status"] = incoming_status
+        state["status"] = incoming_status
+    elif terminal_status:
+        state["status"] = terminal_status
+    elif incoming_status and not (state.get("background") and incoming_status == "in_progress"):
+        state["status"] = incoming_status
+    elif not state.get("status"):
+        state["status"] = "in_progress"
+
+
+def grok_tool_transcript_text(
+    update: dict[str, Any],
+    *,
+    title: str,
+    state: dict[str, Any] | None = None,
+) -> str:
+    tool_state = state if state is not None else {}
+    update_grok_tool_state(tool_state, update, name=title)
+    details = [
+        provider_tool_header(
+            str(tool_state.get("name") or title or "tool"),
+            status=str(tool_state.get("status") or ""),
+            exit_code=tool_state.get("exit_code", ""),
+            duration=tool_state.get("duration", ""),
+        )
+    ]
+    summary = str(tool_state.get("description") or tool_state.get("summary") or "")
+    if summary:
+        details.append(f"Summary:\n{summary}")
+    command = str(tool_state.get("command") or "")
+    if command:
+        details.append(f"Command: {command}")
+    input_text = str(tool_state.get("input_text") or "")
+    if input_text and input_text not in {command, summary}:
+        details.append(f"Input:\n{input_text}")
+    patch = str(tool_state.get("patch") or "")
+    if patch:
+        details.append(f"Patch:\n{patch}")
+    output = str(tool_state.get("output_text") or "")
+    if output:
+        label = "Error" if tool_state.get("status") == "failed" else "Output"
+        details.append(f"{label}:\n{output}")
+    metadata = []
+    if tool_state.get("cwd"):
+        metadata.append(f"cwd: {tool_state['cwd']}")
+    if tool_state.get("output_file"):
+        metadata.append(f"output file: {tool_state['output_file']}")
+    if tool_state.get("truncated"):
+        metadata.append("provider output truncated")
+    if metadata:
+        metadata_text = "\n".join(metadata)
+        details.append(f"Details:\n{metadata_text}")
+    return bounded_provider_tool_text("\n".join(details), PROVIDER_TRANSCRIPT_SOURCE_TEXT_LIMIT)
+
+
+def claude_message_blocks(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, str):
+        return [{"type": "text", "text": value}]
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def claude_tool_state(name: str, value: Any) -> dict[str, Any]:
+    state: dict[str, Any] = {"name": name or "tool", "status": "in_progress"}
+    if isinstance(value, dict):
+        command = value.get("command") or value.get("cmd")
+        description = value.get("description")
+        if isinstance(command, str) and command.strip():
+            state["command"] = command.strip()
+        if isinstance(description, str) and description.strip():
+            state["summary"] = description.strip()
+        if name in {"Edit", "Write"}:
+            path = str(value.get("file_path") or value.get("path") or "")
+            old = str(value.get("old_string") or "")
+            new = str(value.get("new_string") or value.get("content") or "")
+            if path and (old or new):
+                state["patch"], patch_summary = grok_diff_patch(
+                    [{"type": "diff", "path": path, "oldText": old, "newText": new}]
+                )
+                state["summary"] = state.get("summary") or patch_summary
+        state["input_text"] = grok_tool_input_text(value, name.lower())
+    else:
+        state["input_text"] = bounded_provider_tool_text(
+            compact_tool_detail(value), PROVIDER_TOOL_INPUT_LIMIT
+        )
+    return state
+
+
+def claude_tool_transcript_text(state: dict[str, Any]) -> str:
+    details = [
+        provider_tool_header(
+            str(state.get("name") or "tool"),
+            status=str(state.get("status") or ""),
+            exit_code=state.get("exit_code", ""),
+        )
+    ]
+    if state.get("summary"):
+        details.append(f"Summary:\n{state['summary']}")
+    if state.get("command"):
+        details.append(f"Command: {state['command']}")
+    if state.get("input_text") and state.get("input_text") != state.get("command"):
+        details.append(f"Input:\n{state['input_text']}")
+    if state.get("patch"):
+        details.append(f"Patch:\n{state['patch']}")
+    if state.get("output_text"):
+        label = "Error" if state.get("status") == "failed" else "Output"
+        details.append(f"{label}:\n{state['output_text']}")
+    return bounded_provider_tool_text("\n".join(details), PROVIDER_TRANSCRIPT_SOURCE_TEXT_LIMIT)
+
+
 def parse_jsonish_string(value: str) -> Any | None:
     stripped = value.strip()
-    if not stripped or stripped[0] not in "[{\"":
+    if not stripped or stripped[0] not in '[{"':
         return None
     try:
         return json.loads(stripped)
@@ -2891,6 +3652,65 @@ def programmatic_tool_input_details(name: str, source: str) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2) if payload else ""
 
 
+def programmatic_tool_first_argument(
+    source: str,
+    start: int,
+    *,
+    terminators: frozenset[str] = frozenset({",", ")"}),
+) -> str:
+    """Extract the first argument from a ``tools.*(...)`` call without evaluating JS."""
+    delimiters: list[str] = []
+    quote = ""
+    escaped = False
+    argument_start = start
+    matching = {"(": ")", "[": "]", "{": "}"}
+    for index in range(start, len(source)):
+        char = source[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+            continue
+        if char in matching:
+            delimiters.append(matching[char])
+            continue
+        if delimiters and char == delimiters[-1]:
+            delimiters.pop()
+            continue
+        if not delimiters and char in terminators:
+            return source[argument_start:index].strip()
+    return ""
+
+
+def programmatic_tool_argument_detail(source: str, invocation_end: int) -> str:
+    argument = programmatic_tool_first_argument(source, invocation_end)
+    if not argument:
+        return ""
+    decoded = decoded_javascript_string_literal(argument)
+    if decoded:
+        return decoded
+    if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", argument):
+        declaration = re.search(
+            rf"\b(?:const|let|var)\s+{re.escape(argument)}\s*=\s*",
+            source[:invocation_end],
+        )
+        if declaration:
+            assigned = programmatic_tool_first_argument(
+                source,
+                declaration.end(),
+                terminators=frozenset({";"}),
+            )
+            if assigned:
+                argument = assigned
+    return clean_transcript_text(argument)[:PROVIDER_TRANSCRIPT_SOURCE_TEXT_LIMIT]
+
+
 def programmatic_tool_call_details(value: dict[str, Any]) -> dict[str, str] | None:
     source = first_string_value(value, ("input", "arguments", "code"))
     if not source:
@@ -2910,6 +3730,8 @@ def programmatic_tool_call_details(value: dict[str, Any]) -> dict[str, str] | No
             details["input"] = decoded_javascript_string_literal(patch.group(1))
     else:
         details["input"] = programmatic_tool_input_details(name, source)
+        if not details["input"]:
+            details["input"] = programmatic_tool_argument_detail(source, match.end())
     return details
 
 
@@ -2994,6 +3816,7 @@ def tool_transcript_sections(value: str) -> tuple[str, list[tuple[str, str]]]:
     sections: list[tuple[str, str]] = []
     current_label = ""
     current_lines: list[str] = []
+    seen_labels: set[str] = set()
 
     def push_section() -> None:
         nonlocal current_label, current_lines
@@ -3007,10 +3830,13 @@ def tool_transcript_sections(value: str) -> tuple[str, list[tuple[str, str]]]:
 
     for raw_line in lines[1:]:
         match = re.match(r"^([A-Za-z][A-Za-z0-9 _/-]{1,40}):\s*$", raw_line)
-        if match:
+        label = match.group(1).strip() if match else ""
+        label_key = label.lower()
+        if label_key in TOOL_TRANSCRIPT_SECTION_LABELS and label_key not in seen_labels:
             push_section()
-            current_label = match.group(1).strip()
+            current_label = label
             current_lines = []
+            seen_labels.add(label_key)
             continue
         if not current_label:
             current_label = "Details"
@@ -3169,7 +3995,9 @@ def tool_activity_entry_from_value(value: Any) -> dict[str, Any] | None:
     image_entry = image_generation_tool_entry(value)
     if image_entry:
         return image_entry
-    programmatic_details = programmatic_tool_call_details(value) if normalized == "custom_tool_call" else None
+    programmatic_details = (
+        programmatic_tool_call_details(value) if normalized == "custom_tool_call" else None
+    )
     name = first_string_value(value, ("name", "tool_name", "server_label")) or call_id or normalized
     if programmatic_details:
         name = programmatic_details["name"] or name
@@ -3189,7 +4017,10 @@ def tool_activity_entry_from_value(value: Any) -> dict[str, Any] | None:
         command = programmatic_details["command"]
     patch_input = patch_tool_input(value)
     if not patch_input and programmatic_details:
-        for candidate in (programmatic_details["input"], programmatic_details["command"]):
+        for candidate in (
+            programmatic_details["input"],
+            programmatic_details["command"],
+        ):
             if "*** Begin Patch" in candidate:
                 patch_input = candidate
                 break
@@ -3201,12 +4032,20 @@ def tool_activity_entry_from_value(value: Any) -> dict[str, Any] | None:
     detail_sections: list[tuple[str, str]] = []
     seen_detail_text: set[tuple[str, str]] = set()
     if patch_input:
-        source = "native apply_patch" if "apply_patch" in patch_source.lower() or normalized == "apply_patch_call" else patch_source
+        source = (
+            "native apply_patch"
+            if "apply_patch" in patch_source.lower() or normalized == "apply_patch_call"
+            else patch_source
+        )
         seen_detail_text.add(("Source", source))
         detail_sections.append(("Source", source))
         seen_detail_text.add(("Input", patch_input))
         detail_sections.append(("Input", patch_input))
-    if programmatic_details and programmatic_details["input"]:
+    if (
+        programmatic_details
+        and programmatic_details["input"]
+        and ("Input", programmatic_details["input"]) not in seen_detail_text
+    ):
         programmatic_input = programmatic_details["input"]
         seen_detail_text.add(("Input", programmatic_input))
         detail_sections.append(("Input", programmatic_input))
@@ -3234,6 +4073,7 @@ def tool_activity_entry_from_value(value: Any) -> dict[str, Any] | None:
         ("stdout", "Stdout"),
         ("stderr", "Stderr"),
         ("result", "Result"),
+        ("results", "Results"),
         ("message", "Message"),
         ("summary", "Summary"),
     ):
@@ -3361,6 +4201,30 @@ def app_server_error_text(value: Any) -> str:
     return ""
 
 
+def app_server_agent_message_entry(
+    item: Any,
+    *,
+    turn_id: str,
+    authoritative: bool,
+) -> dict[str, Any] | None:
+    if not isinstance(item, dict) or str(item.get("type") or "") != "agentMessage":
+        return None
+    text = clean_transcript_text(str(item.get("text") or ""))
+    if not text:
+        return None
+    entry: dict[str, Any] = {
+        "role": "assistant",
+        "text": text,
+        "append": False,
+        "turn_id": turn_id,
+        "authoritative": authoritative,
+    }
+    source_item_id = first_string_value(item, ("id", "itemId", "item_id"))
+    if source_item_id:
+        entry["source_item_id"] = source_item_id
+    return entry
+
+
 def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | None:
     item_type = str(item.get("type") or "")
     item_type_key = re.sub(r"[_-]", "", item_type).lower()
@@ -3369,19 +4233,33 @@ def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | No
     status = first_string_value(item, ("status", "state"))
     if is_control_tool_call_name(call_id) or is_control_tool_call_name(name):
         return None
-    if item_type_key == "websearch" or is_web_search_tool_call_name(call_id) or is_web_search_tool_call_name(name):
+    if (
+        item_type_key == "websearch"
+        or is_web_search_tool_call_name(call_id)
+        or is_web_search_tool_call_name(name)
+    ):
         suffix = f" (status {status})" if status else ""
         details = [f"Tool: Web Search{suffix}"]
         query = web_search_query_detail(item)
-        result = compact_tool_detail(item.get("result") or item.get("output"))
+        result_value = item.get("results")
+        result_label = "Results"
+        if result_value is None:
+            result_value = item.get("result") or item.get("output")
+            result_label = "Result"
+        result = compact_tool_detail(result_value)
         error = compact_tool_detail(item.get("error"))
         if query:
             details.append(f"Query:\n{query}")
         if result:
-            details.append(f"Result:\n{result}")
+            details.append(f"{result_label}:\n{result}")
         if error:
             details.append(f"Error:\n{error}")
-        return {"role": "tool", "text": "\n".join(details), "call_id": call_id, "status": status}
+        return {
+            "role": "tool",
+            "text": "\n".join(details),
+            "call_id": call_id,
+            "status": status,
+        }
     if item_type_key == "commandexecution":
         command = nested_command_value(item) or first_string_value(item, ("command",))
         exit_code = first_string_value(item, ("exitCode", "exit_code"))
@@ -3419,7 +4297,12 @@ def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | No
             text = compact_tool_detail(item.get(key))
             if text:
                 details.append(f"{label}:\n{text}")
-        return {"role": "tool", "text": "\n".join(details), "call_id": call_id, "status": status}
+        return {
+            "role": "tool",
+            "text": "\n".join(details),
+            "call_id": call_id,
+            "status": status,
+        }
     if item_type_key == "mcptoolcall":
         server = first_string_value(item, ("server",))
         tool = first_string_value(item, ("tool", "name"))
@@ -3435,7 +4318,12 @@ def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | No
             details.append(f"Result:\n{result}")
         if error:
             details.append(f"Error:\n{error}")
-        return {"role": "tool", "text": "\n".join(details), "call_id": call_id, "status": status}
+        return {
+            "role": "tool",
+            "text": "\n".join(details),
+            "call_id": call_id,
+            "status": status,
+        }
     if item_type_key == "filechange":
         changes = item.get("changes")
         paths = []
@@ -3454,7 +4342,9 @@ def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | No
                 paths.append(f"{kind}: {path_text}" if kind else path_text)
         suffix = f" (status {status})" if status else ""
         detail = "\n".join(path for path in paths if path)
-        text = f"Tool: file changes{suffix}" if not detail else f"Tool: file changes{suffix}\n{detail}"
+        text = (
+            f"Tool: file changes{suffix}" if not detail else f"Tool: file changes{suffix}\n{detail}"
+        )
         return {"role": "tool", "text": text, "call_id": call_id, "status": status}
     if item_type_key == "collabagenttoolcall":
         tool = first_string_value(item, ("tool", "name")) or "agent"
@@ -3475,7 +4365,12 @@ def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | No
             text = compact_tool_detail(item.get(key))
             if text:
                 details.append(f"{label}:\n{text}")
-        return {"role": "tool", "text": "\n".join(details), "call_id": call_id, "status": status}
+        return {
+            "role": "tool",
+            "text": "\n".join(details),
+            "call_id": call_id,
+            "status": status,
+        }
     if item_type_key == "subagentactivity":
         kind = first_string_value(item, ("kind",)) or "activity"
         suffix = f" (status {status})" if status else ""
@@ -3489,14 +4384,24 @@ def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | No
             text = compact_tool_detail(item.get(key))
             if text:
                 details.append(f"{label}:\n{text}")
-        return {"role": "tool", "text": "\n".join(details), "call_id": call_id, "status": status}
+        return {
+            "role": "tool",
+            "text": "\n".join(details),
+            "call_id": call_id,
+            "status": status,
+        }
     if item_type_key == "hookprompt":
         suffix = f" (status {status})" if status else ""
         details = [f"Tool: hook prompt{suffix}"]
         fragments = compact_tool_detail(item.get("fragments"))
         if fragments:
             details.append(f"Fragments:\n{fragments}")
-        return {"role": "tool", "text": "\n".join(details), "call_id": call_id, "status": status}
+        return {
+            "role": "tool",
+            "text": "\n".join(details),
+            "call_id": call_id,
+            "status": status,
+        }
     if item_type_key in {
         "imageview",
         "imagegeneration",
@@ -3522,22 +4427,39 @@ def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | No
     return None
 
 
-def app_server_transcript_entries_from_message(message: dict[str, Any]) -> list[dict[str, Any]]:
+def app_server_transcript_entries_from_message(
+    message: dict[str, Any],
+) -> list[dict[str, Any]]:
     method = app_server_message_method(message)
     params = app_server_message_params(message)
     turn_id = app_server_message_turn_id(message)
     if method == "item/agentMessage/delta":
         delta = params.get("delta")
         text = clean_transcript_text(delta, preserve_edges=True) if isinstance(delta, str) else ""
-        return [{"role": "assistant_progress", "text": text, "append": True, "turn_id": turn_id}] if text else []
+        if not text:
+            return []
+        delta_entry: dict[str, Any] = {
+            "role": "assistant_progress",
+            "text": text,
+            "append": True,
+            "turn_id": turn_id,
+        }
+        source_item_id = first_string_value(params, ("itemId", "item_id", "id"))
+        if source_item_id:
+            delta_entry["source_item_id"] = source_item_id
+        return [delta_entry]
     if method == "item/completed":
         item = params.get("item")
         if not isinstance(item, dict):
             return []
         item_type = str(item.get("type") or "")
         if item_type == "agentMessage":
-            text = clean_transcript_text(str(item.get("text") or ""))
-            return [{"role": "assistant", "text": text, "append": False, "turn_id": turn_id}] if text else []
+            completed_entry = app_server_agent_message_entry(
+                item,
+                turn_id=turn_id,
+                authoritative=True,
+            )
+            return [completed_entry] if completed_entry else []
         tool_entry = app_server_tool_entry_from_item(item)
         if tool_entry:
             tool_entry["turn_id"] = turn_id
@@ -3555,7 +4477,27 @@ def app_server_transcript_entries_from_message(message: dict[str, Any]) -> list[
             turn = params.get("turn")
             error = turn.get("error") if isinstance(turn, dict) else None
         text = app_server_error_text(error)
-        return [{"role": "error", "text": text, "append": False, "turn_id": turn_id}] if text else []
+        if text:
+            return [{"role": "error", "text": text, "append": False, "turn_id": turn_id}]
+        if method == "turn/completed":
+            turn = params.get("turn")
+            items = turn.get("items") if isinstance(turn, dict) else None
+            if isinstance(items, list):
+                for item in reversed(items):
+                    if not isinstance(item, dict):
+                        continue
+                    phase = re.sub(r"[_-]", "", str(item.get("phase") or "")).lower()
+                    if phase not in {"", "finalanswer"}:
+                        continue
+                    fallback_entry = app_server_agent_message_entry(
+                        item,
+                        turn_id=turn_id,
+                        authoritative=True,
+                    )
+                    if fallback_entry:
+                        fallback_entry["completion_fallback"] = True
+                        return [fallback_entry]
+        return []
     return []
 
 
@@ -3600,7 +4542,9 @@ def rewrite_service_tier_value(value: Any, *, fast_enabled: bool) -> tuple[Any, 
     return rewritten, service_tier if isinstance(service_tier, str) else None, changed
 
 
-def rewrite_service_tier_body(body: bytes | None, *, fast_enabled: bool) -> tuple[bytes | None, str | None, bool]:
+def rewrite_service_tier_body(
+    body: bytes | None, *, fast_enabled: bool
+) -> tuple[bytes | None, str | None, bool]:
     if not body:
         return body, None, False
     try:
@@ -3760,33 +4704,50 @@ def normalize_token_usage(value: dict[str, Any]) -> dict[str, int] | None:
         key in value
         for key in (
             "input_tokens",
+            "inputTokens",
             "output_tokens",
+            "outputTokens",
             "total_tokens",
+            "totalTokens",
             "prompt_tokens",
             "completion_tokens",
         )
     )
     if not has_usage_key:
         return None
-    input_tokens = int_value(value.get("input_tokens", value.get("prompt_tokens")))
-    output_tokens = int_value(value.get("output_tokens", value.get("completion_tokens")))
-    cached_input_tokens = int_value(value.get("cached_input_tokens"))
-    reasoning_output_tokens = int_value(value.get("reasoning_output_tokens"))
+    input_tokens = int_value(
+        value.get("input_tokens", value.get("inputTokens", value.get("prompt_tokens")))
+    )
+    output_tokens = int_value(
+        value.get("output_tokens", value.get("outputTokens", value.get("completion_tokens")))
+    )
+    cached_input_tokens = int_value(
+        value.get("cached_input_tokens", value.get("cachedInputTokens"))
+    )
+    cache_write_input_tokens = int_value(
+        value.get("cache_write_input_tokens", value.get("cacheWriteInputTokens"))
+    )
+    reasoning_output_tokens = int_value(
+        value.get("reasoning_output_tokens", value.get("reasoningOutputTokens"))
+    )
     input_details = value.get("input_tokens_details")
     if isinstance(input_details, dict):
-        cached_input_tokens = max(cached_input_tokens, int_value(input_details.get("cached_tokens")))
+        cached_input_tokens = max(
+            cached_input_tokens, int_value(input_details.get("cached_tokens"))
+        )
     output_details = value.get("output_tokens_details")
     if isinstance(output_details, dict):
         reasoning_output_tokens = max(
             reasoning_output_tokens,
             int_value(output_details.get("reasoning_tokens")),
         )
-    total_tokens = int_value(value.get("total_tokens"))
+    total_tokens = int_value(value.get("total_tokens", value.get("totalTokens")))
     if total_tokens <= 0:
         total_tokens = input_tokens + output_tokens
     return {
         "input_tokens": input_tokens,
         "cached_input_tokens": cached_input_tokens,
+        "cache_write_input_tokens": cache_write_input_tokens,
         "output_tokens": output_tokens,
         "reasoning_output_tokens": reasoning_output_tokens,
         "total_tokens": total_tokens,
@@ -3912,10 +4873,7 @@ def analytics_turn_ids(payload: bytes | None, *, terminal_only: bool = False) ->
         if not terminal_only:
             turn_ids.append(turn_id)
             continue
-        if (
-            isinstance(status, str)
-            and status.lower() in ANALYTICS_TURN_TERMINAL_STATUSES
-        ):
+        if isinstance(status, str) and status.lower() in ANALYTICS_TURN_TERMINAL_STATUSES:
             turn_ids.append(turn_id)
     return turn_ids
 
@@ -3932,15 +4890,6 @@ def json_value_has_terminal_event(value: Any) -> bool:
         value,
         WEBSOCKET_TERMINAL_EVENT_TYPES,
     ) or json_value_has_response_status(value, WEBSOCKET_TERMINAL_STATUSES)
-
-
-def logo_asset_bytes(name: str = "provision.png") -> bytes | None:
-    if name not in {"provision.png", "provision-wordmark.png"}:
-        return None
-    try:
-        return package_resources.files("provision").joinpath(f"assets/{name}").read_bytes()
-    except (FileNotFoundError, ModuleNotFoundError, OSError):
-        return None
 
 
 def format_status_updated_at(updated_at: datetime) -> str:
@@ -4102,11 +5051,13 @@ def header_limit_ids(headers: Any) -> list[str]:
     for name in rate_limit_header_names(headers):
         if not name.endswith(suffix) or not name.startswith("x-"):
             continue
-        ids.add(normalize_rate_limit_id(name[2:-len(suffix)]))
+        ids.add(normalize_rate_limit_id(name[2 : -len(suffix)]))
     return sorted(ids, key=lambda item: (item != "codex", item))
 
 
-def rate_limit_window_from_headers(headers: Any, prefix: str, window_name: str) -> dict[str, Any] | None:
+def rate_limit_window_from_headers(
+    headers: Any, prefix: str, window_name: str
+) -> dict[str, Any] | None:
     used_percent = header_float(headers, f"{prefix}-{window_name}-used-percent")
     if used_percent is None:
         return None
@@ -4203,20 +5154,128 @@ def normalize_credits_snapshot(value: Any) -> dict[str, Any] | None:
     return credits if credits else None
 
 
-def normalize_rate_limit_reset_credits_summary(value: Any) -> dict[str, int] | None:
+def normalize_rate_limit_reset_credits_summary(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     raw_count = value.get("available_count", value.get("availableCount"))
     if isinstance(raw_count, bool):
         return None
     if isinstance(raw_count, int):
-        return {"available_count": max(0, raw_count)}
+        summary: dict[str, Any] = {"available_count": max(0, raw_count)}
+        details = available_rate_limit_reset_credit_details(value)
+        if details:
+            summary["credits"] = details
+        return summary
     if isinstance(raw_count, str):
         try:
-            return {"available_count": max(0, int(raw_count))}
+            summary = {"available_count": max(0, int(raw_count))}
+            details = available_rate_limit_reset_credit_details(value)
+            if details:
+                summary["credits"] = details
+            return summary
         except ValueError:
             return None
     return None
+
+
+def reset_credit_datetime_iso(value: Any) -> str:
+    """Normalize a documented reset-credit timestamp for browser display."""
+    moment = parse_reset_datetime(value)
+    if moment is None:
+        return ""
+    return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def available_rate_limit_reset_credit_details(value: Any) -> list[dict[str, str]]:
+    """Return selectable available credits without exposing unrelated fields."""
+    if not isinstance(value, dict):
+        return []
+    raw_credits = value.get("credits")
+    if not isinstance(raw_credits, list):
+        return []
+    credits: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_credit in raw_credits:
+        if not isinstance(raw_credit, dict):
+            continue
+        if str(raw_credit.get("status") or "").lower() != "available":
+            continue
+        credit_id = raw_credit.get("id")
+        if not isinstance(credit_id, str):
+            continue
+        credit_id = credit_id.strip()
+        if not credit_id or len(credit_id) > 512 or credit_id in seen:
+            continue
+        seen.add(credit_id)
+        credits.append(
+            {
+                "id": credit_id,
+                "issued_at": reset_credit_datetime_iso(raw_credit.get("grantedAt")),
+                "expires_at": reset_credit_datetime_iso(raw_credit.get("expiresAt")),
+            }
+        )
+    return credits
+
+
+def selected_rate_limit_reset_credit_id(value: Any, requested_credit_id: str | None) -> str | None:
+    """Validate an explicit UI choice, otherwise preserve automatic selection.
+
+    A no-choice request intentionally uses the credit with the nearest known
+    expiry only when the app server supplied a complete list.  If it did not,
+    the app server remains responsible for selecting the credit.
+    """
+    requested = str(requested_credit_id or "").strip()
+    if not requested:
+        return preferred_rate_limit_reset_credit_id(value)
+    available = {detail["id"] for detail in available_rate_limit_reset_credit_details(value)}
+    if requested not in available:
+        raise StoreError(
+            "the selected reset credit is no longer available; refresh quota and choose again"
+        )
+    return requested
+
+
+def preferred_rate_limit_reset_credit_id(value: Any) -> str | None:
+    """Select the soonest-expiring credit only when Codex returned a complete list.
+
+    Codex may return only the available count or cap the list of detail rows. In
+    either case selecting an explicit id could skip an unseen, sooner-expiring
+    credit, so the backend remains responsible for choosing the credit.
+    """
+    normalized = normalize_rate_limit_reset_credits_summary(value)
+    if normalized is None:
+        return None
+    available_count = normalized["available_count"]
+    details = value.get("credits") if isinstance(value, dict) else None
+    if not isinstance(details, list) or len(details) != available_count:
+        return None
+
+    candidates: list[tuple[int, float, float, str]] = []
+    for detail in details:
+        if not isinstance(detail, dict) or str(detail.get("status") or "").lower() != "available":
+            return None
+        credit_id = detail.get("id")
+        granted_at = detail.get("grantedAt")
+        expires_at = detail.get("expiresAt")
+        if not isinstance(credit_id, str) or not credit_id:
+            return None
+        granted_moment = parse_reset_datetime(granted_at)
+        expires_moment = parse_reset_datetime(expires_at)
+        if granted_moment is None:
+            return None
+        if expires_at is not None and expires_moment is None:
+            return None
+        # Expiring credits take precedence; then use grant time and id as stable tie-breakers.
+        candidates.append(
+            (
+                1 if expires_moment is None else 0,
+                expires_moment.timestamp() if expires_moment is not None else 0,
+                granted_moment.timestamp(),
+                credit_id,
+            )
+        )
+
+    return min(candidates)[3] if candidates else None
 
 
 def usage_payload_from_rate_limit_snapshot(snapshot: Any) -> dict[str, Any] | None:
@@ -4235,6 +5294,12 @@ def usage_payload_from_rate_limit_snapshot(snapshot: Any) -> dict[str, Any] | No
     reached_type = snapshot.get("rate_limit_reached_type", snapshot.get("rateLimitReachedType"))
     if isinstance(reached_type, str):
         rate_limit["rate_limit_reached_type"] = reached_type
+    spend_control_reached = snapshot.get(
+        "spend_control_reached",
+        snapshot.get("spendControlReached"),
+    )
+    if isinstance(spend_control_reached, bool):
+        rate_limit["spend_control_reached"] = spend_control_reached
     limit_id = normalize_rate_limit_id(
         snapshot.get("metered_limit_name")
         or snapshot.get("meteredLimitName")
@@ -4260,7 +5325,9 @@ def usage_payload_from_rate_limit_snapshot(snapshot: Any) -> dict[str, Any] | No
             return payload
         payload["additional_rate_limits"] = [
             {
-                "limit_name": str(snapshot.get("limit_name") or snapshot.get("limitName") or limit_id),
+                "limit_name": str(
+                    snapshot.get("limit_name") or snapshot.get("limitName") or limit_id
+                ),
                 "metered_feature": limit_id,
                 "rate_limit": rate_limit,
             }
@@ -4268,7 +5335,9 @@ def usage_payload_from_rate_limit_snapshot(snapshot: Any) -> dict[str, Any] | No
     return payload
 
 
-def usage_payload_from_app_server_rate_limits_response(value: Any) -> dict[str, Any] | None:
+def usage_payload_from_app_server_rate_limits_response(
+    value: Any,
+) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     payload = usage_payload_from_rate_limit_snapshot(value.get("rateLimits")) or {}
@@ -4307,6 +5376,8 @@ def usage_payload_from_rate_limit_event(value: Any) -> dict[str, Any] | None:
             "planType",
             "rate_limit_reached_type",
             "rateLimitReachedType",
+            "spend_control_reached",
+            "spendControlReached",
         ):
             if key in value and key not in snapshot:
                 snapshot[key] = value[key]
@@ -4343,7 +5414,11 @@ def merge_usage_payload(existing: Any, update: dict[str, Any]) -> dict[str, Any]
         merged["rate_limit"] = merge_rate_limit(merged.get("rate_limit"), update["rate_limit"])
     if isinstance(update.get("credits"), dict):
         credits = merged.get("credits")
-        merged["credits"] = {**credits, **update["credits"]} if isinstance(credits, dict) else dict(update["credits"])
+        merged["credits"] = (
+            {**credits, **update["credits"]}
+            if isinstance(credits, dict)
+            else dict(update["credits"])
+        )
     if isinstance(update.get("plan_type"), str):
         merged["plan_type"] = update["plan_type"]
     if isinstance(update.get("rate_limit_reset_credits"), dict):
@@ -4511,6 +5586,8 @@ def usage_window_summary(window: Any, fallback: str) -> str | None:
 def usage_rate_limit_summary(rate_limit: Any) -> str:
     if not isinstance(rate_limit, dict):
         return "quota payload has no rate limit"
+    if rate_limit.get("spend_control_reached") is True:
+        return "spend control reached"
     pieces = [
         summary
         for summary in (
@@ -4769,6 +5846,32 @@ def quota_payload_reset_credit_count(payload: Any) -> int:
     return 0
 
 
+def quota_payload_reset_credit_details(payload: Any) -> list[dict[str, str]]:
+    if not isinstance(payload, dict):
+        return []
+    summary = payload.get("rate_limit_reset_credits")
+    if not isinstance(summary, dict):
+        return []
+    raw_details = summary.get("credits")
+    if not isinstance(raw_details, list):
+        return []
+    details: list[dict[str, str]] = []
+    for raw_detail in raw_details:
+        if not isinstance(raw_detail, dict):
+            continue
+        credit_id = raw_detail.get("id")
+        if not isinstance(credit_id, str) or not credit_id or len(credit_id) > 512:
+            continue
+        details.append(
+            {
+                "id": credit_id,
+                "issued_at": str(raw_detail.get("issued_at") or ""),
+                "expires_at": str(raw_detail.get("expires_at") or ""),
+            }
+        )
+    return details
+
+
 def render_reset_credit_control(
     payload: Any,
     profile: str | None,
@@ -4783,16 +5886,16 @@ def render_reset_credit_control(
             f'title="{html.escape(message)}">{html.escape(label)}</span>'
         )
     count = quota_payload_reset_credit_count(payload)
-    if count <= 0 or not profile or not token:
+    if count <= 0 or not profile:
         return ""
     escaped_profile = html.escape(profile)
     label = f"Reset credit: {count}" if count == 1 else f"Reset credits: {count}"
-    confirm = "Use one rate-limit reset credit for this Codex CLI profile?"
+    credits_json = html.escape(json.dumps(quota_payload_reset_credit_details(payload)), quote=True)
     return f"""
-      <form method="post" action="/api/consume-reset-credit" class="reset-credit-form" data-action="consume_reset_credit" data-profile="{escaped_profile}" data-confirm="{html.escape(confirm)}">
-        <input type="hidden" name="token" value="{html.escape(token)}">
+      <form method="post" action="/api/consume-reset-credit" class="reset-credit-form" data-action="consume_reset_credit" data-profile="{escaped_profile}" data-reset-credits="{credits_json}">
         <input type="hidden" name="profile" value="{escaped_profile}">
-        <button class="quota-reset-credit-pill" title="Use one rate-limit reset credit">{html.escape(label)}</button>
+        <input type="hidden" name="credit_id" value="">
+        <button class="quota-reset-credit-pill" title="Choose a reset credit to use">{html.escape(label)}</button>
       </form>
     """
 
@@ -4858,9 +5961,14 @@ def reset_credit_confirmation_matches(before_payload: Any, current_payload: Any)
         for key in ("primary_remaining_percent", "weekly_remaining_percent"):
             current_value = current.get(key)
             previous_value = previous.get(key)
-            if not isinstance(current_value, (int, float)) or not isinstance(previous_value, (int, float)):
+            if not isinstance(current_value, (int, float)) or not isinstance(
+                previous_value, (int, float)
+            ):
                 continue
-            if float(current_value) - float(previous_value) >= RESET_CREDIT_CONFIRMATION_DELTA_PERCENT:
+            if (
+                float(current_value) - float(previous_value)
+                >= RESET_CREDIT_CONFIRMATION_DELTA_PERCENT
+            ):
                 return True
     return False
 
@@ -4972,7 +6080,9 @@ def usage_refresh_due_at(
         return now
     error = entry.get("error")
     if error_requires_billing(error) or entry.get("billing_required"):
-        error_at = usage_entry_datetime(entry, "error_at") or usage_entry_datetime(entry, "fetched_at")
+        error_at = usage_entry_datetime(entry, "error_at") or usage_entry_datetime(
+            entry, "fetched_at"
+        )
         if error_at is not None:
             return error_at + timedelta(seconds=USAGE_AUTO_REFRESH_BILLING_BACKOFF_SECONDS)
     fetched_at = entry.get("fetched_at")
@@ -5010,6 +6120,8 @@ def quota_window_has_count(window: Any) -> bool:
 
 
 def quota_bucket_state(rate_limit: dict[str, Any]) -> tuple[str, str]:
+    if rate_limit.get("spend_control_reached") is True:
+        return "Spend control", "exhausted"
     if quota_rate_limit_unlimited(rate_limit):
         return "Unlimited", "unlimited"
     remaining_values = [
@@ -5163,6 +6275,22 @@ def quota_stack_context(rate_limit: dict[str, Any]) -> dict[str, Any]:
     weekly_label = quota_window_label(secondary, "Weekly")
     unbounded_kind = "unlimited" if quota_rate_limit_unlimited(rate_limit) else ""
 
+    if rate_limit.get("spend_control_reached") is True:
+        primary_style = primary_percent if primary_percent is not None else 0.0
+        weekly_style = weekly_percent if weekly_percent is not None else primary_style
+        weekly_text = quota_percent_text(weekly_percent)
+        return {
+            "special": "spend-control",
+            "primary_reset_text": "Spend control reached",
+            "weekly_status": quota_status_text(weekly_label, secondary),
+            "primary_style": primary_style,
+            "weekly_style": weekly_style,
+            "primary_text": "Blocked",
+            "weekly_text": weekly_text,
+            "primary_empty": "" if primary_style > 0 else " empty",
+            "aria": "Quota blocked because the account spend control was reached",
+        }
+
     if primary_percent is None and weekly_percent is None and not unbounded_kind:
         count_rows = [
             render_quota_count_window(primary, "5h"),
@@ -5209,7 +6337,11 @@ def quota_stack_context(rate_limit: dict[str, Any]) -> dict[str, Any]:
     aria = " / ".join(
         piece
         for piece in (
-            f"{primary_label} not enforced" if primary_not_enforced else f"{primary_label} {primary_text}" if primary_text else "",
+            f"{primary_label} not enforced"
+            if primary_not_enforced
+            else f"{primary_label} {primary_text}"
+            if primary_text
+            else "",
             f"{weekly_label} {weekly_text}" if weekly_text else "",
         )
         if piece
@@ -5229,9 +6361,11 @@ def quota_stack_context(rate_limit: dict[str, Any]) -> dict[str, Any]:
 
 
 def render_quota_horizons(context: dict[str, Any], name: str, title: str = "") -> str:
+    special = str(context.get("special") or "")
+    special_class = f" {html.escape(special)}" if special else ""
     if context.get("count_html"):
         return f"""
-          <div class="quota-title">
+          <div class="quota-title{special_class}">
             <span class="quota-horizon weekly"></span>
             <span class="quota-bucket-name" title="{html.escape(title)}">{html.escape(name)}</span>
             <span class="quota-horizon primary"></span>
@@ -5239,9 +6373,13 @@ def render_quota_horizons(context: dict[str, Any], name: str, title: str = "") -
         """
     weekly_status = str(context.get("weekly_status") or "")
     primary_status = str(context.get("primary_reset_text") or "")
-    primary_class = "quota-horizon primary not-enforced" if context.get("primary_not_enforced") else "quota-horizon primary"
+    primary_class = (
+        "quota-horizon primary not-enforced"
+        if context.get("primary_not_enforced")
+        else "quota-horizon primary"
+    )
     return f"""
-      <div class="quota-title">
+      <div class="quota-title{special_class}">
         <span class="quota-horizon weekly">{html.escape(weekly_status)}</span>
         <span class="quota-bucket-name" title="{html.escape(title)}">{html.escape(name)}</span>
         <span class="{primary_class}">{html.escape(primary_status)}</span>
@@ -5266,7 +6404,11 @@ def render_quota_stack(context: dict[str, Any]) -> str:
     if primary_not_enforced:
         stack_class += " quota-stack-primary-not-enforced"
     weekly_label_html = f'<span class="quota-weekly-label">{html.escape(weekly_text)}</span>'
-    primary_label_class = "quota-primary-label-outside not-enforced" if primary_not_enforced else "quota-primary-label-outside"
+    primary_label_class = (
+        "quota-primary-label-outside not-enforced"
+        if primary_not_enforced
+        else "quota-primary-label-outside"
+    )
     primary_label_html = f'<span class="{primary_label_class}">{html.escape(primary_text)}</span>'
     bar_attrs = (
         f'role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{primary_style:.0f}" aria-label="{html.escape(aria)}"'
@@ -5322,7 +6464,9 @@ def quota_bucket_matches_model(bucket: dict[str, Any], model: str) -> bool:
     return False
 
 
-def quota_bucket_for_model_from_rows(rows: list[dict[str, Any]], model: str) -> dict[str, Any] | None:
+def quota_bucket_for_model_from_rows(
+    rows: list[dict[str, Any]], model: str
+) -> dict[str, Any] | None:
     if not rows:
         return None
     for row in rows:
@@ -5365,9 +6509,13 @@ def render_compact_quota_bucket_html(bucket: dict[str, Any], *, secondary: bool 
     special_class = f" {html.escape(special)}" if special else ""
     if primary_not_enforced:
         special_class += " primary-not-enforced"
-    primary_class = "control-compact-quota-primary not-enforced" if primary_not_enforced else "control-compact-quota-primary"
+    primary_class = (
+        "control-compact-quota-primary not-enforced"
+        if primary_not_enforced
+        else "control-compact-quota-primary"
+    )
     return f"""
-      <span class="control-compact-quota{special_class}{secondary_class}" title="{html.escape(title)}">
+      <span class="control-compact-quota{special_class}{secondary_class}" title="{html.escape(aria or title)}">
         <span class="control-compact-quota-name">{html.escape(name)}</span>
         <span class="control-compact-quota-weekly">{html.escape(weekly_text)}</span>
         <span class="control-compact-quota-bar" role="img" aria-label="{html.escape(aria)}">
@@ -5458,12 +6606,11 @@ def render_quota_state(state: dict[str, str]) -> str:
 
 
 def render_quota_refresh_control(profile: str | None, token: str | None) -> str:
-    if not profile or not token:
+    if not profile:
         return '<span class="quota-refresh-spacer"></span>'
     escaped_profile = html.escape(profile)
     return f"""
       <form method="post" action="/api/refresh-quota" class="quota-refresh-form" data-action="refresh_quota" data-profile="{escaped_profile}">
-        <input type="hidden" name="token" value="{html.escape(token)}">
         <input type="hidden" name="profile" value="{escaped_profile}">
         <button class="quota-refresh-icon" aria-label="Refresh quota" title="Refresh quota">
           <svg class="quota-refresh-glyph" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -5551,9 +6698,7 @@ def render_quota_html(
     if error:
         message = quota_refresh_error_message(error)
         error_class = " billing" if error_requires_billing(error) else ""
-        error_html = (
-            f'<div class="quota-refresh-error{error_class}">Last refresh failed: {html.escape(message)}</div>'
-        )
+        error_html = f'<div class="quota-refresh-error{error_class}">Last refresh failed: {html.escape(message)}</div>'
     else:
         error_html = ""
     return render_quota_panel(
@@ -5639,7 +6784,9 @@ def reset_credit_control_payload(payload: Any, reset_credit: Any = None) -> dict
     if isinstance(reset_credit, dict) and reset_credit.get("blocks"):
         return {
             "label": str(reset_credit.get("label") or "Reset pending"),
-            "message": str(reset_credit.get("message") or "Reset-credit use is temporarily disabled."),
+            "message": str(
+                reset_credit.get("message") or "Reset-credit use is temporarily disabled."
+            ),
             "disabled": True,
         }
     count = quota_payload_reset_credit_count(payload)
@@ -5647,9 +6794,10 @@ def reset_credit_control_payload(payload: Any, reset_credit: Any = None) -> dict
         return None
     return {
         "label": f"Reset credit: {count}" if count == 1 else f"Reset credits: {count}",
-        "message": "Use one rate-limit reset credit for this Codex CLI profile?",
+        "message": "Choose a reset credit to use for this Codex CLI profile.",
         "disabled": False,
         "count": count,
+        "credits": quota_payload_reset_credit_details(payload),
     }
 
 
@@ -5683,7 +6831,11 @@ def quota_panel_payload(
                 data["refresh_error_billing"] = error_requires_billing(error)
         return data
 
-    buckets = [item for item in (quota_bucket_payload(bucket) for bucket in quota_bucket_rows(payload)) if item]
+    buckets = [
+        item
+        for item in (quota_bucket_payload(bucket) for bucket in quota_bucket_rows(payload))
+        if item
+    ]
     if buckets:
         data["buckets"] = buckets
         data["empty"] = ""
@@ -5731,7 +6883,9 @@ def render_auth_health_html(health: Any) -> str:
     if status not in {"login_required", "refresh_failed"}:
         return ""
     message = str(health.get("message") or "")
-    timestamp = auth_health_time_label(health.get("error_at") or health.get("last_refresh_failed_at"))
+    timestamp = auth_health_time_label(
+        health.get("error_at") or health.get("last_refresh_failed_at")
+    )
     suffix = f" ({timestamp})" if timestamp else ""
     label = "Login required" if status == "login_required" else "Auth refresh failed"
     return f"""
@@ -5741,7 +6895,9 @@ def render_auth_health_html(health: Any) -> str:
     """
 
 
-def render_login_status_html(status: Any, profile: str | None = None, token: str | None = None) -> str:
+def render_login_status_html(
+    status: Any, profile: str | None = None, token: str | None = None
+) -> str:
     if not isinstance(status, dict):
         return ""
     state = str(status.get("status") or "").lower()
@@ -5772,11 +6928,10 @@ def render_login_status_html(status: Any, profile: str | None = None, token: str
         else ""
     )
     cancel_html = ""
-    if state in LOGIN_ACTIVE_STATUSES and profile and token:
+    if state in LOGIN_ACTIVE_STATUSES and profile:
         escaped_profile = html.escape(profile)
         cancel_html = f"""
           <form method="post" action="/api/login" class="login-cancel-form" data-action="cancel_login" data-profile="{escaped_profile}">
-            <input type="hidden" name="token" value="{html.escape(token)}">
             <input type="hidden" name="profile" value="{escaped_profile}">
             <input type="hidden" name="login_action" value="cancel_login">
             <button class="login-cancel-action">Cancel Login</button>
@@ -5791,11 +6946,7 @@ def render_login_status_html(status: Any, profile: str | None = None, token: str
         lines = status.get("lines")
         if isinstance(lines, list) and lines:
             detail = str(lines[-1])
-    detail_html = (
-        f'<div class="login-detail">{html.escape(detail)}</div>'
-        if detail
-        else ""
-    )
+    detail_html = f'<div class="login-detail">{html.escape(detail)}</div>' if detail else ""
     return f"""
       <div class="login-status {state_class}">
         <div class="login-status-top"><strong>{html.escape(title)}</strong><span>{html.escape(mode_label)}</span></div>
@@ -5811,6 +6962,10 @@ class ProvisionServer(ThreadingHTTPServer):
         self.paths = paths
         self.store = Store(paths)
         self.proxy_token = self.store.proxy_token()
+        # Browser controls use an ephemeral, process-local session. The durable
+        # proxy capability remains available to the launcher and CLI, but is
+        # never rendered into dashboard HTML or JavaScript.
+        self.ui_session_token = secrets.token_urlsafe(32)
         # Remote groundwork stays inert during normal local-only operation.
         # In particular, normal daemon startup creates neither a Remote Agent
         # capability nor remote credential material on disk.
@@ -5829,10 +6984,20 @@ class ProvisionServer(ThreadingHTTPServer):
         self.active_requests: dict[int, dict[str, Any]] = {}
         self.active_websockets: dict[int, dict[str, Any]] = {}
         self.active_lock = threading.Lock()
+        self.permission_condition = threading.Condition()
+        self.pending_permissions: dict[str, dict[str, Any]] = {}
+        self.resolved_permissions: dict[str, float] = {}
+        self.permission_routes: dict[str, str] = {}
+        self.ui_client_count = 0
         self.next_request_id = 0
         self.next_websocket_id = 0
         self.observed_sessions: dict[str, dict[str, Any]] = {}
         self.control_transcripts: dict[str, list[dict[str, Any]]] = {}
+        self.provider_session_readers: dict[str, ClaudeSessionReader | GrokSessionReader] = {}
+        self.provider_session_readers_lock = threading.Lock()
+        self.provider_session_last_refresh_monotonic = 0.0
+        self.provider_identity_cache: dict[str, dict[str, Any]] = {}
+        self.provider_identity_cache_lock = threading.Lock()
         self.control_history_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self.control_history_cache_lock = threading.Lock()
         self.control_history_inflight: dict[str, threading.Event] = {}
@@ -5840,7 +7005,9 @@ class ProvisionServer(ThreadingHTTPServer):
         self.profile_settings_lock = threading.Lock()
         self.pinned_sessions: dict[str, str] = self.load_pinned_sessions()
         self.session_tab_order: dict[str, int] = self.load_session_tab_order()
-        self.next_session_tab_order = (max(self.session_tab_order.values()) + 1) if self.session_tab_order else 0
+        self.next_session_tab_order = (
+            (max(self.session_tab_order.values()) + 1) if self.session_tab_order else 0
+        )
         self.reset_credit_state: dict[str, dict[str, Any]] = self.load_reset_credit_state()
         self.reset_credit_state_lock = threading.Lock()
         self.reset_credit_verify_threads: dict[str, threading.Thread] = {}
@@ -5867,17 +7034,104 @@ class ProvisionServer(ThreadingHTTPServer):
         self.resume_candidates_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
         self.resume_candidates_lock = threading.Lock()
         self.resume_candidates_inflight: dict[str, threading.Event] = {}
+        self.prune_orphaned_launcher_sockets()
 
     def log_message(self, format: str, *args: Any) -> None:
         message = format % args
         message = redact_proxy_token(message, self.proxy_token)
-        sys.stderr.write(
-            "%s %s\n"
-            % (
-                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                message,
+        try:
+            sys.stderr.write(
+                "%s %s\n"
+                % (
+                    datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    message,
+                )
             )
-        )
+        except OSError:
+            # Logging must not interrupt cleanup when storage is unavailable.
+            pass
+
+    def prune_orphaned_launcher_sockets(self) -> None:
+        """Remove dead PTY-control socket files left behind by interrupted CLIs.
+
+        Each managed launcher owns a socket named with its own PID.  A Unix
+        socket pathname can survive an interrupted process, causing needless
+        filesystem growth and making an old session look controllable after a
+        daemon restart.  Never touch a socket whose owning launcher is still
+        running; a live launcher will re-register on its five-second
+        heartbeat.
+        """
+        try:
+            candidates = tuple(self.paths.launchers.glob("provision-*.sock"))
+        except OSError:
+            return
+        for path in candidates:
+            if not path.is_socket():
+                continue
+            match = re.fullmatch(r"provision-(\d+)-[0-9a-f]+\.sock", path.name)
+            if match is None:
+                continue
+            try:
+                launcher_pid = int(match.group(1))
+            except ValueError:
+                continue
+            if process_is_running(launcher_pid):
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                continue
+
+    def prune_stale_observed_sessions_locked(
+        self,
+        *,
+        now: float,
+        live_ui_launcher_pids: set[int],
+    ) -> list[str]:
+        """Evict departed live-session records while retaining durable pins.
+
+        Pins are separate routing preferences and deliberately survive this
+        cleanup.  The next request or PTY heartbeat recreates the lightweight
+        observation record if that project becomes active again.
+        """
+        stale_keys: list[str] = []
+        for key, record in self.observed_sessions.items():
+            last_seen = float(record.get("last_seen_monotonic") or 0.0)
+            if now - last_seen < OBSERVED_SESSION_RETENTION_SECONDS:
+                continue
+            control_path = str(record.get("control_path") or "")
+            control_available = bool(control_path and Path(control_path).exists())
+            ui_launcher_pid = record.get("ui_launcher_pid")
+            ui_launcher_running = (
+                isinstance(ui_launcher_pid, int) and ui_launcher_pid in live_ui_launcher_pids
+            )
+            provider_pid = record.get("provider_pid")
+            provider_running = process_is_running(
+                provider_pid if isinstance(provider_pid, int) else None
+            )
+            has_request = any(
+                request.get("session_key") == key for request in self.active_requests.values()
+            )
+            has_tunnel = any(
+                tunnel.get("session_key") == key for tunnel in self.active_websockets.values()
+            )
+            if (
+                control_available
+                or ui_launcher_running
+                or provider_running
+                or has_request
+                or has_tunnel
+            ):
+                continue
+            stale_keys.append(key)
+
+        for key in stale_keys:
+            self.observed_sessions.pop(key, None)
+            self.control_transcripts.pop(key, None)
+            self.session_tab_order.pop(key, None)
+        if stale_keys:
+            self.save_session_tab_order_locked()
+        return stale_keys
 
     def ensure_remote_runtime(self) -> None:
         """Lazily allocate dormant local state for a future Remote Agent."""
@@ -5889,13 +7143,21 @@ class ProvisionServer(ThreadingHTTPServer):
             secret = self.store.remote_secret()
             self.remote_secret = secret
             self.remote_cursor_codec = RemoteCursorCodec(secret)
-            self.remote_devices = RemoteDeviceRegistry(self.paths.remote_devices, self.paths.remote_audit)
+            self.remote_devices = RemoteDeviceRegistry(
+                self.paths.remote_devices, self.paths.remote_audit
+            )
             self.remote_state = RemoteStateSynchronizer()
             self.remote_actions = RemoteActionCache(self.paths.remote_action_state)
 
     def remote_runtime(
         self,
-    ) -> tuple[bytes, RemoteCursorCodec, RemoteDeviceRegistry, RemoteStateSynchronizer, RemoteActionCache]:
+    ) -> tuple[
+        bytes,
+        RemoteCursorCodec,
+        RemoteDeviceRegistry,
+        RemoteStateSynchronizer,
+        RemoteActionCache,
+    ]:
         self.ensure_remote_runtime()
         assert self.remote_secret is not None
         assert self.remote_cursor_codec is not None
@@ -5930,7 +7192,7 @@ class ProvisionServer(ThreadingHTTPServer):
 
     @staticmethod
     def connector_lanes() -> list[str]:
-        return ["provision.echo/v1", "provision.remote/v1"]
+        return ["provision.echo/v1", "provision.remote/v1", "provision.remote-admin/v1"]
 
     def connector_status(self) -> dict[str, Any]:
         with self.connector_hub_lock:
@@ -5976,6 +7238,32 @@ class ProvisionServer(ThreadingHTTPServer):
             return compact_json_bytes({"ok": False, "error": str(exc)})
         return compact_json_bytes({"ok": True, "result": result})
 
+    def connector_remote_admin_frame(
+        self,
+        _connector_id: str,
+        _link_id: str,
+        _lane: str,
+        payload: bytes,
+    ) -> bytes:
+        """Handle host-local paired-device lifecycle requests.
+
+        This lane is for an explicitly trusted connector's host-side pairing
+        UI or a local Provision command.  It is intentionally distinct from
+        the remote request lane so a connector does not accidentally forward
+        device administration requests from an untrusted network peer.
+        """
+        try:
+            request = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return compact_json_bytes({"ok": False, "error": "invalid remote connector frame"})
+        if not isinstance(request, dict) or "token" in request:
+            return compact_json_bytes({"ok": False, "error": "invalid remote connector frame"})
+        try:
+            result = self.handle_remote_admin_request(request)
+        except RemoteError as exc:
+            return compact_json_bytes({"ok": False, "error": str(exc)})
+        return compact_json_bytes({"ok": True, "result": result})
+
     def start_connector_hub(self) -> dict[str, Any]:
         """Enable only the local Connector ABI socket; never a network listener."""
         with self.connector_hub_lock:
@@ -5986,6 +7274,7 @@ class ProvisionServer(ThreadingHTTPServer):
                     {
                         "provision.echo/v1": self.connector_echo_frame,
                         "provision.remote/v1": self.connector_remote_frame,
+                        "provision.remote-admin/v1": self.connector_remote_admin_frame,
                     },
                 )
             hub = self.connector_hub
@@ -6004,9 +7293,247 @@ class ProvisionServer(ThreadingHTTPServer):
         return self.connector_status()
 
     def server_close(self) -> None:
+        self.release_permission_requests()
         self.stop_connector_hub()
         self.stop_remote_agent_api()
         super().server_close()
+
+    @staticmethod
+    def permission_bridge_supported(record: dict[str, Any]) -> bool:
+        provider = str(record.get("provider") or "codex")
+        bridge = str(record.get("permission_bridge") or "").split(":", 1)[0]
+        return (provider, bridge) in {
+            ("claude", "claude-permission-hook-v1"),
+            ("codex", "codex-permission-hook-v1"),
+            ("grok", "grok-acp-permission-v1"),
+        }
+
+    @classmethod
+    def permission_bridge_available(cls, record: dict[str, Any]) -> bool:
+        control_path = str(record.get("control_path") or "")
+        return bool(
+            cls.permission_bridge_supported(record) and control_path and Path(control_path).exists()
+        )
+
+    def permission_bridge_state(self, session_key: str) -> tuple[bool, bool, str]:
+        key = normalize_session_key(session_key)
+        with self.active_lock:
+            record = self.observed_sessions.get(key)
+            if not isinstance(record, dict):
+                return False, False, "Session is no longer available."
+            supported = self.permission_bridge_available(record)
+            provider = str(record.get("provider") or "codex")
+        with self.permission_condition:
+            enabled = self.permission_routes.get(key) == str(record.get("permission_bridge") or "")
+        if supported:
+            reason = "Browser approval is available for this managed session."
+        elif provider == "grok":
+            reason = (
+                "Grok terminal sessions do not expose safe synchronous permission decisions yet."
+            )
+        elif provider == "codex":
+            reason = "Codex terminal sessions require an app-server or explicit hook adapter."
+        else:
+            reason = "Restart this managed session to enable browser approvals."
+        return supported, bool(supported and enabled), reason
+
+    def set_permission_routing(self, session_key: str, enabled: bool) -> None:
+        key = normalize_session_key(session_key)
+        with self.active_lock:
+            record = self.observed_sessions.get(key)
+            if not isinstance(record, dict):
+                raise StoreError("unknown session")
+            supported = self.permission_bridge_available(record)
+        if enabled and not supported:
+            raise StoreError("browser approvals are unavailable for this session")
+        with self.permission_condition:
+            if enabled:
+                self.permission_routes[key] = str(record.get("permission_bridge") or "")
+            else:
+                self.permission_routes.pop(key, None)
+                self._release_permission_requests_locked(session_key=key)
+            self.permission_condition.notify_all()
+        self.mark_ui_dirty("permissions")
+
+    def ui_client_connected(self) -> None:
+        with self.permission_condition:
+            self.ui_client_count += 1
+        self.mark_ui_dirty("permissions")
+
+    def ui_client_disconnected(self) -> None:
+        with self.permission_condition:
+            self.ui_client_count = max(0, self.ui_client_count - 1)
+            if self.ui_client_count == 0:
+                self._release_permission_requests_locked()
+            self.permission_condition.notify_all()
+        self.mark_ui_dirty("permissions")
+
+    def _expire_permission_state_locked(self) -> bool:
+        now = time.monotonic()
+        changed = False
+        for request in self.pending_permissions.values():
+            if not request.get("decision") and now >= float(request.get("deadline") or 0.0):
+                request["decision"] = "terminal"
+                changed = True
+        expired = [
+            request_id
+            for request_id, resolved_at in self.resolved_permissions.items()
+            if now - resolved_at >= PERMISSION_RESOLVED_TTL_SECONDS
+        ]
+        for request_id in expired:
+            self.resolved_permissions.pop(request_id, None)
+        return changed
+
+    def _release_permission_requests_locked(self, session_key: str = "") -> bool:
+        changed = False
+        for request in self.pending_permissions.values():
+            if session_key and request.get("session_key") != session_key:
+                continue
+            if not request.get("decision"):
+                request["decision"] = "terminal"
+                changed = True
+        return changed
+
+    def release_permission_requests(self, session_key: str = "") -> None:
+        with self.permission_condition:
+            changed = self._release_permission_requests_locked(session_key=session_key)
+            if session_key:
+                self.permission_routes.pop(session_key, None)
+            self.permission_condition.notify_all()
+        if changed:
+            self.mark_ui_dirty("permissions")
+
+    def permission_state_snapshot(self) -> dict[str, Any]:
+        with self.permission_condition:
+            self._expire_permission_state_locked()
+            pending = [
+                {
+                    key: value
+                    for key, value in request.items()
+                    if key
+                    in {
+                        "request_id",
+                        "session_key",
+                        "provider",
+                        "workspace",
+                        "native_session_id",
+                        "turn_id",
+                        "tool_name",
+                        "category",
+                        "reason",
+                        "preview",
+                        "requested_at",
+                        "expires_at",
+                    }
+                }
+                for request in self.pending_permissions.values()
+                if not request.get("decision")
+            ]
+            clients = self.ui_client_count
+            self.permission_condition.notify_all()
+        pending.sort(key=lambda item: str(item.get("requested_at") or ""))
+        return {"pending": pending, "browser_clients": clients}
+
+    def request_permission(
+        self,
+        session_key: str,
+        provider: str,
+        request: dict[str, Any],
+        *,
+        timeout: float = PERMISSION_REQUEST_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        key = normalize_session_key(session_key)
+        try:
+            provider = canonical_provider(provider)
+        except ProviderError:
+            return {"ok": True, "decision": "terminal"}
+        with self.active_lock:
+            record = self.observed_sessions.get(key)
+            if (
+                not isinstance(record, dict)
+                or str(record.get("provider") or "codex") != provider
+                or not self.permission_bridge_supported(record)
+            ):
+                return {"ok": True, "decision": "terminal"}
+            workspace = bounded_permission_text(
+                record.get("name") or session_display_name(key), PERMISSION_PATH_MAX_CHARS
+            )
+            permission_bridge = str(record.get("permission_bridge") or "")
+        now = datetime.now().astimezone()
+        timeout = max(0.01, min(float(timeout), PERMISSION_REQUEST_TIMEOUT_SECONDS))
+        deadline = time.monotonic() + timeout
+        request_id = secrets.token_urlsafe(24)
+        pending = {
+            "request_id": request_id,
+            "session_key": key,
+            "provider": provider,
+            "workspace": workspace,
+            "native_session_id": bounded_permission_text(
+                request.get("native_session_id"), PERMISSION_ID_MAX_CHARS
+            ),
+            "turn_id": bounded_permission_text(request.get("turn_id"), PERMISSION_ID_MAX_CHARS),
+            "tool_name": bounded_permission_text(request.get("tool_name") or "Tool", 160),
+            "category": bounded_permission_text(request.get("category") or "tool", 40),
+            "reason": bounded_permission_text(request.get("reason"), PERMISSION_REASON_MAX_CHARS),
+            "preview": bounded_permission_text(
+                request.get("preview"), PERMISSION_PREVIEW_MAX_CHARS
+            ),
+            "requested_at": now.isoformat(),
+            "expires_at": (now + timedelta(seconds=timeout)).isoformat(),
+            "deadline": deadline,
+            "decision": "",
+            "permission_bridge": permission_bridge,
+        }
+        with self.permission_condition:
+            self._expire_permission_state_locked()
+            if (
+                self.permission_routes.get(key) != permission_bridge
+                or self.ui_client_count <= 0
+                or len(self.pending_permissions) >= PERMISSION_MAX_PENDING
+            ):
+                return {"ok": True, "decision": "terminal"}
+            self.pending_permissions[request_id] = pending
+            self.permission_condition.notify_all()
+        self.mark_ui_dirty("permissions")
+        with self.permission_condition:
+            while not pending["decision"]:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    pending["decision"] = "terminal"
+                    break
+                self.permission_condition.wait(timeout=remaining)
+                if (
+                    self.permission_routes.get(key) != permission_bridge
+                    or self.ui_client_count <= 0
+                ):
+                    pending["decision"] = "terminal"
+            decision = str(pending.get("decision") or "terminal")
+            self.pending_permissions.pop(request_id, None)
+            self.resolved_permissions[request_id] = time.monotonic()
+            if len(self.resolved_permissions) > PERMISSION_MAX_RESOLVED:
+                oldest = sorted(self.resolved_permissions, key=self.resolved_permissions.get)
+                for old_id in oldest[: len(self.resolved_permissions) - PERMISSION_MAX_RESOLVED]:
+                    self.resolved_permissions.pop(old_id, None)
+        self.mark_ui_dirty("permissions")
+        return {"ok": True, "decision": decision}
+
+    def resolve_permission(self, request_id: str, session_key: str, decision: str) -> None:
+        request_id = bounded_permission_text(request_id, PERMISSION_ID_MAX_CHARS)
+        key = normalize_session_key(session_key)
+        if decision not in {"allow", "deny", "terminal"}:
+            raise StoreError("unsupported permission decision")
+        with self.permission_condition:
+            self._expire_permission_state_locked()
+            request = self.pending_permissions.get(request_id)
+            if request_id in self.resolved_permissions or not isinstance(request, dict):
+                raise StoreError("permission request is no longer pending")
+            if request.get("session_key") != key:
+                raise StoreError("permission request does not belong to this session")
+            if request.get("decision"):
+                raise StoreError("permission request is no longer pending")
+            request["decision"] = decision
+            self.permission_condition.notify_all()
+        self.mark_ui_dirty("permissions")
 
     def handle_remote_agent_request(self, request: dict[str, Any]) -> dict[str, Any]:
         """Dispatch the typed Unix-socket contract used by a future agent.
@@ -6021,6 +7548,16 @@ class ProvisionServer(ThreadingHTTPServer):
         device_id = request.get("device_id")
         if not isinstance(device_id, str):
             raise RemoteError("remote device ID is required")
+        if operation == "device_enroll":
+            if set(request) != {"operation", "device_id", "identity_fingerprint"}:
+                raise RemoteError("invalid remote device enrollment request")
+            identity_fingerprint = request.get("identity_fingerprint")
+            if not isinstance(identity_fingerprint, str):
+                raise RemoteError("remote device identity fingerprint is required")
+            # The connector must have completed its own verified pairing before
+            # it reaches this point. A newly enrolled device remains read-only
+            # until a local host-side grant changes its capabilities.
+            return self.enroll_remote_device(device_id, identity_fingerprint)
         if operation == "state":
             since = request.get("since_revision")
             cursor = request.get("cursor")
@@ -6081,6 +7618,47 @@ class ProvisionServer(ThreadingHTTPServer):
             )
         raise RemoteError("unsupported local remote-agent operation")
 
+    def handle_remote_admin_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Manage paired devices from the host-local Connector Admin lane."""
+        operation = request.get("operation")
+        if operation == "device_list":
+            if set(request) != {"operation"}:
+                raise RemoteError("invalid remote device list request")
+            _secret, _cursor_codec, devices, _state, _actions = self.remote_runtime()
+            return {"devices": devices.list_devices()}
+        if operation == "device_enroll":
+            if set(request) != {"operation", "device_id", "identity_fingerprint"}:
+                raise RemoteError("invalid remote device enrollment request")
+            device_id = request.get("device_id")
+            identity_fingerprint = request.get("identity_fingerprint")
+            if not isinstance(device_id, str) or not isinstance(identity_fingerprint, str):
+                raise RemoteError("remote device ID and identity fingerprint are required")
+            return self.enroll_remote_device(device_id, identity_fingerprint)
+        if operation == "device_set_capabilities":
+            if set(request) != {"operation", "device_id", "capabilities"}:
+                raise RemoteError("invalid remote device capability request")
+            device_id = request.get("device_id")
+            capabilities = request.get("capabilities")
+            if not isinstance(device_id, str) or not isinstance(capabilities, list):
+                raise RemoteError("remote device ID and capabilities are required")
+            _secret, _cursor_codec, devices, _state, _actions = self.remote_runtime()
+            result = devices.set_capabilities(device_id, capabilities)
+            devices.append_audit(
+                event="device_capabilities_updated",
+                device_id=str(result.get("device_id") or ""),
+                outcome="ok",
+            )
+            return result
+        if operation == "device_revoke":
+            if set(request) != {"operation", "device_id"}:
+                raise RemoteError("invalid remote device revoke request")
+            device_id = request.get("device_id")
+            if not isinstance(device_id, str):
+                raise RemoteError("remote device ID is required")
+            self.revoke_remote_device(device_id)
+            return {"device_id": device_id, "revoked": True}
+        raise RemoteError("unsupported local remote-admin operation")
+
     def mark_ui_dirty(self, reason: str = "state") -> int:
         lock = getattr(self, "ui_state_lock", None)
         if lock is None:
@@ -6125,10 +7703,15 @@ class ProvisionServer(ThreadingHTTPServer):
             first_revision = int(dirty_log[0][0] or 0)
             if first_revision > revision + 1:
                 return {"state"}
-            reasons = {str(reason or "state") for version, reason in dirty_log if int(version or 0) > revision}
+            reasons = {
+                str(reason or "state")
+                for version, reason in dirty_log
+                if int(version or 0) > revision
+            }
             return reasons or {"state"}
 
     def ui_state_liveness_signature(self) -> tuple[Any, ...]:
+        self.refresh_provider_sessions()
         with self.active_lock:
             self.expire_websocket_work_locked()
             now = time.monotonic()
@@ -6157,7 +7740,19 @@ class ProvisionServer(ThreadingHTTPServer):
                     for tunnel in self.active_websockets.values()
                 )
             )
-        return request_rows, tunnel_rows
+            provider_rows = tuple(
+                sorted(
+                    (
+                        key,
+                        bool(record.get("provider_process_running")),
+                        bool(record.get("provider_working")),
+                        str(record.get("provider_session_id") or ""),
+                    )
+                    for key, record in getattr(self, "observed_sessions", {}).items()
+                    if str(record.get("provider") or "codex") != "codex"
+                )
+            )
+        return request_rows, tunnel_rows, provider_rows
 
     def ui_launcher_permission_args(self, permission: str) -> list[str]:
         key = permission if permission in UI_LAUNCHER_PERMISSION_PRESETS else "workspace-write"
@@ -6219,7 +7814,9 @@ class ProvisionServer(ThreadingHTTPServer):
                 pass
             try:
                 _, status = os.waitpid(pid, 0)
-                exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status)
+                exit_code = (
+                    os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status)
+                )
             except OSError:
                 exit_code = 1
             with self.ui_launchers_lock:
@@ -6231,7 +7828,11 @@ class ProvisionServer(ThreadingHTTPServer):
                     record["ui_launcher_exited_at"] = datetime.now().astimezone()
                     record["last_seen_monotonic"] = time.monotonic()
                     record["last_seen_at"] = datetime.now().astimezone()
-            self.log_message("UI-launched provision session %s exited with status %s", session_key, exit_code)
+            self.log_message(
+                "UI-launched provision session %s exited with status %s",
+                session_key,
+                exit_code,
+            )
             self.mark_ui_dirty("ui_launcher_exit")
 
     def launch_ui_session(
@@ -6251,12 +7852,18 @@ class ProvisionServer(ThreadingHTTPServer):
             record = self.observed_sessions.get(key)
             if not isinstance(record, dict):
                 raise StoreError("unknown session")
+            if str(record.get("provider") or "codex") != "codex":
+                raise StoreError("the dashboard launcher currently supports Codex sessions only")
             cwd = str(record.get("cwd") or key)
         cwd_path = Path(cwd).expanduser()
         if not cwd_path.is_dir():
             raise StoreError(f"working directory is not available: {cwd}")
         resolved_cwd = str(cwd_path.resolve(strict=False))
-        launch_profile = profile if profile and self.store.profile_exists(profile) else self.control_profile_for_session(key)
+        launch_profile = (
+            profile
+            if profile and self.store.profile_exists(profile)
+            else self.control_profile_for_session(key)
+        )
         launch_key = f"{normalize_session_key(resolved_cwd)}::ui::{uuid.uuid4().hex[:10]}"
         with self.active_lock:
             self.observe_session_locked(launch_key, resolved_cwd, launch_profile)
@@ -6350,8 +7957,12 @@ class ProvisionServer(ThreadingHTTPServer):
             record = self.observed_sessions.get(key)
             if not isinstance(record, dict):
                 raise StoreError("unknown session")
-            has_request = any(request.get("session_key") == key for request in self.active_requests.values())
-            has_tunnel = any(tunnel.get("session_key") == key for tunnel in self.active_websockets.values())
+            has_request = any(
+                request.get("session_key") == key for request in self.active_requests.values()
+            )
+            has_tunnel = any(
+                tunnel.get("session_key") == key for tunnel in self.active_websockets.values()
+            )
             control_path = str(record.get("control_path") or "")
             control_live = bool(control_path and Path(control_path).exists())
             ui_pid = record.get("ui_launcher_pid")
@@ -6388,6 +7999,8 @@ class ProvisionServer(ThreadingHTTPServer):
                 self.save_pinned_sessions_locked()
             if changed_tab_order:
                 self.save_session_tab_order_locked()
+        with self.provider_session_readers_lock:
+            self.provider_session_readers.pop(key, None)
         for sock in sockets:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -6403,6 +8016,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 path.unlink()
             except OSError:
                 pass
+        self.release_permission_requests(key)
         self.mark_ui_dirty("session_forget")
 
     def load_profile_settings(self) -> dict[str, dict[str, Any]]:
@@ -6491,6 +8105,8 @@ class ProvisionServer(ThreadingHTTPServer):
             record = self.observed_sessions.get(session_key)
             if not isinstance(record, dict):
                 raise StoreError("unknown session")
+            if str(record.get("provider") or "codex") != "codex":
+                return []
             cwd = str(record.get("cwd") or session_key)
         return self.resume_candidates_for_cwd(cwd)
 
@@ -6541,6 +8157,8 @@ class ProvisionServer(ThreadingHTTPServer):
             record = self.observed_sessions.get(session_key)
             if not isinstance(record, dict):
                 raise StoreError("unknown session")
+            if str(record.get("provider") or "codex") != "codex":
+                return []
             cwd = str(record.get("cwd") or session_key)
             observed_turns = self.control_turns_from_transcript(
                 self.control_transcript_snapshot(session_key)
@@ -6549,7 +8167,9 @@ class ProvisionServer(ThreadingHTTPServer):
         return [
             turn
             for turn in history_turns
-            if not any(history_turn_duplicates_observed(turn, observed) for observed in observed_turns)
+            if not any(
+                history_turn_duplicates_observed(turn, observed) for observed in observed_turns
+            )
         ]
 
     def history_turn_payload_for_session(self, session_key: str, turn_key: str) -> dict[str, Any]:
@@ -6557,6 +8177,8 @@ class ProvisionServer(ThreadingHTTPServer):
             record = self.observed_sessions.get(session_key)
             if not isinstance(record, dict):
                 raise StoreError("unknown session")
+            if str(record.get("provider") or "codex") != "codex":
+                raise StoreError("native history is not available for this provider")
             cwd = str(record.get("cwd") or session_key)
         payload = codex_history_turn_payload_for_cwd(cwd, turn_key)
         if not payload:
@@ -6710,7 +8332,9 @@ class ProvisionServer(ThreadingHTTPServer):
             settings = self.profile_settings.setdefault(profile, {})
             settings["login_required"] = True
             settings["login_error"] = message[:500]
-            settings["login_error_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            settings["login_error_at"] = (
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            )
             self.save_profile_settings_locked()
         self.mark_ui_dirty("login_required")
 
@@ -6794,7 +8418,9 @@ class ProvisionServer(ThreadingHTTPServer):
             settings = self.profile_settings.setdefault(profile, {})
             settings["billing_required"] = True
             settings["billing_error"] = message[:500]
-            settings["billing_error_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            settings["billing_error_at"] = (
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            )
             self.save_profile_settings_locked()
         self.mark_ui_dirty("billing_required")
 
@@ -6925,7 +8551,11 @@ class ProvisionServer(ThreadingHTTPServer):
         elif status:
             blocks = bool(guard_until and guard_until > current)
             label = "Reset guarded" if blocks else "Reset available"
-            title = str(state.get("error") or state.get("outcome") or "Previous reset-credit attempt did not complete.")
+            title = str(
+                state.get("error")
+                or state.get("outcome")
+                or "Previous reset-credit attempt did not complete."
+            )
 
         if cooldown_until and cooldown_until > current:
             title = f"{title} Disabled until {format_status_updated_at(cooldown_until)}.".strip()
@@ -6965,7 +8595,9 @@ class ProvisionServer(ThreadingHTTPServer):
         if status in {"pending", "verifying"} and requested_at:
             if requested_at + timedelta(seconds=RESET_CREDIT_VERIFY_TIMEOUT_SECONDS) < current:
                 state["status"] = "unconfirmed"
-                state["last_error"] = "usage endpoint did not confirm the reset before the verification timeout"
+                state["last_error"] = (
+                    "usage endpoint did not confirm the reset before the verification timeout"
+                )
                 changed = True
         status = str(state.get("status") or "")
         if status in {"verified", "unconfirmed"} and cooldown_until and cooldown_until <= current:
@@ -6999,7 +8631,25 @@ class ProvisionServer(ThreadingHTTPServer):
             return False
         with lock:
             state = self.normalize_reset_credit_state_locked(profile)
-            return str(state.get("status") or "") in {"pending", "verifying", "unconfirmed"}
+            return str(state.get("status") or "") in {
+                "pending",
+                "verifying",
+                "unconfirmed",
+            }
+
+    def ensure_reset_credit_attempt_allowed(self, profile: str) -> None:
+        """Fail before opening an app-server connection when a credit is guarded."""
+        if not self.store.profile_exists(profile):
+            raise StoreError(f"unknown profile: {profile}")
+        with self.reset_credit_state_lock:
+            existing = self.normalize_reset_credit_state_locked(profile)
+            public = self.reset_credit_public_state_from_state(existing) if existing else {}
+            if public.get("blocks"):
+                raise ResetCreditGuardError(
+                    str(
+                        public.get("message") or "Reset credit is already pending for this profile."
+                    )
+                )
 
     def begin_reset_credit_attempt(self, profile: str, idempotency_key: str) -> None:
         if not self.store.profile_exists(profile):
@@ -7009,16 +8659,22 @@ class ProvisionServer(ThreadingHTTPServer):
         now = datetime.now(timezone.utc)
         with self.reset_credit_state_lock:
             existing = self.normalize_reset_credit_state_locked(profile, now=now)
-            public = self.reset_credit_public_state_from_state(existing, now=now) if existing else {}
+            public = (
+                self.reset_credit_public_state_from_state(existing, now=now) if existing else {}
+            )
             if public.get("blocks"):
                 raise ResetCreditGuardError(
-                    str(public.get("message") or "Reset credit is already pending for this profile.")
+                    str(
+                        public.get("message") or "Reset credit is already pending for this profile."
+                    )
                 )
             state: dict[str, Any] = {
                 "status": "pending",
                 "idempotency_key": idempotency_key,
                 "requested_at": utc_timestamp(now),
-                "cooldown_until": utc_timestamp(now + timedelta(seconds=RESET_CREDIT_COOLDOWN_SECONDS)),
+                "cooldown_until": utc_timestamp(
+                    now + timedelta(seconds=RESET_CREDIT_COOLDOWN_SECONDS)
+                ),
             }
             if isinstance(before_payload, dict):
                 state["before_payload"] = before_payload
@@ -7039,7 +8695,9 @@ class ProvisionServer(ThreadingHTTPServer):
             state["idempotency_key"] = idempotency_key
             state.setdefault("requested_at", utc_timestamp(now))
             state["error"] = str(error)[:500]
-            state["guard_until"] = utc_timestamp(now + timedelta(seconds=RESET_CREDIT_ERROR_GUARD_SECONDS))
+            state["guard_until"] = utc_timestamp(
+                now + timedelta(seconds=RESET_CREDIT_ERROR_GUARD_SECONDS)
+            )
             self.save_reset_credit_state_locked()
         self.mark_ui_dirty("reset_credit_error")
 
@@ -7068,7 +8726,9 @@ class ProvisionServer(ThreadingHTTPServer):
                     state["app_server_payload"] = payload
             else:
                 state["status"] = outcome or "unknown"
-                state["guard_until"] = utc_timestamp(now + timedelta(seconds=RESET_CREDIT_ERROR_GUARD_SECONDS))
+                state["guard_until"] = utc_timestamp(
+                    now + timedelta(seconds=RESET_CREDIT_ERROR_GUARD_SECONDS)
+                )
             self.save_reset_credit_state_locked()
         self.mark_ui_dirty("reset_credit_outcome")
         if outcome == "reset":
@@ -7093,7 +8753,11 @@ class ProvisionServer(ThreadingHTTPServer):
         verified = False
         with lock:
             state = self.normalize_reset_credit_state_locked(profile, now=now)
-            if str(state.get("status") or "") not in {"pending", "verifying", "unconfirmed"}:
+            if str(state.get("status") or "") not in {
+                "pending",
+                "verifying",
+                "unconfirmed",
+            }:
                 return False
             state["last_checked_at"] = utc_timestamp(now)
             before_payload = state.get("before_payload")
@@ -7135,7 +8799,11 @@ class ProvisionServer(ThreadingHTTPServer):
     ) -> None:
         with self.reset_credit_state_lock:
             state = self.normalize_reset_credit_state_locked(profile)
-            if str(state.get("status") or "") not in {"pending", "verifying", "unconfirmed"}:
+            if str(state.get("status") or "") not in {
+                "pending",
+                "verifying",
+                "unconfirmed",
+            }:
                 return
             current = self.reset_credit_verify_threads.get(profile)
             if current and current.is_alive():
@@ -7158,7 +8826,11 @@ class ProvisionServer(ThreadingHTTPServer):
             try:
                 self.usage_payload_for_profile(profile, force=True)
             except Exception as exc:
-                self.log_message("reset-credit verification refresh for profile %s failed: %s", profile, exc)
+                self.log_message(
+                    "reset-credit verification refresh for profile %s failed: %s",
+                    profile,
+                    exc,
+                )
             if not self.reset_credit_awaiting_usage_confirmation(profile):
                 return
             if time.monotonic() - started >= RESET_CREDIT_VERIFY_TIMEOUT_SECONDS:
@@ -7166,7 +8838,9 @@ class ProvisionServer(ThreadingHTTPServer):
                     state = self.normalize_reset_credit_state_locked(profile)
                     if str(state.get("status") or "") in {"pending", "verifying"}:
                         state["status"] = "unconfirmed"
-                        state["last_error"] = "usage endpoint did not confirm the reset before the verification timeout"
+                        state["last_error"] = (
+                            "usage endpoint did not confirm the reset before the verification timeout"
+                        )
                         self.reset_credit_state[profile] = state
                         self.save_reset_credit_state_locked()
                 return
@@ -7244,7 +8918,9 @@ class ProvisionServer(ThreadingHTTPServer):
         try:
             self.paths.session_tabs.parent.mkdir(parents=True, exist_ok=True)
             temp = self.paths.session_tabs.with_suffix(self.paths.session_tabs.suffix + ".tmp")
-            encoded = json.dumps(dict(sorted(known.items(), key=lambda item: item[1])), indent=2) + "\n"
+            encoded = (
+                json.dumps(dict(sorted(known.items(), key=lambda item: item[1])), indent=2) + "\n"
+            )
             with temp.open("w", encoding="utf-8") as handle:
                 handle.write(encoded)
             temp.chmod(0o600)
@@ -7289,9 +8965,17 @@ class ProvisionServer(ThreadingHTTPServer):
                     record["tab_order"] = ordered
                 ordered += 1
             remaining = sorted(
-                (key for key in observed_keys if key not in self.session_tab_order or key not in normalized_keys),
+                (
+                    key
+                    for key in observed_keys
+                    if key not in self.session_tab_order or key not in normalized_keys
+                ),
                 key=lambda key: (
-                    int(self.session_tab_order.get(key, self.observed_sessions[key].get("tab_order", 0))),
+                    int(
+                        self.session_tab_order.get(
+                            key, self.observed_sessions[key].get("tab_order", 0)
+                        )
+                    ),
                     float(self.observed_sessions[key].get("first_seen_monotonic") or 0.0),
                     key,
                 ),
@@ -7309,21 +8993,32 @@ class ProvisionServer(ThreadingHTTPServer):
         cwd: str,
         profile: str | None = None,
         *,
+        provider: str = "codex",
+        provider_profile: str | None = None,
         control_path: str | None = None,
         launcher_pid: int | None = None,
+        provider_pid: int | None = None,
+        provider_state_root: str | None = None,
+        permission_bridge: str | None = None,
         pty_managed: bool = False,
         clear_control_path: bool = False,
     ) -> str:
         key = normalize_session_key(cwd)
         if not key:
             return ""
+        provider = canonical_provider(provider)
         with self.active_lock:
             self.observe_session_locked(
                 key,
                 cwd,
                 profile,
+                provider=provider,
+                provider_profile=provider_profile,
                 control_path=control_path,
                 launcher_pid=launcher_pid,
+                provider_pid=provider_pid,
+                provider_state_root=provider_state_root,
+                permission_bridge=permission_bridge,
                 pty_managed=pty_managed,
                 clear_control_path=clear_control_path,
             )
@@ -7335,8 +9030,13 @@ class ProvisionServer(ThreadingHTTPServer):
         cwd: str,
         profile: str | None = None,
         *,
+        provider: str = "codex",
+        provider_profile: str | None = None,
         control_path: str | None = None,
         launcher_pid: int | None = None,
+        provider_pid: int | None = None,
+        provider_state_root: str | None = None,
+        permission_bridge: str | None = None,
         pty_managed: bool = False,
         clear_control_path: bool = False,
     ) -> None:
@@ -7357,17 +9057,44 @@ class ProvisionServer(ThreadingHTTPServer):
         )
         previous_cwd = str(record.get("cwd") or "")
         previous_profile = str(record.get("last_profile") or "")
+        previous_provider = str(record.get("provider") or "codex")
+        previous_provider_profile = str(record.get("provider_profile") or "")
         previous_control_path = str(record.get("control_path") or "")
         previous_pty_managed = bool(record.get("pty_managed"))
         previous_launcher_pid = record.get("launcher_pid")
+        previous_provider_pid = record.get("provider_pid")
+        previous_provider_state_root = str(record.get("provider_state_root") or "")
+        previous_permission_bridge = str(record.get("permission_bridge") or "")
         record["tab_order"] = self.session_tab_order_for_key_locked(key)
         record["cwd"] = cwd
         record["display"] = compact_session_path(cwd)
         record["name"] = session_display_name(cwd)
         record["last_seen_monotonic"] = now
         record["last_seen_at"] = datetime.now().astimezone()
+        record["provider"] = provider
         if profile:
             record["last_profile"] = profile
+        if provider != "codex":
+            record["provider_profile"] = provider_profile or ""
+        else:
+            record.pop("provider_profile", None)
+        if previous_provider != provider:
+            for field in (
+                "provider_model",
+                "permission_bridge",
+                "provider_pid",
+                "provider_process_running",
+                "provider_session_id",
+                "provider_state_root",
+                "provider_usage",
+                "provider_usage_updated_at",
+                "provider_working",
+            ):
+                record.pop(field, None)
+            with self.permission_condition:
+                self.permission_routes.pop(key, None)
+                self._release_permission_requests_locked(session_key=key)
+                self.permission_condition.notify_all()
         if control_path:
             record["control_path"] = control_path
             record["pty_managed"] = bool(pty_managed)
@@ -7378,6 +9105,22 @@ class ProvisionServer(ThreadingHTTPServer):
             record["launcher_pid"] = launcher_pid
         elif clear_control_path:
             record.pop("launcher_pid", None)
+        if provider_pid is not None:
+            record["provider_pid"] = provider_pid
+        elif clear_control_path:
+            record.pop("provider_pid", None)
+        if provider_state_root:
+            record["provider_state_root"] = provider_state_root
+        if permission_bridge:
+            record["permission_bridge"] = bounded_permission_text(permission_bridge, 80)
+        elif clear_control_path:
+            record.pop("permission_bridge", None)
+        current_permission_bridge = str(record.get("permission_bridge") or "")
+        if previous_permission_bridge and previous_permission_bridge != current_permission_bridge:
+            with self.permission_condition:
+                self.permission_routes.pop(key, None)
+                self._release_permission_requests_locked(session_key=key)
+                self.permission_condition.notify_all()
         if new_tab_order:
             self.save_session_tab_order_locked()
         state_changed = (
@@ -7385,9 +9128,14 @@ class ProvisionServer(ThreadingHTTPServer):
             or new_tab_order
             or previous_cwd != str(record.get("cwd") or "")
             or previous_profile != str(record.get("last_profile") or "")
+            or previous_provider != str(record.get("provider") or "codex")
+            or previous_provider_profile != str(record.get("provider_profile") or "")
             or previous_control_path != str(record.get("control_path") or "")
             or previous_pty_managed != bool(record.get("pty_managed"))
             or previous_launcher_pid != record.get("launcher_pid")
+            or previous_provider_pid != record.get("provider_pid")
+            or previous_provider_state_root != str(record.get("provider_state_root") or "")
+            or previous_permission_bridge != str(record.get("permission_bridge") or "")
         )
         if state_changed:
             self.mark_ui_dirty("session_observe")
@@ -7419,6 +9167,8 @@ class ProvisionServer(ThreadingHTTPServer):
             record = self.observed_sessions.get(session_key)
             if record is None:
                 raise StoreError("unknown session")
+            if str(record.get("provider") or "codex") != "codex":
+                raise StoreError("Codex profile pins apply only to Codex sessions")
             active_profile = self.active_profile_for_session_locked(session_key)
             if active_profile and active_profile != profile:
                 raise StoreError(
@@ -7447,10 +9197,16 @@ class ProvisionServer(ThreadingHTTPServer):
 
     def active_profile_for_session_locked(self, session_key: str) -> str | None:
         self.expire_websocket_work_locked()
+        now = time.monotonic()
         for request in self.active_requests.values():
+            started = request.get("started_monotonic")
+            if (
+                isinstance(started, (int, float))
+                and now - float(started) > STALE_HTTP_REQUEST_SECONDS
+            ):
+                continue
             if request.get("session_key") == session_key:
                 return str(request.get("profile") or "")
-        now = time.monotonic()
         for tunnel in self.active_websockets.values():
             if tunnel.get("session_key") != session_key:
                 continue
@@ -7461,13 +9217,20 @@ class ProvisionServer(ThreadingHTTPServer):
                 return str(tunnel.get("profile") or "")
         return None
 
-    def begin_request(self, profile: str, session_key: str | None = None) -> int:
+    def begin_request(
+        self,
+        profile: str,
+        session_key: str | None = None,
+        *,
+        turn_work: bool = False,
+    ) -> int:
         with self.active_lock:
             self.next_request_id += 1
             request_id = self.next_request_id
             self.active_requests[request_id] = {
                 "profile": profile,
                 "session_key": session_key,
+                "turn_work": bool(turn_work),
                 "started_monotonic": time.monotonic(),
             }
         self.mark_ui_dirty("request_begin")
@@ -7481,7 +9244,28 @@ class ProvisionServer(ThreadingHTTPServer):
         if changed:
             self.mark_ui_dirty("request_end")
 
+    def expire_stale_requests_locked(self, now: float | None = None) -> int:
+        current = time.monotonic() if now is None else now
+        stale_ids = [
+            request_id
+            for request_id, request in self.active_requests.items()
+            if isinstance(request.get("started_monotonic"), (int, float))
+            and current - float(request["started_monotonic"]) > STALE_HTTP_REQUEST_SECONDS
+        ]
+        for request_id in stale_ids:
+            self.active_requests.pop(request_id, None)
+        return len(stale_ids)
+
+    def expire_stale_requests(self) -> int:
+        with self.active_lock:
+            expired = self.expire_stale_requests_locked()
+        if expired:
+            self.log_message("expired %s stale upstream request record(s)", expired)
+            self.mark_ui_dirty("request_expire")
+        return expired
+
     def request_count(self, *, blocking_only: bool = False) -> int:
+        self.expire_stale_requests()
         with self.active_lock:
             return sum(
                 1
@@ -7620,10 +9404,9 @@ class ProvisionServer(ThreadingHTTPServer):
         existing_line = existing.rsplit("\n", 1)[-1]
         if existing.endswith(("\n", "\r")):
             return ""
-        if (
-            re.match(r"\s*(?:[-*+]\s+|-\d+\s+|\d+\.\s+|#{1,6}\s+|>\s?|```)", text)
-            and not cls.transcript_line_has_open_markdown_span(existing_line)
-        ):
+        if re.match(
+            r"\s*(?:[-*+]\s+|-\d+\s+|\d+\.\s+|#{1,6}\s+|>\s?|```)", text
+        ) and not cls.transcript_line_has_open_markdown_span(existing_line):
             return "\n"
         if existing[-1].isspace() or text[0].isspace():
             return ""
@@ -7707,7 +9490,9 @@ class ProvisionServer(ThreadingHTTPServer):
                 existing["turn_id"] = turn_id
             existing["profile"] = profile or existing.get("profile") or ""
             existing["updated_at"] = now
-            self.set_transcript_item_text(existing, str(existing.get("role") or "user_pending"), text)
+            self.set_transcript_item_text(
+                existing, str(existing.get("role") or "user_pending"), text
+            )
             replay_after_pending = any(
                 item.get("role") in {"resume", "context_compaction"}
                 for item in transcript[index + 1 :]
@@ -7846,13 +9631,19 @@ class ProvisionServer(ThreadingHTTPServer):
         profile: str = "",
         append: bool = False,
         call_id: str = "",
+        tool_status: str = "",
+        tool_kind: str = "",
+        tool_title: str = "",
+        source_item_id: str = "",
+        authoritative: bool = False,
+        timestamp: str = "",
     ) -> None:
         if role in {"user", "user_pending", "resume", "context_compaction"}:
             text = clean_control_user_text(text)
         if not session_key or not text:
             return
         self.mark_ui_dirty("transcript")
-        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        now = timestamp or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         transcript = self.control_transcripts.setdefault(session_key, [])
 
         def notify_remote(item: dict[str, Any], *, replace: bool) -> None:
@@ -7886,19 +9677,28 @@ class ProvisionServer(ThreadingHTTPServer):
                 profile=profile,
                 now=now,
             )
-        if role == "user" and not append and self.promote_pending_user_transcript(
-            transcript,
-            text=text,
-            turn_id=turn_id,
-            profile=profile,
-            now=now,
+        if (
+            role == "user"
+            and not append
+            and self.promote_pending_user_transcript(
+                transcript,
+                text=text,
+                turn_id=turn_id,
+                profile=profile,
+                now=now,
+            )
         ):
             for existing in reversed(transcript):
                 if existing.get("role") == "user" and self.transcript_text_matches(existing, text):
                     notify_remote(existing, replace=True)
                     break
             return
-        if role == "resume" and not append and transcript and transcript[-1].get("role") == "resume":
+        if (
+            role == "resume"
+            and not append
+            and transcript
+            and transcript[-1].get("role") == "resume"
+        ):
             existing = transcript[-1]
             existing_turn = str(existing.get("turn_id") or "")
             if not turn_id or not existing_turn or existing_turn == turn_id:
@@ -7958,17 +9758,35 @@ class ProvisionServer(ThreadingHTTPServer):
                             )
                 return
         if role == "assistant":
+            if source_item_id:
+                for existing in reversed(transcript):
+                    if existing.get("role") not in {"assistant", "assistant_progress"}:
+                        continue
+                    if existing.get("source_item_id") != source_item_id:
+                        continue
+                    existing["role"] = "assistant"
+                    self.set_transcript_item_text(existing, "assistant", text)
+                    existing["updated_at"] = now
+                    existing["turn_id"] = turn_id or existing.get("turn_id") or ""
+                    existing["profile"] = profile or existing.get("profile") or ""
+                    existing["authoritative"] = authoritative or bool(existing.get("authoritative"))
+                    notify_remote(existing, replace=True)
+                    return
             for existing in reversed(transcript):
-                existing_turn = existing.get("turn_id")
+                progress_turn = str(existing.get("turn_id") or "")
                 if existing.get("role") != "assistant_progress":
                     continue
-                if turn_id and existing_turn and existing_turn != turn_id:
+                if turn_id and progress_turn and progress_turn != turn_id:
                     continue
                 existing["role"] = "assistant"
                 self.set_transcript_item_text(existing, "assistant", text)
                 existing["updated_at"] = now
-                existing["turn_id"] = turn_id or existing_turn or ""
+                existing["turn_id"] = turn_id or progress_turn
                 existing["profile"] = profile or existing.get("profile") or ""
+                if source_item_id:
+                    existing["source_item_id"] = source_item_id
+                if authoritative:
+                    existing["authoritative"] = True
                 notify_remote(existing, replace=True)
                 return
         if role == "tool" and call_id:
@@ -7981,6 +9799,12 @@ class ProvisionServer(ThreadingHTTPServer):
                 existing["updated_at"] = now
                 existing["turn_id"] = turn_id or existing.get("turn_id") or ""
                 existing["profile"] = profile or existing.get("profile") or ""
+                if tool_status:
+                    existing["status"] = tool_status
+                if tool_kind:
+                    existing["tool_kind"] = tool_kind
+                if tool_title:
+                    existing["tool_title"] = tool_title
                 notify_remote(existing, replace=True)
                 return
         if (
@@ -7989,9 +9813,9 @@ class ProvisionServer(ThreadingHTTPServer):
             and transcript[-1].get("role") == role
             and transcript[-1].get("turn_id") == turn_id
         ):
-            existing = str(transcript[-1].get("full_text") or transcript[-1].get("text") or "")
-            separator = self.transcript_stream_separator(existing, text)
-            merged = existing + separator + text
+            existing_text = str(transcript[-1].get("full_text") or transcript[-1].get("text") or "")
+            separator = self.transcript_stream_separator(existing_text, text)
+            merged = existing_text + separator + text
             self.set_transcript_item_text(transcript[-1], role, merged)
             transcript[-1]["updated_at"] = now
             notify_remote(transcript[-1], replace=True)
@@ -8004,7 +9828,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 and existing.get("text") == clipped
             ):
                 return
-        item = {
+        new_item: dict[str, Any] = {
             "item_id": f"cti_{uuid.uuid4().hex}",
             "ts": now,
             "updated_at": now,
@@ -8014,11 +9838,21 @@ class ProvisionServer(ThreadingHTTPServer):
             "profile": profile,
             "search_text": f"{role} {clipped}",
         }
-        self.set_transcript_item_text(item, role, text)
+        self.set_transcript_item_text(new_item, role, text)
         if call_id:
-            item["call_id"] = call_id
-        transcript.append(item)
-        notify_remote(item, replace=False)
+            new_item["call_id"] = call_id
+        if tool_status:
+            new_item["status"] = tool_status
+        if tool_kind:
+            new_item["tool_kind"] = tool_kind
+        if tool_title:
+            new_item["tool_title"] = tool_title
+        if source_item_id:
+            new_item["source_item_id"] = source_item_id
+        if authoritative:
+            new_item["authoritative"] = True
+        transcript.append(new_item)
+        notify_remote(new_item, replace=False)
         if len(transcript) > CONTROL_TRANSCRIPT_MAX_ITEMS:
             trim_count = len(transcript) - CONTROL_TRANSCRIPT_MAX_ITEMS
             dropped = transcript[:trim_count]
@@ -8038,6 +9872,9 @@ class ProvisionServer(ThreadingHTTPServer):
         text: str,
         append: bool = False,
         call_id: str = "",
+        source_item_id: str = "",
+        authoritative: bool = False,
+        turn_id_override: str = "",
     ) -> None:
         if not text:
             return
@@ -8048,7 +9885,10 @@ class ProvisionServer(ThreadingHTTPServer):
             session_key = tunnel.get("session_key")
             if not isinstance(session_key, str) or not session_key:
                 return
-            turn_id = tunnel.get("turn_id") if isinstance(tunnel.get("turn_id"), str) else ""
+            stored_turn_id = tunnel.get("turn_id")
+            turn_id = turn_id_override or (
+                stored_turn_id if isinstance(stored_turn_id, str) else ""
+            )
             profile = str(tunnel.get("profile") or "")
             if role in {"user", "user_pending"} and int(tunnel.get("pending_work") or 0) <= 0:
                 turn_id = ""
@@ -8060,6 +9900,8 @@ class ProvisionServer(ThreadingHTTPServer):
                 profile=profile,
                 append=append,
                 call_id=call_id,
+                source_item_id=source_item_id,
+                authoritative=authoritative,
             )
 
     def record_websocket_transcript(
@@ -8089,13 +9931,27 @@ class ProvisionServer(ThreadingHTTPServer):
                     append=False,
                 )
             return
-        entry = websocket_message_assistant_entry(opcode, payload)
-        if entry:
+        value = websocket_message_json(opcode, payload)
+        if isinstance(value, dict) and isinstance(value.get("method"), str):
+            for app_server_entry in app_server_transcript_entries_from_message(value):
+                self.record_websocket_transcript_message(
+                    tunnel_id,
+                    role=str(app_server_entry.get("role") or "assistant"),
+                    text=str(app_server_entry.get("text") or ""),
+                    append=bool(app_server_entry.get("append")),
+                    call_id=str(app_server_entry.get("call_id") or ""),
+                    source_item_id=str(app_server_entry.get("source_item_id") or ""),
+                    authoritative=bool(app_server_entry.get("authoritative")),
+                    turn_id_override=str(app_server_entry.get("turn_id") or ""),
+                )
+            return
+        assistant_entry = websocket_message_assistant_entry(opcode, payload)
+        if assistant_entry:
             self.record_websocket_transcript_message(
                 tunnel_id,
-                role=str(entry.get("role") or "assistant"),
-                text=str(entry.get("text") or ""),
-                append=bool(entry.get("append")),
+                role=str(assistant_entry.get("role") or "assistant"),
+                text=str(assistant_entry.get("text") or ""),
+                append=bool(assistant_entry.get("append")),
             )
         for tool_entry in websocket_message_tool_entries(opcode, payload):
             self.record_websocket_transcript_message(
@@ -8207,7 +10063,11 @@ class ProvisionServer(ThreadingHTTPServer):
                 if not session_key:
                     continue
                 record = self.observed_sessions.get(session_key)
-                cwd = str(record.get("cwd") or session_key) if isinstance(record, dict) else session_key
+                cwd = (
+                    str(record.get("cwd") or session_key)
+                    if isinstance(record, dict)
+                    else session_key
+                )
                 return {"key": session_key, "cwd": cwd}
         return None
 
@@ -8348,7 +10208,9 @@ class ProvisionServer(ThreadingHTTPServer):
         rows, _window = self.control_transcript_snapshot_window(session_key)
         return rows
 
-    def control_turns_from_transcript(self, transcript: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def control_turns_from_transcript(
+        self, transcript: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
         turns: list[dict[str, Any]] = []
         current: dict[str, Any] | None = None
         for index, item in enumerate(transcript):
@@ -8357,7 +10219,9 @@ class ProvisionServer(ThreadingHTTPServer):
             if role in {"user", "user_pending"}:
                 if current is not None and turn_id and str(current.get("turn_id") or "") == turn_id:
                     current["end_index"] = index
-                    current["updated_at"] = str(item.get("updated_at") or item.get("ts") or current.get("updated_at") or "")
+                    current["updated_at"] = str(
+                        item.get("updated_at") or item.get("ts") or current.get("updated_at") or ""
+                    )
                     if role == "user_pending":
                         current["pending"] = True
                     continue
@@ -8380,7 +10244,9 @@ class ProvisionServer(ThreadingHTTPServer):
                 continue
             if current is not None:
                 current["end_index"] = index
-                current["updated_at"] = str(item.get("updated_at") or item.get("ts") or current.get("updated_at") or "")
+                current["updated_at"] = str(
+                    item.get("updated_at") or item.get("ts") or current.get("updated_at") or ""
+                )
                 continue
             if turn_id:
                 current = {
@@ -8411,19 +10277,483 @@ class ProvisionServer(ThreadingHTTPServer):
             )
         return turns
 
+    def apply_grok_session_record_locked(
+        self,
+        session_key: str,
+        reader: GrokSessionReader,
+        value: dict[str, Any],
+        *,
+        profile: str,
+    ) -> None:
+        kind, params, update = grok_update_payload(value)
+        if not kind:
+            return
+        timestamp = provider_update_timestamp(value.get("timestamp"))
+        meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+        prompt_id = str(meta.get("promptId") or update.get("prompt_id") or "")
+        if prompt_id:
+            reader.current_turn_id = prompt_id
+        turn_id = reader.current_turn_id
+
+        if kind == "user_message_chunk":
+            text = grok_content_text(update.get("content"))
+            if not text:
+                return
+            reader.current_turn_id = ""
+            reader.working = True
+            self.append_control_transcript(
+                session_key=session_key,
+                role="user",
+                text=text,
+                profile=profile,
+                timestamp=timestamp,
+            )
+            return
+        if kind in {"agent_message_chunk", "agent_thought_chunk"}:
+            text = grok_content_text(update.get("content"))
+            if not text:
+                return
+            reader.working = True
+            self.append_control_transcript(
+                session_key=session_key,
+                role="assistant_progress",
+                text=text,
+                turn_id=turn_id,
+                profile=profile,
+                append=True,
+                timestamp=timestamp,
+            )
+            return
+        if kind in {"tool_call", "tool_call_update"}:
+            source_call_id = str(update.get("toolCallId") or "")
+            if not source_call_id:
+                return
+            title = str(update.get("title") or "").strip()
+            if kind == "tool_call" and title:
+                reader.tool_names[source_call_id] = title
+                if title == "get_command_or_subagent_output":
+                    raw_input = update.get("rawInput")
+                    task_ids = raw_input.get("task_ids") if isinstance(raw_input, dict) else None
+                    if (
+                        isinstance(task_ids, list)
+                        and len(task_ids) == 1
+                        and str(task_ids[0]) in reader.tool_states
+                    ):
+                        reader.tool_aliases[source_call_id] = str(task_ids[0])
+                        return
+            call_id = reader.tool_aliases.get(source_call_id, source_call_id)
+            title = (
+                reader.tool_names.get(call_id)
+                or reader.tool_names.get(source_call_id)
+                or title
+                or str(update.get("kind") or "tool")
+            )
+            state = reader.tool_states.setdefault(call_id, {})
+            shaped_update = update
+            if call_id != source_call_id:
+                shaped_update = dict(update)
+                shaped_update.pop("kind", None)
+                shaped_update.pop("title", None)
+                shaped_update.pop("_meta", None)
+            text = grok_tool_transcript_text(shaped_update, title=title, state=state)
+            if not text:
+                return
+            reader.working = True
+            self.append_control_transcript(
+                session_key=session_key,
+                role="tool",
+                text=text,
+                turn_id=turn_id,
+                profile=profile,
+                call_id=call_id,
+                tool_status=str(state.get("status") or ""),
+                tool_kind=str(state.get("kind") or ""),
+                tool_title=str(state.get("summary") or ""),
+                timestamp=timestamp,
+            )
+            return
+        if kind in {"task_backgrounded", "task_completed"}:
+            snapshot = update.get("task_snapshot")
+            call_id = str(
+                update.get("tool_call_id")
+                or update.get("task_id")
+                or (snapshot.get("task_id") if isinstance(snapshot, dict) else "")
+                or ""
+            )
+            state = reader.tool_states.get(call_id)
+            if not call_id or state is None:
+                return
+            if kind == "task_backgrounded":
+                state["background"] = True
+                state["status"] = "backgrounded"
+                for source, target in (
+                    ("command", "command"),
+                    ("description", "description"),
+                    ("cwd", "cwd"),
+                    ("output_file", "output_file"),
+                ):
+                    if update.get(source):
+                        state[target] = str(update[source])
+            elif isinstance(snapshot, dict):
+                completed_status = "completed"
+                if snapshot.get("explicitly_killed"):
+                    completed_status = "cancelled"
+                elif not snapshot.get("completed", True):
+                    completed_status = "failed"
+                synthetic = {
+                    "status": completed_status,
+                    "rawOutput": {"type": "TaskOutput", "Result": snapshot},
+                }
+                update_grok_tool_state(
+                    state,
+                    synthetic,
+                    name=str(state.get("name") or "run_terminal_command"),
+                )
+            text = grok_tool_transcript_text(
+                {},
+                title=str(state.get("name") or "run_terminal_command"),
+                state=state,
+            )
+            self.append_control_transcript(
+                session_key=session_key,
+                role="tool",
+                text=text,
+                turn_id=turn_id,
+                profile=profile,
+                call_id=call_id,
+                tool_status=str(state.get("status") or ""),
+                tool_kind=str(state.get("kind") or "execute"),
+                tool_title=str(state.get("summary") or ""),
+                timestamp=timestamp,
+            )
+            return
+        if kind == "session_recap":
+            text = compact_tool_detail(update.get("summary"))
+            if text:
+                self.append_control_transcript(
+                    session_key=session_key,
+                    role="context_compaction",
+                    text=text,
+                    turn_id=turn_id,
+                    profile=profile,
+                    timestamp=timestamp,
+                )
+            return
+        if kind != "turn_completed":
+            return
+
+        reader.working = False
+        usage = normalize_grok_turn_usage(update.get("usage"))
+        if usage:
+            reader.latest_usage = usage
+            reader.usage_updated_at = timestamp
+        transcript = self.control_transcripts.get(session_key, [])
+        for item in reversed(transcript):
+            item_turn_id = str(item.get("turn_id") or "")
+            if turn_id and item_turn_id and item_turn_id != turn_id:
+                continue
+            if item.get("role") != "assistant_progress":
+                continue
+            self.append_control_transcript(
+                session_key=session_key,
+                role="assistant",
+                text=self.transcript_item_full_text(item),
+                turn_id=turn_id or item_turn_id,
+                profile=profile,
+                timestamp=timestamp,
+            )
+            break
+
+    def apply_claude_session_record_locked(
+        self,
+        session_key: str,
+        reader: ClaudeSessionReader,
+        value: dict[str, Any],
+        *,
+        profile: str,
+    ) -> None:
+        if value.get("isSidechain"):
+            return
+        kind = str(value.get("type") or "")
+        subtype = str(value.get("subtype") or "")
+        timestamp = provider_update_timestamp(value.get("timestamp"))
+        prompt_id = str(value.get("promptId") or "")
+        if prompt_id:
+            reader.current_turn_id = prompt_id
+        turn_id = reader.current_turn_id
+
+        if kind == "user":
+            message = value.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            blocks = claude_message_blocks(content)
+            tool_results = [block for block in blocks if block.get("type") == "tool_result"]
+            if tool_results:
+                for block in tool_results:
+                    call_id = str(block.get("tool_use_id") or "")
+                    if not call_id:
+                        continue
+                    state = reader.tool_states.setdefault(
+                        call_id, {"name": "tool", "status": "in_progress"}
+                    )
+                    result_text = transcript_text_from_content(
+                        block.get("content"), preserve_edges=True
+                    ) or compact_tool_detail(block.get("content"))
+                    state["output_text"] = bounded_provider_tool_text(
+                        result_text, PROVIDER_TOOL_OUTPUT_LIMIT
+                    )
+                    state["status"] = "failed" if block.get("is_error") else "completed"
+                    tool_result = value.get("toolUseResult")
+                    if isinstance(tool_result, dict):
+                        exit_code = tool_result.get("exitCode")
+                        if exit_code is None:
+                            exit_code = tool_result.get("exit_code")
+                        if exit_code is not None:
+                            state["exit_code"] = exit_code
+                        if tool_result.get("interrupted"):
+                            state["status"] = "cancelled"
+                        stderr = tool_result.get("stderr")
+                        if isinstance(stderr, str) and stderr.strip() and not result_text:
+                            state["output_text"] = bounded_provider_tool_text(
+                                stderr, PROVIDER_TOOL_OUTPUT_LIMIT
+                            )
+                    self.append_control_transcript(
+                        session_key=session_key,
+                        role="tool",
+                        text=claude_tool_transcript_text(state),
+                        turn_id=turn_id,
+                        profile=profile,
+                        call_id=call_id,
+                        tool_status=str(state.get("status") or ""),
+                        tool_kind=str(state.get("name") or "tool").lower(),
+                        tool_title=str(state.get("summary") or ""),
+                        timestamp=timestamp,
+                    )
+                return
+            text = "\n".join(
+                clean_transcript_text(str(block.get("text") or ""), preserve_edges=True)
+                for block in blocks
+                if block.get("type") == "text" and str(block.get("text") or "").strip()
+            )
+            if text:
+                reader.working = True
+                self.append_control_transcript(
+                    session_key=session_key,
+                    role="user",
+                    text=text,
+                    turn_id=turn_id,
+                    profile=profile,
+                    timestamp=timestamp,
+                )
+            return
+
+        if kind == "assistant":
+            message = value.get("message")
+            if not isinstance(message, dict):
+                return
+            model = str(message.get("model") or "")
+            if model:
+                reader.model = model
+            reader.working = str(message.get("stop_reason") or "") != "end_turn"
+            for index, block in enumerate(claude_message_blocks(message.get("content"))):
+                block_type = str(block.get("type") or "")
+                if block_type == "text":
+                    text = clean_transcript_text(str(block.get("text") or ""), preserve_edges=True)
+                    if text:
+                        self.append_control_transcript(
+                            session_key=session_key,
+                            role="assistant",
+                            text=text,
+                            turn_id=turn_id,
+                            profile=profile,
+                            source_item_id=f"{value.get('uuid') or ''}:{index}",
+                            authoritative=True,
+                            timestamp=timestamp,
+                        )
+                elif block_type == "tool_use":
+                    call_id = str(block.get("id") or "")
+                    if not call_id:
+                        continue
+                    state = claude_tool_state(str(block.get("name") or "tool"), block.get("input"))
+                    reader.tool_states[call_id] = state
+                    self.append_control_transcript(
+                        session_key=session_key,
+                        role="tool",
+                        text=claude_tool_transcript_text(state),
+                        turn_id=turn_id,
+                        profile=profile,
+                        call_id=call_id,
+                        tool_status="in_progress",
+                        tool_kind=str(state.get("name") or "tool").lower(),
+                        tool_title=str(state.get("summary") or ""),
+                        timestamp=timestamp,
+                    )
+            return
+
+        if kind == "system" and subtype == "compact_boundary":
+            metadata = value.get("compactMetadata")
+            details = [str(value.get("content") or "Conversation compacted")]
+            if isinstance(metadata, dict):
+                before = metadata.get("preTokens")
+                after = metadata.get("postTokens")
+                trigger = metadata.get("trigger")
+                if before is not None and after is not None:
+                    details.append(f"Context: {before} → {after} tokens")
+                if trigger:
+                    details.append(f"Trigger: {trigger}")
+            self.append_control_transcript(
+                session_key=session_key,
+                role="context_compaction",
+                text="\n".join(details),
+                turn_id=turn_id,
+                profile=profile,
+                timestamp=timestamp,
+            )
+            return
+        if kind == "system" and subtype == "turn_duration":
+            reader.working = False
+        elif kind == "system" and subtype == "api_error":
+            text = clean_transcript_text(str(value.get("content") or ""))
+            if text:
+                self.append_control_transcript(
+                    session_key=session_key,
+                    role="error",
+                    text=text,
+                    turn_id=turn_id,
+                    profile=profile,
+                    timestamp=timestamp,
+                )
+
+    def refresh_provider_sessions(self, *, force: bool = False) -> None:
+        """Import new structured transcript records from supported local CLIs."""
+        lock = getattr(self, "provider_session_readers_lock", None)
+        readers = getattr(self, "provider_session_readers", None)
+        if lock is None or not isinstance(readers, dict):
+            return
+        now = time.monotonic()
+        with lock:
+            last = float(getattr(self, "provider_session_last_refresh_monotonic", 0.0) or 0.0)
+            if not force and now - last < PROVIDER_SESSION_REFRESH_SECONDS:
+                return
+            self.provider_session_last_refresh_monotonic = now
+            with self.active_lock:
+                candidates = [
+                    (
+                        key,
+                        str(record.get("provider") or "codex"),
+                        str(record.get("cwd") or key),
+                        str(record.get("provider_profile") or ""),
+                        str(record.get("provider_state_root") or ""),
+                        record.get("provider_pid"),
+                        str(record.get("control_path") or ""),
+                    )
+                    for key, record in self.observed_sessions.items()
+                    if str(record.get("provider") or "codex") in {"grok", "claude"}
+                ]
+            for (
+                session_key,
+                provider,
+                cwd,
+                profile,
+                state_root_text,
+                provider_pid,
+                control_path,
+            ) in candidates:
+                if not state_root_text:
+                    if profile:
+                        try:
+                            state_root_text = str(
+                                self.store.provider_profile_root(provider, profile)
+                            )
+                        except StoreError:
+                            continue
+                    else:
+                        state_root_text = str(
+                            Path.home() / (".grok" if provider == "grok" else ".claude")
+                        )
+                reader_type = GrokSessionReader if provider == "grok" else ClaudeSessionReader
+                reader = readers.get(session_key)
+                if not isinstance(reader, reader_type):
+                    reader = reader_type()
+                    readers[session_key] = reader
+                batch = reader.refresh(
+                    Path(state_root_text).expanduser(),
+                    cwd,
+                    provider_pid if isinstance(provider_pid, int) else None,
+                )
+                provider_running = process_is_running(
+                    provider_pid if isinstance(provider_pid, int) else None
+                ) or bool(control_path and Path(control_path).exists())
+                state_changed = False
+                with self.active_lock:
+                    record = self.observed_sessions.get(session_key)
+                    if (
+                        not isinstance(record, dict)
+                        or str(record.get("provider") or "") != provider
+                    ):
+                        continue
+                    for value in batch.records:
+                        if isinstance(reader, GrokSessionReader):
+                            self.apply_grok_session_record_locked(
+                                session_key,
+                                reader,
+                                value,
+                                profile=profile,
+                            )
+                        else:
+                            self.apply_claude_session_record_locked(
+                                session_key,
+                                reader,
+                                value,
+                                profile=profile,
+                            )
+                    updates = {
+                        "provider_session_id": batch.session_id,
+                        "provider_model": batch.model,
+                        "provider_process_running": provider_running,
+                        "provider_working": bool(reader.working and provider_running),
+                    }
+                    if isinstance(reader, GrokSessionReader):
+                        updates["provider_usage"] = dict(reader.latest_usage)
+                        updates["provider_usage_updated_at"] = reader.usage_updated_at
+                    if batch.title:
+                        updates["title"] = batch.title
+                    if batch.session_id:
+                        updates["thread_id"] = batch.session_id
+                    for key, value in updates.items():
+                        if record.get(key) != value:
+                            record[key] = value
+                            state_changed = True
+                if state_changed:
+                    self.mark_ui_dirty("provider_session")
+
     def session_snapshots(self) -> list[dict[str, Any]]:
+        self.refresh_provider_sessions()
+        self.expire_stale_requests()
         with self.ui_launchers_lock:
             live_ui_launcher_pids = set(self.ui_launchers)
         with self.active_lock:
             self.expire_websocket_work_locked()
             now = time.monotonic()
+            stale_session_keys = self.prune_stale_observed_sessions_locked(
+                now=now,
+                live_ui_launcher_pids=live_ui_launcher_pids,
+            )
             snapshots = []
             for key, record in self.observed_sessions.items():
                 active_requests = sum(
-                    1 for request in self.active_requests.values() if request.get("session_key") == key
+                    1
+                    for request in self.active_requests.values()
+                    if request.get("session_key") == key
+                )
+                active_turn_requests = sum(
+                    1
+                    for request in self.active_requests.values()
+                    if request.get("session_key") == key and bool(request.get("turn_work"))
                 )
                 active_tunnels = sum(
-                    1 for tunnel in self.active_websockets.values() if tunnel.get("session_key") == key
+                    1
+                    for tunnel in self.active_websockets.values()
+                    if tunnel.get("session_key") == key
                 )
                 pending_work = sum(
                     1
@@ -8443,12 +10773,39 @@ class ProvisionServer(ThreadingHTTPServer):
                     for tunnel in self.active_websockets.values()
                     if tunnel.get("session_key") == key and tunnel.get("thread_id")
                 ]
-                thread_id = str(record.get("thread_id") or (active_thread_ids[0] if active_thread_ids else ""))
+                thread_id = str(
+                    record.get("thread_id") or (active_thread_ids[0] if active_thread_ids else "")
+                )
                 control_path = str(record.get("control_path") or "")
                 control_available = bool(control_path and Path(control_path).exists())
                 pty_managed = bool(record.get("pty_managed"))
+                provider = str(record.get("provider") or "codex")
+                permission_supported = self.permission_bridge_available(record)
+                with self.permission_condition:
+                    permission_enabled = permission_supported and (
+                        self.permission_routes.get(key)
+                        == str(record.get("permission_bridge") or "")
+                    )
+                if permission_supported:
+                    permission_reason = "Browser approval is available for this managed session."
+                elif provider == "grok":
+                    permission_reason = (
+                        "Grok terminal sessions do not expose safe synchronous "
+                        "permission decisions yet."
+                    )
+                elif provider == "codex":
+                    permission_reason = (
+                        "Codex terminal sessions require an app-server or explicit hook adapter."
+                    )
+                else:
+                    permission_reason = "Restart this managed session to enable browser approvals."
+                provider_profile = str(record.get("provider_profile") or "")
+                provider_process_running = bool(record.get("provider_process_running"))
+                provider_working = bool(record.get("provider_working"))
                 ui_launcher_pid = record.get("ui_launcher_pid")
-                ui_launcher_running = isinstance(ui_launcher_pid, int) and ui_launcher_pid in live_ui_launcher_pids
+                ui_launcher_running = (
+                    isinstance(ui_launcher_pid, int) and ui_launcher_pid in live_ui_launcher_pids
+                )
                 associated_profile = str(pinned_profile or record.get("last_profile") or "")
                 snapshots.append(
                     {
@@ -8456,41 +10813,77 @@ class ProvisionServer(ThreadingHTTPServer):
                         "cwd": str(record.get("cwd") or key),
                         "display": str(record.get("display") or compact_session_path(key)),
                         "name": str(record.get("name") or session_display_name(key)),
-                        "title": str(record.get("title") or record.get("name") or session_display_name(key)),
-                        "tab_order": int(record.get("tab_order") or self.session_tab_order_for_key_locked(key)),
+                        "title": str(
+                            record.get("title") or record.get("name") or session_display_name(key)
+                        ),
+                        "tab_order": int(
+                            record.get("tab_order") or self.session_tab_order_for_key_locked(key)
+                        ),
                         "thread_id": thread_id,
+                        "provider": provider,
+                        "permission_routing_supported": permission_supported,
+                        "permission_routing_enabled": permission_enabled,
+                        "permission_routing_reason": permission_reason,
+                        "provider_profile": provider_profile,
                         "last_profile": record.get("last_profile"),
                         "pinned_profile": pinned_profile,
                         "associated_profile": associated_profile,
                         "parent_session_key": str(record.get("parent_session_key") or ""),
                         "ui_launched": bool(record.get("ui_launched")),
                         "active_requests": active_requests,
+                        "active_turn_requests": active_turn_requests,
                         "active_tunnels": active_tunnels,
                         "pending_websocket_work": pending_work,
+                        "working": active_turn_requests > 0 or pending_work > 0 or provider_working,
                         "recent_websocket_activity": recent_activity,
                         "pty_managed": pty_managed,
                         "pty_control_available": control_available,
-                        "ui_launcher_pid": ui_launcher_pid if isinstance(ui_launcher_pid, int) else None,
+                        "ui_launcher_pid": ui_launcher_pid
+                        if isinstance(ui_launcher_pid, int)
+                        else None,
                         "ui_launcher_running": ui_launcher_running,
                         "ui_launcher_mode": str(record.get("ui_launcher_mode") or ""),
                         "ui_launcher_permission": str(record.get("ui_launcher_permission") or ""),
-                        "active": active_requests > 0 or pending_work > 0 or recent_activity > 0 or ui_launcher_running,
+                        "active": (
+                            active_requests > 0
+                            or pending_work > 0
+                            or recent_activity > 0
+                            or control_available
+                            or ui_launcher_running
+                            or provider_process_running
+                        ),
+                        "provider_process_running": provider_process_running,
+                        "provider_session_id": str(record.get("provider_session_id") or ""),
+                        "provider_model": str(record.get("provider_model") or ""),
+                        "provider_usage": dict(record.get("provider_usage") or {})
+                        if isinstance(record.get("provider_usage"), dict)
+                        else {},
+                        "provider_usage_updated_at": str(
+                            record.get("provider_usage_updated_at") or ""
+                        ),
                         "first_seen_monotonic": record.get("first_seen_monotonic") or 0.0,
                         "last_seen_monotonic": record.get("last_seen_monotonic") or 0.0,
                         "interaction": {
                             "available": control_available,
                             "thread_id": thread_id,
                             "mode": "pty" if control_available else "",
-                            "reason": "Ready to send input to the running Codex CLI terminal."
+                            "reason": f"Ready to send input to the running {provider.title()} terminal."
                             if control_available
                             else (
-                                "This PTY-managed launcher is no longer reachable. Restart the Codex CLI session with `provision`."
+                                f"This PTY-managed {provider.title()} launcher is no longer reachable. Restart it with `provision {provider}`."
                                 if pty_managed
-                                else "Restart this session with `provision` in an interactive terminal to enable UI input."
+                                else f"Restart this {provider.title()} session with Provision in an interactive terminal to enable UI input."
                             ),
                         },
                     }
                 )
+        if stale_session_keys:
+            with self.provider_session_readers_lock:
+                for key in stale_session_keys:
+                    self.provider_session_readers.pop(key, None)
+            for key in stale_session_keys:
+                self.release_permission_requests(key)
+            self.mark_ui_dirty("session_prune")
         snapshots.sort(
             key=lambda item: (
                 int(item.get("tab_order") or 0),
@@ -8499,6 +10892,20 @@ class ProvisionServer(ThreadingHTTPServer):
             )
         )
         for snapshot in snapshots:
+            provider = str(snapshot.get("provider") or "codex")
+            if provider != "codex":
+                provider_profile = str(snapshot.get("provider_profile") or "")
+                snapshot["associated_profile"] = provider_profile
+                snapshot["model_setting"] = {}
+                snapshot["quota_summary"] = {
+                    "available": False,
+                    "source": "unavailable",
+                }
+                snapshot["quota_html"] = (
+                    '<div class="quota-empty">Quota data is not exposed by this provider.</div>'
+                )
+                snapshot["quota_compact_html"] = ""
+                continue
             profile = str(snapshot.get("associated_profile") or "")
             if not profile:
                 profile = str(self.store.active_profile(required=False) or "")
@@ -8511,7 +10918,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 quota_snapshot,
                 quota_updated_label(quota_snapshot),
                 profile or None,
-                self.proxy_token,
+                "",
             )
             snapshot["quota_compact_html"] = render_compact_quota_html(
                 quota_snapshot,
@@ -8519,7 +10926,231 @@ class ProvisionServer(ThreadingHTTPServer):
             )
         return snapshots
 
-    def control_plane_sessions(self, sessions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def provider_profile_snapshots(
+        self,
+        sessions: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Describe observed/configured native provider identities for the UI.
+
+        These are deliberately separate from Codex account profiles. Claude
+        identity labels come only from the CLI's documented, bounded
+        ``auth status --json`` response; Provision does not read a provider
+        credential store or manufacture an account-quota endpoint.
+        """
+        if sessions is None:
+            sessions = self.session_snapshots()
+        default_provider = self.store.default_provider()
+        provider_configs = (
+            {
+                "provider": "claude",
+                "label": "Claude",
+                "managed_identity": "Provision-managed CLAUDE_CONFIG_DIR",
+                "native_identity": "Vendor-managed Claude identity",
+                "quota_source": "claude_native_usage_command",
+                "quota_status": "Use /usage in Claude",
+                "quota_detail": (
+                    "Claude exposes subscription usage in its native /usage screen, "
+                    "but the CLI does not document a machine-readable account-quota interface."
+                ),
+                "usage_empty": "Turn usage is not projected for Claude sessions yet.",
+            },
+            {
+                "provider": "grok",
+                "label": "Grok",
+                "managed_identity": "Provision-managed GROK_HOME",
+                "native_identity": "Vendor-managed Grok identity",
+                "quota_source": "grok_native_usage_command",
+                "quota_status": "Use /usage in Grok",
+                "quota_detail": (
+                    "Grok does not expose OAuth subscription quota in its structured "
+                    "session feed. The native /usage command is available only for "
+                    "eligible account tiers."
+                ),
+                "usage_empty": "No completed-turn usage observed yet.",
+            },
+        )
+        profiles: list[dict[str, Any]] = []
+        for config in provider_configs:
+            provider = str(config["provider"])
+            provider_label = str(config["label"])
+            provider_sessions = [
+                session
+                for session in sessions
+                if isinstance(session, dict) and str(session.get("provider") or "") == provider
+            ]
+            try:
+                managed_names = set(self.store.provider_profile_names(provider))
+                selected_name = self.store.active_provider_profile(provider) or ""
+            except StoreError:
+                managed_names = set()
+                selected_name = ""
+            observed_names = {
+                str(session.get("provider_profile") or "") for session in provider_sessions
+            }
+            names = managed_names | {name for name in observed_names if name}
+            include_native = "" in observed_names or (
+                not selected_name and (default_provider == provider or bool(managed_names))
+            )
+            if not include_native and not names:
+                continue
+
+            ordered_names = ([""] if include_native else []) + sorted(names)
+            for name in ordered_names:
+                matching = [
+                    session
+                    for session in provider_sessions
+                    if str(session.get("provider_profile") or "") == name
+                ]
+                latest = max(
+                    matching,
+                    key=lambda session: (
+                        str(session.get("provider_usage_updated_at") or ""),
+                        float(session.get("last_seen_monotonic") or 0.0),
+                    ),
+                    default={},
+                )
+                usage = latest.get("provider_usage")
+                usage = dict(usage) if isinstance(usage, dict) else {}
+                models = sorted(
+                    {
+                        str(session.get("provider_model") or "")
+                        for session in matching
+                        if str(session.get("provider_model") or "")
+                    }
+                )
+                identity = (
+                    self.provider_identity_snapshot(provider, name) if provider == "claude" else {}
+                )
+                account_parts = []
+                for field in ("email", "organization"):
+                    value = str(identity.get(field) or "")
+                    if value and value not in account_parts:
+                        account_parts.append(value)
+                profiles.append(
+                    {
+                        "key": f"provider:{provider}:{name or 'native'}",
+                        "provider": provider,
+                        "provider_label": provider_label,
+                        "name": name,
+                        "display_name": name or "Native",
+                        "managed": bool(name),
+                        "profile_kind_label": "Managed provider profile"
+                        if name
+                        else "Provider native",
+                        "identity_label": str(
+                            config["managed_identity"] if name else config["native_identity"]
+                        ),
+                        "account_label": " · ".join(account_parts),
+                        "auth_status": str(identity.get("status") or ""),
+                        "auth_pending": bool(identity.get("pending")),
+                        "logged_in": identity.get("logged_in"),
+                        "auth_method": str(identity.get("auth_method") or ""),
+                        "api_provider": str(identity.get("api_provider") or ""),
+                        "subscription_label": str(identity.get("subscription") or ""),
+                        "selected_for_provider": name == selected_name,
+                        "selection_label": f"{provider_label} default",
+                        "default_provider": default_provider == provider and name == selected_name,
+                        "session_count": len(matching),
+                        "active_session_count": sum(
+                            1 for session in matching if session.get("active")
+                        ),
+                        "working_session_count": sum(
+                            1 for session in matching if session.get("working")
+                        ),
+                        "models": models,
+                        "usage": usage,
+                        "usage_empty": str(config["usage_empty"]),
+                        "usage_updated_at": str(latest.get("provider_usage_updated_at") or ""),
+                        "usage_session": str(latest.get("name") or ""),
+                        "quota": {
+                            "available": False,
+                            "source": str(config["quota_source"]),
+                            "status": str(config["quota_status"]),
+                            "detail": str(config["quota_detail"]),
+                        },
+                    }
+                )
+        return profiles
+
+    def provider_identity_snapshot(self, provider: str, profile: str) -> dict[str, Any]:
+        """Return cached identity metadata and refresh it without delaying UI state."""
+
+        if provider != "claude":
+            return {}
+        key = f"{provider}:{profile or 'native'}"
+        now = time.monotonic()
+        pending = {
+            "available": False,
+            "logged_in": None,
+            "pending": True,
+            "status": "Checking login…",
+        }
+        with self.provider_identity_cache_lock:
+            entry = self.provider_identity_cache.get(key)
+            if isinstance(entry, dict):
+                value = entry.get("value")
+                updated_at = float(entry.get("updated_at") or 0.0)
+                ttl = (
+                    PROVIDER_IDENTITY_CACHE_SECONDS
+                    if isinstance(value, dict) and value.get("available")
+                    else PROVIDER_IDENTITY_ERROR_CACHE_SECONDS
+                )
+                if isinstance(value, dict) and now - updated_at < ttl:
+                    return dict(value)
+                if entry.get("in_flight"):
+                    pending = dict(value) if isinstance(value, dict) else pending
+                    pending["pending"] = True
+                    pending.setdefault("status", "Checking login…")
+                    return pending
+            previous_value = entry.get("value") if isinstance(entry, dict) else None
+            if isinstance(previous_value, dict) and previous_value:
+                pending = dict(previous_value)
+                pending["pending"] = True
+            self.provider_identity_cache[key] = {
+                "value": dict(previous_value) if isinstance(previous_value, dict) else {},
+                "updated_at": float(entry.get("updated_at") or 0.0)
+                if isinstance(entry, dict)
+                else 0.0,
+                "in_flight": True,
+            }
+        thread = threading.Thread(
+            target=self.refresh_provider_identity,
+            args=(provider, profile, key),
+            daemon=True,
+            name=f"provision-{provider}-identity-{profile or 'native'}",
+        )
+        thread.start()
+        return pending
+
+    def refresh_provider_identity(self, provider: str, profile: str, key: str) -> None:
+        config_dir: Path | None = None
+        if profile:
+            try:
+                config_dir = self.store.provider_profile_root(provider, profile)
+            except StoreError:
+                value = {
+                    "available": False,
+                    "logged_in": None,
+                    "status": "Authentication status unavailable",
+                }
+            else:
+                value = claude_auth_status_probe(config_dir)
+        else:
+            value = claude_auth_status_probe()
+        value = dict(value)
+        value["pending"] = False
+        with self.provider_identity_cache_lock:
+            self.provider_identity_cache[key] = {
+                "value": value,
+                "updated_at": time.monotonic(),
+                "in_flight": False,
+            }
+        self.mark_ui_dirty("profiles")
+
+    def control_plane_sessions(
+        self, sessions: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        self.expire_stale_requests()
         if sessions is None:
             sessions = self.session_snapshots()
         by_key = {
@@ -8539,6 +11170,7 @@ class ProvisionServer(ThreadingHTTPServer):
                     request_rows.append(
                         {
                             "profile": str(request.get("profile") or ""),
+                            "turn_work": bool(request.get("turn_work")),
                             "age_seconds": round(now - float(started), 1)
                             if isinstance(started, (int, float))
                             else None,
@@ -8554,7 +11186,9 @@ class ProvisionServer(ThreadingHTTPServer):
                         {
                             "profile": str(tunnel.get("profile") or ""),
                             "pending_work": int(tunnel.get("pending_work") or 0),
-                            "turn_id": tunnel.get("turn_id") if isinstance(tunnel.get("turn_id"), str) else "",
+                            "turn_id": tunnel.get("turn_id")
+                            if isinstance(tunnel.get("turn_id"), str)
+                            else "",
                             "thread_id": tunnel.get("thread_id")
                             if isinstance(tunnel.get("thread_id"), str)
                             else "",
@@ -8564,7 +11198,9 @@ class ProvisionServer(ThreadingHTTPServer):
                             "age_seconds": round(now - float(started), 1)
                             if isinstance(started, (int, float))
                             else None,
-                            "last_data_age_seconds": round(now - last_data, 1) if last_data > 0 else None,
+                            "last_data_age_seconds": round(now - last_data, 1)
+                            if last_data > 0
+                            else None,
                             "bytes_up": int(tunnel.get("bytes_up") or 0),
                             "bytes_down": int(tunnel.get("bytes_down") or 0),
                             "messages_up": int(tunnel.get("messages_up") or 0),
@@ -8616,9 +11252,9 @@ class ProvisionServer(ThreadingHTTPServer):
                     isinstance(control_status, dict) and control_status.get("interactive_api")
                 ),
                 "app_server_turn_control": False,
-                "reason": "PTY-managed Codex CLI input is available."
+                "reason": "PTY-managed CLI input is available."
                 if pty_available
-                else "Launch or resume a Codex CLI session with `provision` in an interactive terminal to enable live UI input.",
+                else "Launch a supported CLI with `provision` in an interactive terminal to enable live UI input.",
             },
         }
 
@@ -8894,7 +11530,9 @@ class ProvisionServer(ThreadingHTTPServer):
             if cached.get("_semantic_ref") != semantic_ref:
                 raise RemoteError("remote idempotency key was reused for a different action")
             if cached.get("_state") != "completed":
-                raise RemoteError("remote action outcome is indeterminate; inspect the session before retrying")
+                raise RemoteError(
+                    "remote action outcome is indeterminate; inspect the session before retrying"
+                )
             return {key: value for key, value in cached.items() if not key.startswith("_")}
 
         self.refresh_remote_state()
@@ -8919,7 +11557,9 @@ class ProvisionServer(ThreadingHTTPServer):
                 session = state.session_payload(session_id)
                 if session is None or expected_revision != int(session.get("unread_revision") or 0):
                     raise RemoteError("remote action has a stale session revision")
-                if expected_turn_id and expected_turn_id != str(session.get("current_turn_id") or ""):
+                if expected_turn_id and expected_turn_id != str(
+                    session.get("current_turn_id") or ""
+                ):
                     raise RemoteError("remote action has a stale turn")
                 cached = actions.reserve(
                     device_id,
@@ -8941,7 +11581,9 @@ class ProvisionServer(ThreadingHTTPServer):
                     "action": action,
                     "session_id": session_id,
                     "revision": resulting_revision,
-                    "session_revision": int(resulting_session.get("unread_revision") or resulting_revision),
+                    "session_revision": int(
+                        resulting_session.get("unread_revision") or resulting_revision
+                    ),
                     "idempotency_key": idempotency_key,
                     "_semantic_ref": semantic_ref,
                 }
@@ -8984,13 +11626,10 @@ class ProvisionServer(ThreadingHTTPServer):
     ) -> list[dict[str, Any]]:
         if sessions is None:
             sessions = self.session_snapshots()
-        return [
-            session
-            for session in sessions
-            if session.get("pinned_profile") == profile
-        ]
+        return [session for session in sessions if session.get("pinned_profile") == profile]
 
     def profile_has_active_sessions(self, profile: str, *, pinned_only: bool = False) -> bool:
+        self.expire_stale_requests()
         with self.active_lock:
             self.expire_websocket_work_locked()
             now = time.monotonic()
@@ -9139,7 +11778,8 @@ class ProvisionServer(ThreadingHTTPServer):
                     "profile": profile,
                     "source": source,
                     "service_tier": service_tier,
-                    "fast": service_tier in FAST_SERVICE_TIER_VALUES or self.profile_fast_mode(profile),
+                    "fast": service_tier in FAST_SERVICE_TIER_VALUES
+                    or self.profile_fast_mode(profile),
                     "quota": quota_remaining_delta(previous_payload, current_payload),
                 }
             )
@@ -9222,13 +11862,23 @@ class ProvisionServer(ThreadingHTTPServer):
             entry = self.app_server_model_catalog_cache.setdefault(profile, {})
             fetched = entry.get("fetched_monotonic")
             failed = entry.get("failed_monotonic")
-            fresh = isinstance(fetched, (int, float)) and now - fetched < APP_SERVER_MODEL_CATALOG_CACHE_SECONDS
-            recent_failure = isinstance(failed, (int, float)) and now - failed < APP_SERVER_MODEL_CATALOG_ERROR_BACKOFF_SECONDS
+            fresh = (
+                isinstance(fetched, (int, float))
+                and now - fetched < APP_SERVER_MODEL_CATALOG_CACHE_SECONDS
+            )
+            recent_failure = (
+                isinstance(failed, (int, float))
+                and now - failed < APP_SERVER_MODEL_CATALOG_ERROR_BACKOFF_SECONDS
+            )
             if not fresh and not recent_failure and not entry.get("in_flight"):
                 entry["in_flight"] = True
                 should_refresh = True
             cached_catalog = entry.get("catalog")
-            catalog = [dict(item) for item in cached_catalog] if isinstance(cached_catalog, tuple) else fallback
+            catalog = (
+                [dict(item) for item in cached_catalog]
+                if isinstance(cached_catalog, tuple)
+                else fallback
+            )
             snapshot = {
                 "catalog": catalog,
                 "source": str(entry.get("source") or "bundled-fallback"),
@@ -9296,7 +11946,9 @@ class ProvisionServer(ThreadingHTTPServer):
             for tunnel in self.active_websockets.values():
                 if tunnel.get("session_key") != session_key:
                     continue
-                thread_id = tunnel.get("thread_id") if isinstance(tunnel.get("thread_id"), str) else ""
+                thread_id = (
+                    tunnel.get("thread_id") if isinstance(tunnel.get("thread_id"), str) else ""
+                )
                 turn_id = tunnel.get("turn_id") if isinstance(tunnel.get("turn_id"), str) else ""
                 if int(tunnel.get("pending_work") or 0) > 0 and thread_id and turn_id:
                     return thread_id, turn_id
@@ -9332,7 +11984,7 @@ class ProvisionServer(ThreadingHTTPServer):
             control_path = record.get("control_path")
         return control_path if isinstance(control_path, str) else ""
 
-    def send_pty_control_payload(self, control_path: str, payload: dict[str, Any]) -> None:
+    def pty_control_request(self, control_path: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not control_path:
             raise StoreError(
                 "This session was not launched under Provision PTY control. "
@@ -9342,30 +11994,79 @@ class ProvisionServer(ThreadingHTTPServer):
         if not path.exists():
             raise StoreError(
                 "Provision's PTY control socket for this session is no longer available. "
-                "Restart the Codex CLI session with `provision`."
+                "Restart the CLI session with Provision."
             )
-        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
+        if len(encoded) > PERMISSION_CONTROL_MAX_BYTES:
+            raise StoreError("PTY control message is too large")
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(2.0)
                 client.connect(str(path))
                 client.sendall(encoded)
-                raw = client.recv(4096)
+                response = bytearray()
+                while len(response) <= PERMISSION_CONTROL_MAX_BYTES:
+                    chunk = client.recv(min(8192, PERMISSION_CONTROL_MAX_BYTES + 1 - len(response)))
+                    if not chunk:
+                        break
+                    response.extend(chunk)
+                    if b"\n" in response:
+                        break
         except OSError as exc:
             raise StoreError(f"failed to send PTY control message: {exc}") from exc
+        if len(response) > PERMISSION_CONTROL_MAX_BYTES:
+            raise StoreError("PTY control response is too large")
         try:
-            response = json.loads(raw.decode("utf-8")) if raw else {}
+            value = bytes(response).split(b"\n", 1)[0]
+            response_payload = json.loads(value.decode("utf-8")) if value else {}
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise StoreError(f"invalid PTY control response: {exc}") from exc
-        if not isinstance(response, dict) or not response.get("ok"):
-            error = response.get("error") if isinstance(response, dict) else None
+        if not isinstance(response_payload, dict) or not response_payload.get("ok"):
+            error = response_payload.get("error") if isinstance(response_payload, dict) else None
             raise StoreError(str(error or "PTY control rejected the message"))
+        return response_payload
+
+    def send_pty_control_payload(self, control_path: str, payload: dict[str, Any]) -> None:
+        self.pty_control_request(control_path, payload)
 
     def send_prompt_to_pty_control(self, control_path: str, text: str) -> None:
         self.send_pty_control_payload(control_path, {"action": "send_text", "text": text})
 
     def send_escape_to_pty_control(self, control_path: str) -> None:
         self.send_pty_control_payload(control_path, {"action": "send_escape"})
+
+    def terminal_snapshot_for_session(self, session_key: str) -> dict[str, Any]:
+        """Read one bounded visual terminal tail from a managed local PTY.
+
+        This is intentionally on-demand and local-dashboard-only. It avoids
+        adding raw terminal streams to routine status snapshots, history,
+        search, logs, or the Connector/remote protocol.
+        """
+        with self.active_lock:
+            record = self.observed_sessions.get(session_key)
+            if not isinstance(record, dict):
+                raise StoreError("unknown session")
+            control_path = (
+                record.get("control_path") if isinstance(record.get("control_path"), str) else ""
+            )
+            provider = str(record.get("provider") or "codex")
+        response = self.pty_control_request(
+            str(control_path or ""), {"action": "terminal_snapshot"}
+        )
+        if response.get("encoding") != "base64" or not isinstance(response.get("output"), str):
+            raise StoreError("invalid PTY terminal snapshot")
+        try:
+            output = base64.b64decode(response["output"].encode("ascii"), validate=True)
+        except (ValueError, binascii.Error, UnicodeEncodeError) as exc:
+            raise StoreError(f"invalid PTY terminal snapshot: {exc}") from exc
+        # Browser rendering must receive text only. Keep newlines/tabs but
+        # strip control and ANSI escape sequences before escaped DOM rendering.
+        text = terminal_display_text(output)
+        return {
+            "provider": provider,
+            "text": text,
+            "truncated": bool(response.get("truncated")),
+        }
 
     def send_session_prompt(self, session_key: str, text: str) -> dict[str, Any]:
         prompt = clean_transcript_text(text)
@@ -9376,8 +12077,16 @@ class ProvisionServer(ThreadingHTTPServer):
             if not isinstance(record, dict):
                 raise StoreError("unknown session")
             cwd = str(record.get("cwd") or session_key)
-            control_path = record.get("control_path") if isinstance(record.get("control_path"), str) else ""
-        profile = self.control_profile_for_session(session_key)
+            control_path = (
+                record.get("control_path") if isinstance(record.get("control_path"), str) else ""
+            )
+            provider = str(record.get("provider") or "codex")
+            provider_profile = str(record.get("provider_profile") or "")
+        profile = (
+            self.control_profile_for_session(session_key)
+            if provider == "codex"
+            else provider_profile
+        )
         self.send_prompt_to_pty_control(str(control_path or ""), prompt)
         active_turn_id = ""
         with self.active_lock:
@@ -9405,6 +12114,7 @@ class ProvisionServer(ThreadingHTTPServer):
         return {
             "ok": True,
             "profile": profile,
+            "provider": provider,
             "cwd": cwd,
             "mode": "pty",
         }
@@ -9414,7 +12124,9 @@ class ProvisionServer(ThreadingHTTPServer):
             record = self.observed_sessions.get(session_key)
             if not isinstance(record, dict):
                 raise StoreError("unknown session")
-            control_path = record.get("control_path") if isinstance(record.get("control_path"), str) else ""
+            control_path = (
+                record.get("control_path") if isinstance(record.get("control_path"), str) else ""
+            )
         self.send_escape_to_pty_control(str(control_path or ""))
         return {
             "ok": True,
@@ -9426,24 +12138,42 @@ class ProvisionServer(ThreadingHTTPServer):
         profile: str,
         *,
         idempotency_key: str | None = None,
+        credit_id: str | None = None,
     ) -> dict[str, Any]:
+        if not self.store.profile_exists(profile):
+            raise StoreError(f"unknown profile: {profile}")
+        self.ensure_reset_credit_attempt_allowed(profile)
         key = idempotency_key or str(uuid.uuid4())
-        self.begin_reset_credit_attempt(profile, key)
+        attempt_started = False
 
         def consume(client: CodexAppServerClient) -> dict[str, Any]:
+            nonlocal attempt_started
+            rate_limits_before = client.read_account_rate_limits()
+            reset_credits = rate_limits_before.get("rateLimitResetCredits")
+            selected_credit_id = selected_rate_limit_reset_credit_id(reset_credits, credit_id)
+            self.begin_reset_credit_attempt(profile, key)
+            attempt_started = True
             return {
-                "consume": client.consume_account_rate_limit_reset_credit(key),
+                "consume": client.consume_account_rate_limit_reset_credit(
+                    key, credit_id=selected_credit_id
+                ),
                 "rate_limits": client.read_account_rate_limits(),
+                "credit_id": selected_credit_id,
             }
 
         try:
             result = self.run_app_server_for_profile(profile, consume)
         except Exception as exc:
-            self.mark_reset_credit_attempt_error(profile, key, exc)
+            if attempt_started:
+                self.mark_reset_credit_attempt_error(profile, key, exc)
             raise
         consume_result = result.get("consume") if isinstance(result, dict) else {}
         rate_limits = result.get("rate_limits") if isinstance(result, dict) else {}
-        outcome = str(consume_result.get("outcome") or "unknown") if isinstance(consume_result, dict) else "unknown"
+        outcome = (
+            str(consume_result.get("outcome") or "unknown")
+            if isinstance(consume_result, dict)
+            else "unknown"
+        )
         payload = usage_payload_from_app_server_rate_limits_response(rate_limits)
         self.mark_reset_credit_outcome(
             profile,
@@ -9462,6 +12192,7 @@ class ProvisionServer(ThreadingHTTPServer):
         return {
             "outcome": outcome,
             "idempotency_key": key,
+            "credit_id": str(result.get("credit_id") or "") if isinstance(result, dict) else "",
             "payload": payload,
             "reset_credit": self.reset_credit_status(profile),
         }
@@ -9487,13 +12218,22 @@ class ProvisionServer(ThreadingHTTPServer):
             return False
         now = time.monotonic()
         fetched = entry.get("fetched_monotonic")
-        if isinstance(fetched, (int, float)) and now - float(fetched) < APP_SERVER_RATE_LIMIT_CACHE_SECONDS:
+        if (
+            isinstance(fetched, (int, float))
+            and now - float(fetched) < APP_SERVER_RATE_LIMIT_CACHE_SECONDS
+        ):
             return False
         checked = entry.get("checked_monotonic")
-        if isinstance(checked, (int, float)) and now - float(checked) < APP_SERVER_RATE_LIMIT_CACHE_SECONDS:
+        if (
+            isinstance(checked, (int, float))
+            and now - float(checked) < APP_SERVER_RATE_LIMIT_CACHE_SECONDS
+        ):
             return False
         failed = entry.get("failed_monotonic")
-        if isinstance(failed, (int, float)) and now - float(failed) < APP_SERVER_RATE_LIMIT_FAILURE_BACKOFF_SECONDS:
+        if (
+            isinstance(failed, (int, float))
+            and now - float(failed) < APP_SERVER_RATE_LIMIT_FAILURE_BACKOFF_SECONDS
+        ):
             return False
         return True
 
@@ -9535,7 +12275,9 @@ class ProvisionServer(ThreadingHTTPServer):
                 entry["fetched_monotonic"] = entry["checked_monotonic"]
                 entry["fetched_at"] = datetime.now().astimezone()
         if isinstance(payload, dict) and not self.reset_credit_awaiting_usage_confirmation(profile):
-            self.update_usage_cache_from_observation(profile, payload, source="app_server_rate_limits")
+            self.update_usage_cache_from_observation(
+                profile, payload, source="app_server_rate_limits"
+            )
             return payload
         if isinstance(payload, dict):
             return payload
@@ -9548,7 +12290,9 @@ class ProvisionServer(ThreadingHTTPServer):
             return None
 
         def read_rate_limits(client: CodexAppServerClient) -> dict[str, Any] | None:
-            return usage_payload_from_app_server_rate_limits_response(client.read_account_rate_limits())
+            return usage_payload_from_app_server_rate_limits_response(
+                client.read_account_rate_limits()
+            )
 
         return self.run_app_server_for_profile(profile, read_rate_limits)
 
@@ -9707,6 +12451,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 "bytes_down": 0,
                 "input_tokens": 0,
                 "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0,
                 "output_tokens": 0,
                 "reasoning_output_tokens": 0,
                 "total_tokens": 0,
@@ -9733,6 +12478,7 @@ class ProvisionServer(ThreadingHTTPServer):
                     "bytes_down": 0,
                     "input_tokens": 0,
                     "cached_input_tokens": 0,
+                    "cache_write_input_tokens": 0,
                     "output_tokens": 0,
                     "reasoning_output_tokens": 0,
                     "total_tokens": 0,
@@ -9758,6 +12504,9 @@ class ProvisionServer(ThreadingHTTPServer):
                 if isinstance(usage, dict):
                     row["input_tokens"] += int_value(usage.get("input_tokens"))
                     row["cached_input_tokens"] += int_value(usage.get("cached_input_tokens"))
+                    row["cache_write_input_tokens"] += int_value(
+                        usage.get("cache_write_input_tokens")
+                    )
                     row["output_tokens"] += int_value(usage.get("output_tokens"))
                     row["reasoning_output_tokens"] += int_value(
                         usage.get("reasoning_output_tokens")
@@ -9769,12 +12518,29 @@ class ProvisionServer(ThreadingHTTPServer):
                         row["fast_tokens"] += total
             elif event_type == "quota_update":
                 row["quota_updates"] += 1
-                row["last_quota"] = event.get("quota") if isinstance(event.get("quota"), dict) else {}
-            if event_type in {"http_request", "websocket_tunnel", "token_usage", "reset_credit"}:
+                row["last_quota"] = (
+                    event.get("quota") if isinstance(event.get("quota"), dict) else {}
+                )
+            if event_type in {
+                "http_request",
+                "websocket_tunnel",
+                "token_usage",
+                "reset_credit",
+            }:
                 recent.append(compact_stats_event(event))
-            if event_type in {"http_request", "websocket_tunnel", "token_usage", "quota_update", "reset_credit"}:
+            if event_type in {
+                "http_request",
+                "websocket_tunnel",
+                "token_usage",
+                "quota_update",
+                "reset_credit",
+            }:
                 traffic = int(row["bytes_up"]) + int(row["bytes_down"])
-                value = int(row["total_tokens"]) or traffic or int(row["requests"]) + int(row["tunnels"]) + int(row["quota_updates"])
+                value = (
+                    int(row["total_tokens"])
+                    or traffic
+                    or int(row["requests"]) + int(row["tunnels"]) + int(row["quota_updates"])
+                )
                 series.append(
                     {
                         "ts": str(event.get("ts") or ""),
@@ -9802,6 +12568,7 @@ class ProvisionServer(ThreadingHTTPServer):
                             "bytes_down": 0,
                             "input_tokens": 0,
                             "cached_input_tokens": 0,
+                            "cache_write_input_tokens": 0,
                             "output_tokens": 0,
                             "reasoning_output_tokens": 0,
                             "total_tokens": 0,
@@ -9925,7 +12692,12 @@ class ProvisionServer(ThreadingHTTPServer):
                 overwrite=True,
                 set_active=False,
             )
-            label = metadata.get("email") or metadata.get("account_id") or metadata.get("kind") or profile
+            label = (
+                metadata.get("email")
+                or metadata.get("account_id")
+                or metadata.get("kind")
+                or profile
+            )
             self.finish_profile_login(profile, "complete", f"captured {label}")
             self.clear_profile_login_required(profile)
             self.clear_profile_billing_required(profile)
@@ -10091,7 +12863,11 @@ class ProvisionServer(ThreadingHTTPServer):
                 entry = self.usage_cache.get(profile)
                 if usage_refresh_due_at(entry, now) > now:
                     continue
-                attempted = entry.get("auto_refresh_attempted_monotonic") if isinstance(entry, dict) else None
+                attempted = (
+                    entry.get("auto_refresh_attempted_monotonic")
+                    if isinstance(entry, dict)
+                    else None
+                )
                 if (
                     isinstance(attempted, (float, int))
                     and monotonic_now - float(attempted) < USAGE_AUTO_REFRESH_ERROR_BACKOFF_SECONDS
@@ -10105,7 +12881,9 @@ class ProvisionServer(ThreadingHTTPServer):
                 billing_error_at = parse_reset_datetime(billing.get("error_at"))
                 if (
                     billing_error_at is not None
-                    and billing_error_at + timedelta(seconds=USAGE_AUTO_REFRESH_BILLING_BACKOFF_SECONDS) > now
+                    and billing_error_at
+                    + timedelta(seconds=USAGE_AUTO_REFRESH_BILLING_BACKOFF_SECONDS)
+                    > now
                 ):
                     continue
             available_profiles.append(profile)
@@ -10171,7 +12949,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(self.status_payload())
             return
         if parsed.path in ("/", "/ui"):
-            self.send_html(self.render_ui())
+            if not self.request_host_is_allowed():
+                self.send_error(421, "dashboard Host header is not allowed")
+                return
+            self.send_dashboard_html(self.render_ui())
+            return
+        if parsed.path == "/api/ui-session":
+            if not self.request_host_is_allowed():
+                self.send_error(421, "dashboard Host header is not allowed")
+                return
+            self.send_ui_session()
             return
         if parsed.path in (
             "/assets/provision.png",
@@ -10179,7 +12966,13 @@ class Handler(BaseHTTPRequestHandler):
         ):
             self.send_logo_asset(parsed.path.rsplit("/", 1)[-1])
             return
+        if parsed.path in UI_ASSETS:
+            self.send_ui_asset(parsed.path)
+            return
         if parsed.path == "/api/status":
+            if not self.request_host_is_allowed():
+                self.send_error(421, "dashboard Host header is not allowed")
+                return
             self.send_json(self.status_payload(include_profiles=True))
             return
         if parsed.path == "/api/ui-ws":
@@ -10225,6 +13018,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/session":
             self.handle_observe_session()
             return
+        if parsed.path == "/api/permission-request":
+            self.handle_permission_request()
+            return
         if parsed.path == "/api/pin-session":
             self.handle_pin_session()
             return
@@ -10248,7 +13044,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=400)
             return
-        if data.get("token") != self.server.proxy_token:
+        if not self.control_request_is_authorized(data):
             self.send_json({"error": "invalid connector control token"}, status=401)
             return
         action = str(data.get("action") or "status")
@@ -10273,9 +13069,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, status=400)
             return
         profile = data.get("profile")
-        token = data.get("token")
-
-        if token != self.server.proxy_token:
+        if not self.control_request_is_authorized(data):
             self.send_json({"error": "invalid switch token"}, status=401)
             return
         block_reason = self.server.switch_block_reason()
@@ -10301,11 +13095,16 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=400)
             return
-        if data.get("token") != self.server.proxy_token:
+        if not self.control_request_is_authorized(data):
             self.send_json({"error": "invalid UI token"}, status=401)
             return
         profile = str(data.get("profile") or "")
-        hidden = str(data.get("hidden") or "").strip().lower() in {"1", "true", "yes", "on"}
+        hidden = str(data.get("hidden") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         try:
             self.server.store.set_profile_hidden(profile, hidden)
         except StoreError as exc:
@@ -10321,8 +13120,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, status=400)
             return
         profile = str(data.get("profile") or "")
-        token = data.get("token")
-        if token != self.server.proxy_token:
+        if not self.control_request_is_authorized(data):
             self.send_json({"error": "invalid UI token"}, status=401)
             return
         if not self.server.store.profile_exists(profile):
@@ -10348,16 +13146,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, status=400)
             return
         profile = str(data.get("profile") or "")
-        token = data.get("token")
-        if token != self.server.proxy_token:
+        credit_id = str(data.get("credit_id") or "").strip() or None
+        if not self.control_request_is_authorized(data):
             self.send_json({"error": "invalid UI token"}, status=401)
             return
         if not self.server.store.profile_exists(profile):
             self.send_json({"error": f"unknown profile: {profile}"}, status=400)
             return
         try:
-            self.server.consume_profile_rate_limit_reset_credit(profile)
-        except (StoreError, CodexAppServerError, AuthError, OSError, json.JSONDecodeError) as exc:
+            self.server.consume_profile_rate_limit_reset_credit(profile, credit_id=credit_id)
+        except (
+            StoreError,
+            CodexAppServerError,
+            AuthError,
+            OSError,
+            json.JSONDecodeError,
+        ) as exc:
             self.send_json({"error": str(exc)}, status=400)
             return
         self.redirect_ui()
@@ -10369,8 +13173,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, status=400)
             return
         profile = str(data.get("profile") or "")
-        token = data.get("token")
-        if token != self.server.proxy_token:
+        if not self.control_request_is_authorized(data):
             self.send_json({"error": "invalid UI token"}, status=401)
             return
         try:
@@ -10387,8 +13190,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, status=400)
             return
         profile = str(data.get("profile") or "")
-        token = data.get("token")
-        if token != self.server.proxy_token:
+        if not self.control_request_is_authorized(data):
             self.send_json({"error": "invalid UI token"}, status=401)
             return
         try:
@@ -10409,10 +13211,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, status=400)
             return
         profile = str(data.get("profile") or "")
-        token = data.get("token")
         mode = str(data.get("mode") or "browser")
         login_action = str(data.get("login_action") or "start_login")
-        if token != self.server.proxy_token:
+        if not self.control_request_is_authorized(data):
             self.send_json({"error": "invalid UI token"}, status=401)
             return
         try:
@@ -10431,7 +13232,6 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=400)
             return
-        token = data.get("token")
         cwd = str(data.get("cwd") or "")
         explicit_session_key = normalize_session_key(str(data.get("session_key") or ""))
         control_path = str(data.get("control_path") or "")
@@ -10440,20 +13240,38 @@ class Handler(BaseHTTPRequestHandler):
             launcher_pid = int(launcher_pid_raw) if launcher_pid_raw else None
         except ValueError:
             launcher_pid = None
+        provider_pid_raw = str(data.get("provider_pid") or "")
+        try:
+            provider_pid = int(provider_pid_raw) if provider_pid_raw else None
+        except ValueError:
+            provider_pid = None
+        provider_state_root = str(data.get("provider_state_root") or "")
+        permission_bridge = bounded_permission_text(data.get("permission_bridge"), 80)
         pty_managed = str(data.get("pty_managed") or "").lower() in {"1", "true", "yes"}
-        if token != self.server.proxy_token:
+        if not self.control_request_is_authorized(data):
             self.send_json({"error": "invalid UI token"}, status=401)
             return
+        try:
+            provider = canonical_provider(str(data.get("provider") or "codex"))
+        except ProviderError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        provider_profile = str(data.get("provider_profile") or "")
         session_key = explicit_session_key or normalize_session_key(cwd)
-        profile = self.server.profile_for_session(session_key)
+        profile = self.server.profile_for_session(session_key) if provider == "codex" else None
         if explicit_session_key:
             with self.server.active_lock:
                 self.server.observe_session_locked(
                     explicit_session_key,
                     cwd,
                     profile,
+                    provider=provider,
+                    provider_profile=provider_profile or None,
                     control_path=control_path or None,
                     launcher_pid=launcher_pid,
+                    provider_pid=provider_pid,
+                    provider_state_root=provider_state_root or None,
+                    permission_bridge=permission_bridge or None,
                     pty_managed=pty_managed,
                     clear_control_path=not bool(control_path),
                 )
@@ -10462,12 +13280,42 @@ class Handler(BaseHTTPRequestHandler):
             session_key = self.server.observe_session(
                 cwd,
                 profile,
+                provider=provider,
+                provider_profile=provider_profile or None,
                 control_path=control_path or None,
                 launcher_pid=launcher_pid,
+                provider_pid=provider_pid,
+                provider_state_root=provider_state_root or None,
+                permission_bridge=permission_bridge or None,
                 pty_managed=pty_managed,
                 clear_control_path=not bool(control_path),
             )
         self.send_json({"ok": True, "session_key": session_key})
+
+    def handle_permission_request(self) -> None:
+        client_host = str(self.client_address[0] if self.client_address else "")
+        if not daemon_host_is_loopback(client_host):
+            self.send_json({"error": "permission bridge is loopback-only"}, status=403)
+            return
+        try:
+            data = self.read_post_fields(max_bytes=PERMISSION_CONTROL_MAX_BYTES)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        supplied = str(data.get("token") or "")
+        if not supplied or not hmac.compare_digest(supplied, self.server.proxy_token):
+            self.send_json({"error": "invalid permission bridge token"}, status=401)
+            return
+        request = data.get("request")
+        if not isinstance(request, dict):
+            self.send_json({"error": "invalid permission request"}, status=400)
+            return
+        result = self.server.request_permission(
+            str(data.get("session_key") or ""),
+            str(data.get("provider") or ""),
+            request,
+        )
+        self.send_json(result)
 
     def handle_pin_session(self) -> None:
         try:
@@ -10475,8 +13323,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=400)
             return
-        token = data.get("token")
-        if token != self.server.proxy_token:
+        if not self.control_request_is_authorized(data):
             self.send_json({"error": "invalid UI token"}, status=401)
             return
         profile = str(data.get("profile") or "")
@@ -10492,21 +13339,71 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.redirect_ui()
 
-    def read_post_fields(self) -> dict[str, Any]:
+    def read_post_fields(self, *, max_bytes: int | None = None) -> dict[str, Any]:
         content_type = self.headers.get("content-type", "")
-        raw = self.rfile.read(int(self.headers.get("content-length", "0") or "0"))
+        try:
+            length = int(self.headers.get("content-length", "0") or "0")
+        except ValueError:
+            raise ValueError("invalid content length") from None
+        if length < 0:
+            raise ValueError("invalid content length")
+        if max_bytes is not None and length > max_bytes:
+            raise ValueError("request body is too large")
+        raw = self.rfile.read(length)
         if "application/json" in content_type:
             try:
                 data = json.loads(raw.decode("utf-8"))
-            except json.JSONDecodeError:
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 raise ValueError("invalid JSON") from None
             return data if isinstance(data, dict) else {}
-        form = urllib.parse.parse_qs(raw.decode("utf-8"))
-        return {
-            key: values[0]
-            for key, values in form.items()
-            if values
-        }
+        try:
+            form = urllib.parse.parse_qs(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            raise ValueError("invalid form data") from None
+        return {key: values[0] for key, values in form.items() if values}
+
+    def request_origin_is_same_host(self) -> bool:
+        if not self.request_host_is_allowed():
+            return False
+        origin = self.headers.get("origin", "")
+        host = self.headers.get("host", "")
+        if not origin or not host:
+            return False
+        parsed = urllib.parse.urlparse(origin)
+        return parsed.scheme in {"http", "https"} and hmac.compare_digest(
+            parsed.netloc.lower(), host.lower()
+        )
+
+    def request_host_is_allowed(self) -> bool:
+        address = getattr(self.server, "server_address", (DEFAULT_DAEMON_HOST, 0))
+        bind_host = str(address[0] or DEFAULT_DAEMON_HOST)
+        if not daemon_host_is_loopback(bind_host):
+            return True
+        raw_host = self.headers.get("host", "")
+        try:
+            hostname = urllib.parse.urlsplit(f"//{raw_host}").hostname
+        except ValueError:
+            return False
+        return bool(hostname and daemon_host_is_loopback(hostname))
+
+    def dashboard_session_is_authorized(self) -> bool:
+        if not self.request_origin_is_same_host():
+            return False
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("cookie", ""))
+        except CookieError:
+            return False
+        morsel = cookie.get(UI_SESSION_COOKIE)
+        expected = getattr(self.server, "ui_session_token", "")
+        return bool(morsel and expected and hmac.compare_digest(morsel.value, expected))
+
+    def control_request_is_authorized(self, data: dict[str, Any]) -> bool:
+        supplied = str(data.get("token") or "")
+        proxy_token = self.server.proxy_token
+        if supplied and hmac.compare_digest(supplied, proxy_token):
+            return True
+        return self.dashboard_session_is_authorized()
 
     def redirect_ui(self) -> None:
         self.send_response(303)
@@ -10520,7 +13417,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         query = urllib.parse.parse_qs(parsed.query)
         token = query.get("token", [""])[0]
-        if token != self.server.proxy_token:
+        if not self.control_request_is_authorized({"token": token}):
             self.send_json({"error": "invalid UI token"}, status=401)
             return
         key = self.headers.get("sec-websocket-key", "")
@@ -10531,11 +13428,12 @@ class Handler(BaseHTTPRequestHandler):
         self.accept_websocket(key)
         self.close_connection = True
         self.connection.settimeout(UI_STATE_CHECK_SECONDS)
-        last_sent_version = self.send_ui_state()
-        last_liveness_signature = self.server.ui_state_liveness_signature()
-        last_safety_snapshot = time.monotonic()
-        last_heartbeat = last_safety_snapshot
+        self.server.ui_client_connected()
         try:
+            last_sent_version = self.send_ui_state()
+            last_liveness_signature = self.server.ui_state_liveness_signature()
+            last_safety_snapshot = time.monotonic()
+            last_heartbeat = last_safety_snapshot
             while True:
                 try:
                     message = self.read_websocket_json()
@@ -10574,6 +13472,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         except (BrokenPipeError, ConnectionResetError, OSError) as exc:
             self.log_message("ui websocket closed: %s", exc)
+        finally:
+            self.server.ui_client_disconnected()
 
     def accept_websocket(self, key: str) -> None:
         self.send_response(101)
@@ -10583,7 +13483,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def handle_ui_websocket_action(self, message: dict[str, Any]) -> None:
-        if message.get("token") != self.server.proxy_token:
+        if not self.control_request_is_authorized(message):
             self.send_ui_state(message="Invalid UI token")
             return
         profile = str(message.get("profile") or "")
@@ -10607,7 +13507,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_ui_state()
             return
         if action == "set_profile_visibility":
-            hidden = str(message.get("hidden") or "").strip().lower() in {"1", "true", "yes", "on"}
+            hidden = str(message.get("hidden") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
             try:
                 self.server.store.set_profile_hidden(profile, hidden)
             except StoreError as exc:
@@ -10648,8 +13553,17 @@ class Handler(BaseHTTPRequestHandler):
                 pending_profile=profile,
             )
             try:
-                result = self.server.consume_profile_rate_limit_reset_credit(profile)
-            except (StoreError, CodexAppServerError, AuthError, OSError, json.JSONDecodeError) as exc:
+                credit_id = str(message.get("credit_id") or "").strip() or None
+                result = self.server.consume_profile_rate_limit_reset_credit(
+                    profile, credit_id=credit_id
+                )
+            except (
+                StoreError,
+                CodexAppServerError,
+                AuthError,
+                OSError,
+                json.JSONDecodeError,
+            ) as exc:
                 self.log_message("reset credit redemption for profile %s failed: %s", profile, exc)
                 self.send_ui_state(message=f"Reset credit failed for {profile}: {exc}")
                 return
@@ -10706,6 +13620,31 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_ui_state()
             return
+        if action == "set_permission_routing":
+            session_key = str(message.get("session_key") or "")
+            enabled_value = message.get("enabled")
+            if not isinstance(enabled_value, bool):
+                self.send_ui_state(message="invalid browser approval setting")
+                return
+            try:
+                self.server.set_permission_routing(session_key, enabled_value)
+            except StoreError as exc:
+                self.send_ui_state(message=str(exc))
+                return
+            self.send_ui_state()
+            return
+        if action == "resolve_permission":
+            try:
+                self.server.resolve_permission(
+                    str(message.get("request_id") or ""),
+                    str(message.get("session_key") or ""),
+                    str(message.get("decision") or ""),
+                )
+            except StoreError as exc:
+                self.send_ui_state(message=str(exc))
+                return
+            self.send_ui_state()
+            return
         if action == "launch_session":
             session_key = str(message.get("session_key") or "")
             mode = str(message.get("mode") or "new")
@@ -10752,7 +13691,13 @@ class Handler(BaseHTTPRequestHandler):
             prompt = str(message.get("prompt") or "")
             try:
                 result = self.server.send_session_prompt(session_key, prompt)
-            except (StoreError, CodexAppServerError, AuthError, OSError, json.JSONDecodeError) as exc:
+            except (
+                StoreError,
+                CodexAppServerError,
+                AuthError,
+                OSError,
+                json.JSONDecodeError,
+            ) as exc:
                 self.log_message("session prompt failed for %s: %s", session_key, exc)
                 self.send_ui_state(message=f"Session interaction failed: {exc}")
                 return
@@ -10796,6 +13741,29 @@ class Handler(BaseHTTPRequestHandler):
                     "session_key": session_key,
                     "turn_key": turn_key,
                     "payload": payload,
+                }
+            )
+            return
+        if action == "terminal_snapshot":
+            session_key = str(message.get("session_key") or "")
+            try:
+                snapshot = self.server.terminal_snapshot_for_session(session_key)
+            except StoreError as exc:
+                self.send_websocket_json(
+                    {
+                        "type": "terminal_snapshot",
+                        "ok": False,
+                        "session_key": session_key,
+                        "error": str(exc),
+                    }
+                )
+                return
+            self.send_websocket_json(
+                {
+                    "type": "terminal_snapshot",
+                    "ok": True,
+                    "session_key": session_key,
+                    "snapshot": snapshot,
                 }
             )
             return
@@ -10955,13 +13923,24 @@ class Handler(BaseHTTPRequestHandler):
                 "websocket_traffic",
                 "websocket_tool_output",
                 "transcript",
+                "provider_session",
             }:
                 sections.add("control_plane")
-                if reason in {"session_observe", "session_pin", "session_unpin", "session_reorder", "session_forget"}:
+                if reason in {
+                    "session_observe",
+                    "session_pin",
+                    "session_unpin",
+                    "session_reorder",
+                    "session_forget",
+                    "provider_session",
+                }:
                     sections.add("profiles")
                 continue
             if reason == "stats":
                 sections.add("stats")
+                continue
+            if reason == "permissions":
+                sections.update({"permissions", "control_plane"})
                 continue
             return {"full"}
         return sections
@@ -10977,6 +13956,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             status["sessions"] = full_status.get("sessions", [])
             status["profiles"] = full_status.get("profiles", [])
+            status["provider_profiles"] = full_status.get("provider_profiles", [])
         if "control_plane" in sections:
             status["control_plane"] = (
                 full_status.get("control_plane", {})
@@ -10985,6 +13965,13 @@ class Handler(BaseHTTPRequestHandler):
             )
         if "stats" in sections:
             status["stats"] = self.server.stats_summary()
+        if "permissions" in sections:
+            permission_snapshot = getattr(self.server, "permission_state_snapshot", None)
+            status["permissions"] = (
+                permission_snapshot()
+                if callable(permission_snapshot)
+                else {"pending": [], "browser_clients": 0}
+            )
         if "model_catalog" in sections:
             status["model_catalog"] = model_catalog()
         return status
@@ -11029,15 +14016,11 @@ class Handler(BaseHTTPRequestHandler):
         last_heartbeat: float,
     ) -> tuple[int, tuple[Any, ...], float, float]:
         now = time.monotonic()
-        current_version = self.server.ui_state_revision()
         current_liveness_signature = self.server.ui_state_liveness_signature()
+        current_version = self.server.ui_state_revision()
         safety_due = now - last_safety_snapshot >= UI_SAFETY_SNAPSHOT_SECONDS
         liveness_changed = current_liveness_signature != last_liveness_signature
-        state_due = (
-            current_version != last_sent_version
-            or liveness_changed
-            or safety_due
-        )
+        state_due = current_version != last_sent_version or liveness_changed or safety_due
         if state_due:
             if safety_due:
                 sent_version = self.send_ui_state()
@@ -11051,7 +14034,12 @@ class Handler(BaseHTTPRequestHandler):
         if now - last_heartbeat >= UI_HEARTBEAT_SECONDS:
             self.send_ui_heartbeat()
             return last_sent_version, last_liveness_signature, last_safety_snapshot, now
-        return last_sent_version, last_liveness_signature, last_safety_snapshot, last_heartbeat
+        return (
+            last_sent_version,
+            last_liveness_signature,
+            last_safety_snapshot,
+            last_heartbeat,
+        )
 
     def read_websocket_json(self) -> dict[str, Any] | None:
         frame = self.read_websocket_frame()
@@ -11150,7 +14138,10 @@ class Handler(BaseHTTPRequestHandler):
         model_setting = self.server.profile_model_setting(profile)
         model = str(model_setting.get("model") or "")
         reasoning_effort = str(model_setting.get("reasoning_effort") or "")
-        if route == UpstreamRoute.CODEX_API and parsed.path in ("/v1/responses", "/v1/responses/compact"):
+        if route == UpstreamRoute.CODEX_API and parsed.path in (
+            "/v1/responses",
+            "/v1/responses/compact",
+        ):
             body, service_tier, changed = rewrite_service_tier_body(
                 body,
                 fast_enabled=self.server.profile_fast_mode(profile),
@@ -11172,7 +14163,15 @@ class Handler(BaseHTTPRequestHandler):
                     profile,
                     model_setting_label(model, reasoning_effort),
                 )
-        request_id = self.server.begin_request(profile, session_key)
+        request_id = self.server.begin_request(
+            profile,
+            session_key,
+            turn_work=(
+                route == UpstreamRoute.CODEX_API
+                and method == "POST"
+                and parsed.path in {"/v1/responses", "/v1/responses/compact"}
+            ),
+        )
         started = time.monotonic()
         status_code: int | None = None
         bytes_out = 0
@@ -11187,27 +14186,34 @@ class Handler(BaseHTTPRequestHandler):
             )
         finally:
             elapsed = time.monotonic() - started
-            self.server.record_http_stats(
-                profile=profile,
-                session_key=session_key,
-                route=route,
-                path=parsed.path,
-                method=method,
-                status_code=status_code,
-                duration_seconds=elapsed,
-                bytes_in=len(body or b""),
-                bytes_out=bytes_out,
-                service_tier=service_tier,
-            )
-            self.log_message(
-                "http proxy %s %s for profile %s completed status=%s duration=%.3fs",
-                method,
-                parsed.path,
-                profile,
-                status_code if status_code is not None else "unknown",
-                elapsed,
-            )
-            self.server.end_request(request_id)
+            try:
+                try:
+                    self.server.record_http_stats(
+                        profile=profile,
+                        session_key=session_key,
+                        route=route,
+                        path=parsed.path,
+                        method=method,
+                        status_code=status_code,
+                        duration_seconds=elapsed,
+                        bytes_in=len(body or b""),
+                        bytes_out=bytes_out,
+                        service_tier=service_tier,
+                    )
+                except Exception as exc:
+                    self.log_message("http proxy statistics recording failed: %s", exc)
+                self.log_message(
+                    "http proxy %s %s for profile %s completed status=%s duration=%.3fs",
+                    method,
+                    parsed.path,
+                    profile,
+                    status_code if status_code is not None else "unknown",
+                    elapsed,
+                )
+            finally:
+                # Finalization may fail during an outage or a disk-full event;
+                # removal from active_requests must still be unconditional.
+                self.server.end_request(request_id)
 
     def _proxy_to_upstream_once(
         self,
@@ -11258,16 +14264,23 @@ class Handler(BaseHTTPRequestHandler):
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=600) as response:
-                if route == UpstreamRoute.CODEX_API and parsed.path in ("/v1/responses", "/v1/responses/compact"):
+                if route == UpstreamRoute.CODEX_API and parsed.path in (
+                    "/v1/responses",
+                    "/v1/responses/compact",
+                ):
                     self.server.clear_profile_billing_required(profile)
-                if self.server.update_usage_cache_from_rate_limit_headers(profile, response.headers):
+                if self.server.update_usage_cache_from_rate_limit_headers(
+                    profile, response.headers
+                ):
                     self.log_message(
                         "quota cache for profile %s updated from response headers",
                         profile,
                     )
                 if self.should_label_usage_response(route, method, upstream_path, response.headers):
                     payload = response.read()
-                    labeled = self.label_usage_response(payload, profile, datetime.now().astimezone())
+                    labeled = self.label_usage_response(
+                        payload, profile, datetime.now().astimezone()
+                    )
                     if labeled is not None:
                         self.send_json(labeled, status=response.status)
                         return response.status, len(json.dumps(labeled).encode("utf-8"))
@@ -11351,7 +14364,9 @@ class Handler(BaseHTTPRequestHandler):
             profile = self.server.profile_for_session(session_key)
             if session and session_key and session.get("cwd"):
                 with self.server.active_lock:
-                    self.server.observe_session_locked(str(session_key), str(session["cwd"]), profile)
+                    self.server.observe_session_locked(
+                        str(session_key), str(session["cwd"]), profile
+                    )
             tunnel_id = self.server.begin_websocket(profile, self.connection, session_key)
             auth_path = self.server.store.auth_path(profile)
             auth = ensure_fresh_chatgpt_auth(auth_path)
@@ -11417,7 +14432,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.end_websocket(tunnel_id)
 
     def is_chatgpt_backend_proxy_path(self, path: str) -> bool:
-        prefixes = (backend_proxy_prefix(self.server.proxy_token), backend_proxy_prefix())
+        prefixes = (
+            backend_proxy_prefix(self.server.proxy_token),
+            backend_proxy_prefix(),
+        )
         return any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes)
 
     def upstream_url(
@@ -11428,7 +14446,9 @@ class Handler(BaseHTTPRequestHandler):
         *,
         upstream_path: str | None = None,
     ) -> str:
-        upstream_path = upstream_path if upstream_path is not None else self.upstream_path(route, parsed)
+        upstream_path = (
+            upstream_path if upstream_path is not None else self.upstream_path(route, parsed)
+        )
         if route == UpstreamRoute.CODEX_API:
             return upstream_base_url(auth).rstrip("/") + upstream_path
         if route == UpstreamRoute.CHATGPT_BACKEND:
@@ -11539,7 +14559,9 @@ class Handler(BaseHTTPRequestHandler):
     ) -> tuple[dict[str, Any], datetime | None, str]:
         return self.server.usage_payload_for_profile(profile, force=force)
 
-    def fetch_usage_payload_uncached(self, profile: str, *, retry_on_401: bool = True) -> dict[str, Any] | None:
+    def fetch_usage_payload_uncached(
+        self, profile: str, *, retry_on_401: bool = True
+    ) -> dict[str, Any] | None:
         return self.server.fetch_usage_payload_uncached(profile, retry_on_401=retry_on_401)
 
     def open_upstream_websocket(
@@ -11636,9 +14658,6 @@ class Handler(BaseHTTPRequestHandler):
         downstream_tracker = WebSocketMessageTracker()
         downstream_rewriter = WebSocketMessageRewriter(mask_output=True)
         upstream_tracker = WebSocketMessageTracker()
-        model_setting = self.server.profile_model_setting(profile)
-        model = str(model_setting.get("model") or "")
-        reasoning_effort = str(model_setting.get("reasoning_effort") or "")
 
         def shutdown() -> None:
             stop.set()
@@ -11662,6 +14681,7 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     service_tier = None
                     if from_downstream:
+
                         def rewrite_message(opcode: int, payload: bytes) -> bytes:
                             nonlocal service_tier
                             rewritten, next_tier, changed = rewrite_service_tier_websocket_message(
@@ -11678,11 +14698,13 @@ class Handler(BaseHTTPRequestHandler):
                             current_reasoning = str(
                                 current_model_setting.get("reasoning_effort") or ""
                             )
-                            rewritten, _model, _reasoning, model_changed = rewrite_model_websocket_message(
-                                opcode,
-                                rewritten,
-                                model=current_model,
-                                reasoning_effort=current_reasoning,
+                            rewritten, _model, _reasoning, model_changed = (
+                                rewrite_model_websocket_message(
+                                    opcode,
+                                    rewritten,
+                                    model=current_model,
+                                    reasoning_effort=current_reasoning,
+                                )
                             )
                             if model_changed:
                                 self.log_message(
@@ -11806,10 +14828,13 @@ class Handler(BaseHTTPRequestHandler):
         auth = self.headers.get("authorization", "")
         if auth == f"Bearer {self.server.proxy_token}":
             return True
-        return decode_project_session_sentinel(
-            self.headers.get("openai-project", ""),
-            self.server.proxy_token,
-        ) is not None
+        return (
+            decode_project_session_sentinel(
+                self.headers.get("openai-project", ""),
+                self.server.proxy_token,
+            )
+            is not None
+        )
 
     def local_project_sentinel(self) -> str:
         return project_sentinel(self.server.proxy_token)
@@ -11866,7 +14891,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(chunk)
             self.wfile.flush()
             return True
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
             self.close_connection = True
             return False
 
@@ -11889,13 +14914,16 @@ class Handler(BaseHTTPRequestHandler):
             "port": self.server.server_address[1],
             "provision_protocol": PROTOCOL_VERSION,
             "codex": codex_compatibility_payload(),
+            "default_provider": self.server.store.default_provider(),
             "active_profile": self.server.store.active_profile(required=False),
             "active_requests": active_requests,
             "blocking_active_requests": blocking_requests,
             "active_websockets": active_websockets,
             "blocking_active_websockets": self.server.websocket_count(blocking_only=True),
             "active_websocket_work": self.server.active_websocket_work_count(),
-            "blocking_active_websocket_work": self.server.active_websocket_work_count(blocking_only=True),
+            "blocking_active_websocket_work": self.server.active_websocket_work_count(
+                blocking_only=True
+            ),
             "pending_websocket_work": pending_work,
             "blocking_pending_websocket_work": blocking_pending_work,
             "recent_websocket_activity": recent_activity,
@@ -11909,6 +14937,7 @@ class Handler(BaseHTTPRequestHandler):
             payload["sessions"] = sessions
             if include_control_plane:
                 payload["control_plane"] = self.server.control_plane_sessions(sessions)
+            payload["provider_profiles"] = self.server.provider_profile_snapshots(sessions)
             profiles = []
             for profile in self.server.store.list_profiles():
                 item = dict(profile)
@@ -11916,7 +14945,9 @@ class Handler(BaseHTTPRequestHandler):
                 item["quota_summary"] = usage_cache_summary(
                     self.server.usage_cache_snapshot(str(name)) if name else None
                 )
-                item["billing_required"] = self.server.profile_billing_required(str(name)) if name else {}
+                item["billing_required"] = (
+                    self.server.profile_billing_required(str(name)) if name else {}
+                )
                 profiles.append(item)
             payload["profiles"] = profiles
         return payload
@@ -11933,11 +14964,21 @@ class Handler(BaseHTTPRequestHandler):
         )
         status["model_catalog"] = model_catalog()
         status["stats"] = self.server.stats_summary()
+        permission_snapshot = getattr(self.server, "permission_state_snapshot", None)
+        status["permissions"] = (
+            permission_snapshot()
+            if callable(permission_snapshot)
+            else {"pending": [], "browser_clients": 0}
+        )
         for profile in status["profiles"]:
             name = str(profile.get("name") or "")
             snapshot = self.server.usage_cache_snapshot(name) if name else None
             billing_required = self.server.profile_billing_required(name)
-            if isinstance(billing_required, dict) and billing_required.get("required") and not snapshot:
+            if (
+                isinstance(billing_required, dict)
+                and billing_required.get("required")
+                and not snapshot
+            ):
                 snapshot = {
                     "error": billing_required.get("error") or "HTTP Error 402: Payment Required",
                     "error_at": billing_required.get("error_at") or "",
@@ -11982,7 +15023,7 @@ class Handler(BaseHTTPRequestHandler):
             profile["login_status_html"] = render_login_status_html(
                 profile["login_status"],
                 name,
-                self.server.proxy_token,
+                "",
             )
             profile["pin_menu_html"] = self.render_pin_menu(profile, status)
             profile["pinned_sessions_html"] = self.render_pinned_sessions(profile)
@@ -11992,7 +15033,7 @@ class Handler(BaseHTTPRequestHandler):
                     snapshot,
                     profile["quota_updated"],
                     name,
-                    self.server.proxy_token,
+                    "",
                 )
             if profile.get("active"):
                 status["model_catalog"] = profile_catalog["catalog"]
@@ -12027,20 +15068,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def render_pin_menu(self, profile: dict[str, Any], status: dict[str, Any]) -> str:
         profile_name = str(profile.get("name") or "")
-        token = html.escape(self.server.proxy_token)
         sessions = status.get("sessions")
-        if not isinstance(sessions, list) or not sessions:
+        codex_sessions = (
+            [
+                session
+                for session in sessions
+                if isinstance(session, dict) and str(session.get("provider") or "codex") == "codex"
+            ]
+            if isinstance(sessions, list)
+            else []
+        )
+        if not codex_sessions:
             return f"""
               <details class="pin-menu profile-pin-menu" data-profile="{html.escape(profile_name)}">
                 <summary class="pin-summary">{PIN_ICON_SVG}<span>Session Pins</span></summary>
-                <div class="pin-menu-panel"><div class="pin-menu-empty">No sessions observed</div></div>
+                <div class="pin-menu-panel"><div class="pin-menu-empty">No Codex sessions observed</div></div>
               </details>
             """
 
         items: list[str] = []
-        for session in sessions:
-            if not isinstance(session, dict):
-                continue
+        for session in codex_sessions:
             session_key = str(session.get("key") or "")
             if not session_key:
                 continue
@@ -12059,7 +15106,6 @@ class Handler(BaseHTTPRequestHandler):
             items.append(
                 f"""
                 <form method="post" action="/api/pin-session" data-action="{action}" data-profile="{html.escape(profile_name)}">
-                  <input type="hidden" name="token" value="{token}">
                   <input type="hidden" name="action" value="{action}">
                   <input type="hidden" name="profile" value="{html.escape(profile_name)}">
                   <input type="hidden" name="session_key" value="{html.escape(session_key)}">
@@ -12076,7 +15122,7 @@ class Handler(BaseHTTPRequestHandler):
         return f"""
           <details class="pin-menu profile-pin-menu" data-profile="{html.escape(profile_name)}">
             <summary class="pin-summary{active_class}">{PIN_ICON_SVG}<span>Session Pins</span></summary>
-            <div class="pin-menu-panel">{''.join(items)}</div>
+            <div class="pin-menu-panel">{"".join(items)}</div>
           </details>
         """
 
@@ -12102,7 +15148,7 @@ class Handler(BaseHTTPRequestHandler):
             return ""
         return f"""
           <div class="pinned-sessions">
-            <div class="session-chips">{''.join(chips)}</div>
+            <div class="session-chips">{"".join(chips)}</div>
           </div>
         """
 
@@ -12112,7 +15158,6 @@ class Handler(BaseHTTPRequestHandler):
         enabled_class = " enabled" if enabled else ""
         return f"""
           <form method="post" action="/api/toggle-fast" class="profile-pill-form" data-action="toggle_fast" data-profile="{html.escape(profile_name)}">
-            <input type="hidden" name="token" value="{html.escape(self.server.proxy_token)}">
             <input type="hidden" name="profile" value="{html.escape(profile_name)}">
             <button class="profile-pill fast-pill{enabled_class}" title="Toggle fast mode">Fast</button>
           </form>
@@ -12135,12 +15180,10 @@ class Handler(BaseHTTPRequestHandler):
         disabled = "disabled" if running else ""
         cancel_disabled = "disabled" if status == "canceling" else ""
         title = "Login already running" if running else (error or "Refresh profile login")
-        token = html.escape(self.server.proxy_token)
         name = html.escape(profile_name)
         cancel_form = (
             f"""
               <form method="post" action="/api/login" data-action="cancel_login" data-profile="{name}">
-                <input type="hidden" name="token" value="{token}">
                 <input type="hidden" name="profile" value="{name}">
                 <input type="hidden" name="login_action" value="cancel_login">
                 <button class="menu-action danger-action" {cancel_disabled}>Cancel Login</button>
@@ -12155,13 +15198,11 @@ class Handler(BaseHTTPRequestHandler):
             <div class="login-menu-panel">
               <div class="login-menu-note">{html.escape(LOGIN_BROWSER_REMOTE_NOTE)}</div>
               <form method="post" action="/api/login" data-action="start_login" data-profile="{name}">
-                <input type="hidden" name="token" value="{token}">
                 <input type="hidden" name="profile" value="{name}">
                 <input type="hidden" name="mode" value="browser">
                 <button class="menu-action" {disabled}>Browser Login</button>
               </form>
               <form method="post" action="/api/login" data-action="start_login" data-profile="{name}">
-                <input type="hidden" name="token" value="{token}">
                 <input type="hidden" name="profile" value="{name}">
                 <input type="hidden" name="mode" value="device">
                 <button class="menu-action" {disabled}>Device Auth</button>
@@ -12198,15 +15239,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def render_model_menu(self, profile: dict[str, Any]) -> str:
         profile_name = str(profile.get("name") or "")
-        setting = profile.get("model_setting") if isinstance(profile.get("model_setting"), dict) else {}
+        setting = (
+            profile.get("model_setting") if isinstance(profile.get("model_setting"), dict) else {}
+        )
         current_model = str(setting.get("model") or DEFAULT_MODEL_ID)
-        current_reasoning = str(setting.get("reasoning_effort") or default_reasoning_for_model(current_model))
+        current_reasoning = str(
+            setting.get("reasoning_effort") or default_reasoning_for_model(current_model)
+        )
         label = model_pill_label(current_model, current_reasoning)
-        token = html.escape(self.server.proxy_token)
         name = html.escape(profile_name)
         items: list[str] = []
         profile_catalog = profile.get("model_catalog")
-        catalog = profile_catalog if isinstance(profile_catalog, list) and profile_catalog else model_catalog()
+        catalog = (
+            profile_catalog
+            if isinstance(profile_catalog, list) and profile_catalog
+            else model_catalog()
+        )
         for item in catalog:
             if not isinstance(item, dict):
                 continue
@@ -12226,7 +15274,6 @@ class Handler(BaseHTTPRequestHandler):
                 reasoning_forms.append(
                     f"""
                     <form method="post" action="/api/model" data-action="set_model" data-profile="{name}">
-                      <input type="hidden" name="token" value="{token}">
                       <input type="hidden" name="profile" value="{name}">
                       <input type="hidden" name="model" value="{html.escape(model)}">
                       <input type="hidden" name="reasoning_effort" value="{html.escape(reasoning)}">
@@ -12241,7 +15288,7 @@ class Handler(BaseHTTPRequestHandler):
                     <span>{html.escape(display)}</span>
                     <span class="model-option-arrow">&rsaquo;</span>
                   </button>
-                  <div class="model-reasoning-menu">{''.join(reasoning_forms)}</div>
+                  <div class="model-reasoning-menu">{"".join(reasoning_forms)}</div>
                 </div>
                 """
             )
@@ -12250,7 +15297,7 @@ class Handler(BaseHTTPRequestHandler):
             <summary class="model-pill" title="Select model and reasoning effort">
               <span>{html.escape(label)}</span>
             </summary>
-            <div class="model-menu-panel">{''.join(items)}</div>
+            <div class="model-menu-panel">{"".join(items)}</div>
           </details>
         """
 
@@ -12260,6 +15307,9 @@ class Handler(BaseHTTPRequestHandler):
             if profile.get("hidden"):
                 continue
             rows.append(self.render_profile_row(profile))
+        for profile in status.get("provider_profiles", []):
+            if isinstance(profile, dict):
+                rows.append(self.render_provider_profile_row(profile))
         return "".join(rows)
 
     def render_profile_row(self, profile: dict[str, Any]) -> str:
@@ -12271,7 +15321,9 @@ class Handler(BaseHTTPRequestHandler):
         active = " active" if profile.get("active") else ""
         switch_reason = str(profile.get("switch_disabled_reason") or "")
         switch_label = html.escape(str(profile.get("switch_button_label") or "Use"))
-        switch_class = "primary-action current-action" if profile.get("active") else "primary-action"
+        switch_class = (
+            "primary-action current-action" if profile.get("active") else "primary-action"
+        )
         if profile.get("active") and profile.get("has_active_sessions"):
             switch_class += " session-active-action"
         disabled = "disabled" if switch_reason else ""
@@ -12281,7 +15333,6 @@ class Handler(BaseHTTPRequestHandler):
         auth_health_html = str(profile.get("auth_health_html") or "")
         profile_chips = self.render_profile_chips(profile)
         model_menu = self.render_model_menu(profile)
-        token = html.escape(self.server.proxy_token)
         return f"""
           <tr class="profile-row{active}" data-profile="{name}" data-profile-key="{name}">
             <td class="profile-cell">
@@ -12297,12 +15348,10 @@ class Handler(BaseHTTPRequestHandler):
             <td class="quota-cell">{quota}</td>
             <td class="actions">
               <form method="post" action="/api/switch" data-action="switch" data-profile="{name}">
-                <input type="hidden" name="token" value="{token}">
                 <input type="hidden" name="profile" value="{name}">
                 <button class="{switch_class}" {disabled} title="{html.escape(switch_reason)}">{switch_label}</button>
               </form>
               <form method="post" action="/api/profile-visibility" data-action="set_profile_visibility" data-profile="{name}">
-                <input type="hidden" name="token" value="{token}">
                 <input type="hidden" name="profile" value="{name}">
                 <input type="hidden" name="hidden" value="true">
                 <button class="profile-visibility-action" title="Hide this profile from the dashboard">Hide</button>
@@ -12311,7472 +15360,251 @@ class Handler(BaseHTTPRequestHandler):
           </tr>
         """
 
+    def render_provider_profile_row(self, profile: dict[str, Any]) -> str:
+        provider = str(profile.get("provider") or "provider")
+        provider_label = str(profile.get("provider_label") or provider.title())
+        display_name = str(profile.get("display_name") or profile.get("name") or "Native")
+        key = html.escape(str(profile.get("key") or f"provider:{provider}:{display_name}"))
+        session_count = int(profile.get("session_count") or 0)
+        active_count = int(profile.get("active_session_count") or 0)
+        usage = profile.get("usage") if isinstance(profile.get("usage"), dict) else {}
+        models = profile.get("models") if isinstance(profile.get("models"), list) else []
+        model_html = (
+            "".join(
+                f'<span class="model-pill provider-model-pill">{html.escape(str(model))}</span>'
+                for model in models
+                if str(model)
+            )
+            or '<span class="quota-muted">Observed model unavailable</span>'
+        )
+        usage_rows: list[str] = []
+        for label, field in (
+            ("Total tokens", "totalTokens"),
+            ("Input", "inputTokens"),
+            ("Output", "outputTokens"),
+            ("Reasoning", "reasoningTokens"),
+            ("Cached read", "cachedReadTokens"),
+            ("Cache write", "cacheCreationTokens"),
+            ("Model calls", "modelCalls"),
+            ("Agent turns", "numTurns"),
+        ):
+            value = usage.get(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                usage_rows.append(
+                    f"<span><span>{html.escape(label)}</span><strong>{value:,}</strong></span>"
+                )
+        cost_ticks = usage.get("costUsdTicks")
+        if isinstance(cost_ticks, int) and not isinstance(cost_ticks, bool):
+            cost = f"{cost_ticks / 10_000_000_000:.4f}".rstrip("0").rstrip(".") or "0"
+            usage_rows.append(
+                f"<span><span>Server-reported cost</span><strong>${html.escape(cost)}</strong></span>"
+            )
+        latest_usage = (
+            '<div class="provider-usage-head">Latest observed turn</div>'
+            f'<div class="provider-usage-grid">{"".join(usage_rows)}</div>'
+            if usage_rows
+            else (
+                '<div class="quota-muted">'
+                f"{html.escape(str(profile.get('usage_empty') or 'No completed-turn usage observed yet.'))}"
+                "</div>"
+            )
+        )
+        quota = profile.get("quota") if isinstance(profile.get("quota"), dict) else {}
+        quota_status = html.escape(str(quota.get("status") or "Account quota unavailable"))
+        quota_detail = html.escape(str(quota.get("detail") or ""))
+        default_badge = (
+            '<span class="badge active-badge">Default provider identity</span>'
+            if profile.get("default_provider")
+            else (
+                '<span class="profile-pill provider-default-pill">'
+                f"{html.escape(str(profile.get('selection_label') or f'{provider_label} default'))}"
+                "</span>"
+                if profile.get("selected_for_provider")
+                else ""
+            )
+        )
+        account_label = str(profile.get("account_label") or "")
+        account_html = (
+            f'<div class="profile-email">{html.escape(account_label)}</div>'
+            if account_label
+            else ""
+        )
+        profile_kind = str(
+            profile.get("profile_kind_label")
+            or ("Managed provider profile" if profile.get("managed") else "Provider native")
+        )
+        auth_status = str(profile.get("auth_status") or "")
+        auth_status_class = " login-pill" if profile.get("logged_in") is False else ""
+        auth_status_html = (
+            f'<span class="profile-pill{auth_status_class}">{html.escape(auth_status)}</span>'
+            if auth_status
+            else ""
+        )
+        subscription = str(profile.get("subscription_label") or "")
+        subscription_html = (
+            f'<span class="profile-pill">{html.escape(subscription)}</span>' if subscription else ""
+        )
+        session_label = f"{session_count} session{'s' if session_count != 1 else ''}"
+        if active_count:
+            session_label += f" / {active_count} active"
+        return f"""
+          <tr class="profile-row provider-profile-row{" active" if profile.get("default_provider") else ""}" data-profile-key="{key}">
+            <td class="profile-cell">
+              <div class="profile-name">{html.escape(provider_label)} <span class="profile-plan">({html.escape(display_name)})</span></div>
+              <div class="profile-email">{html.escape(str(profile.get("identity_label") or "Native provider identity"))}</div>
+              {account_html}
+              <div class="profile-chips"><span class="profile-pill provider-pill">{html.escape(profile_kind)}</span>{auth_status_html}{subscription_html}{default_badge}</div>
+            </td>
+            <td class="model-cell"><div class="provider-models">{model_html}</div></td>
+            <td class="quota-cell">
+              <div class="provider-quota-panel">
+                <div class="provider-quota-head"><span>Account quota</span><strong>{quota_status}</strong></div>
+                <div class="provider-quota-detail">{quota_detail}</div>
+                {latest_usage}
+              </div>
+            </td>
+            <td class="actions provider-actions"><span>{html.escape(session_label)}</span></td>
+          </tr>
+        """
+
     def render_ui(self) -> str:
         status = self.ui_status_payload(include_html=True)
         rows = self.render_profile_rows(status)
         active_profile = html.escape(str(status.get("active_profile") or "none"))
+        default_provider = html.escape(str(status.get("default_provider") or "codex"))
         active_requests = int(status.get("active_requests") or 0)
         active_websockets = int(status.get("active_websockets") or 0)
         busy = "busy" if status.get("live_busy") else "idle"
         codex = status.get("codex") if isinstance(status.get("codex"), dict) else {}
-        codex_cli = codex.get("cli") if isinstance(codex.get("cli"), dict) else {}
+        codex_cli = reported_codex_cli(codex)
         codex_version = html.escape(str(codex_cli.get("version") or "unknown"))
         initial_json = json.dumps(
             {"type": "state", "status": status, "message": None},
             separators=(",", ":"),
         ).replace("</", "<\\/")
-        token_json = json.dumps(self.server.proxy_token)
-        return r"""
-<!doctype html>
-<html>
-	<head>
-		  <meta charset="utf-8">
-		  <meta name="viewport" content="width=device-width, initial-scale=1">
-		  <title>Provision</title>
-		  <script>
-		    (function() {
-		      try {
-		        const theme = localStorage.getItem("provision-theme");
-		        if (theme === "light" || theme === "dark") {
-		          document.documentElement.dataset.theme = theme;
-		        }
-		      } catch {
-		      }
-		    })();
-		  </script>
-		  <style>
-	    :root {
-	      color-scheme: light dark;
-	      --ink: #171717;
-	      --muted: #65676f;
-	      --line: #d9d9df;
-	      --surface: #ffffff;
-	      --page: #f6f4f1;
-	      --soft: #f0eeea;
-	      --subtle: #fafafa;
-	      --active-row: #fffafa;
-	      --button-bg: #ffffff;
-	      --button-hover: #fafafa;
-	      --button-disabled-bg: #f1f1f3;
-	      --button-disabled-ink: #8d9098;
-	      --bar-bg: #e8e8ed;
-	      --notice-bg: #fff1f0;
-	      --notice-border: #efc8c4;
-	      --notice-ink: #641e16;
-	      --message-bg: #fff8e5;
-	      --message-border: #e5d4a9;
-	      --message-ink: #5f410a;
-	      --badge-bg: #fff0f0;
-	      --badge-border: #f0b5b5;
-			      --red: #d83434;
-			      --red-hi: #eb5555;
-			      --red-low: #ad2929;
-			      --red-dark: #9f2424;
-			      --green: #35b779;
-			      --green-hi: #48d996;
-			      --green-low: #20915d;
-			      --blue: #60a5fa;
-			      --blue-hi: #7fb8ff;
-			      --blue-low: #3b82d6;
-			      --amber: #b7791f;
-			      --amber-hi: #d59b35;
-			      --amber-low: #8d5d14;
-			      --amber-dark: #8a5a12;
-	      --danger: #b42318;
-	      --shadow: 0 12px 30px rgba(23, 23, 23, 0.08);
-	    }
-		    @media (prefers-color-scheme: dark) {
-		      :root {
-	        --ink: #f1f3f7;
-	        --muted: #a5adba;
-	        --line: #343946;
-	        --surface: #151821;
-	        --page: #0b0d12;
-	        --soft: #1e222d;
-	        --subtle: #1a1e27;
-	        --active-row: #21171a;
-	        --button-bg: #1a1e27;
-	        --button-hover: #232938;
-	        --button-disabled-bg: #161a22;
-	        --button-disabled-ink: #707887;
-	        --bar-bg: #303642;
-	        --notice-bg: #2a1616;
-	        --notice-border: #603030;
-	        --notice-ink: #ffd7d4;
-	        --message-bg: #2a2414;
-	        --message-border: #5f4a19;
-	        --message-ink: #ffe2a3;
-	        --badge-bg: #2a171a;
-	        --badge-border: #6b3438;
-		        --red: #f05252;
-		        --red-hi: #ff6f6f;
-		        --red-low: #c83a3a;
-		        --red-dark: #c83a3a;
-		        --green: #35b779;
-		        --green-hi: #48d996;
-		        --green-low: #20915d;
-		        --blue: #60a5fa;
-		        --blue-hi: #7fb8ff;
-		        --blue-low: #3b82d6;
-		        --amber: #d79a2b;
-		        --amber-hi: #efbd54;
-		        --amber-low: #a86f16;
-		        --amber-dark: #a86f16;
-	        --danger: #ff6b63;
-		        --shadow: 0 14px 34px rgba(0, 0, 0, 0.34);
-		      }
-		    }
-		    :root[data-theme="light"] {
-		      color-scheme: light;
-		      --ink: #171717;
-		      --muted: #65676f;
-		      --line: #d9d9df;
-		      --surface: #ffffff;
-		      --page: #f6f4f1;
-		      --soft: #f0eeea;
-		      --subtle: #fafafa;
-		      --active-row: #fffafa;
-		      --button-bg: #ffffff;
-		      --button-hover: #fafafa;
-		      --button-disabled-bg: #f1f1f3;
-		      --button-disabled-ink: #8d9098;
-		      --bar-bg: #e8e8ed;
-		      --notice-bg: #fff1f0;
-		      --notice-border: #efc8c4;
-		      --notice-ink: #641e16;
-		      --message-bg: #fff8e5;
-		      --message-border: #e5d4a9;
-		      --message-ink: #5f410a;
-		      --badge-bg: #fff0f0;
-		      --badge-border: #f0b5b5;
-		      --red: #d83434;
-		      --red-hi: #eb5555;
-		      --red-low: #ad2929;
-		      --red-dark: #9f2424;
-		      --green: #35b779;
-		      --green-hi: #48d996;
-		      --green-low: #20915d;
-		      --blue: #60a5fa;
-		      --blue-hi: #7fb8ff;
-		      --blue-low: #3b82d6;
-		      --amber: #b7791f;
-		      --amber-hi: #d59b35;
-		      --amber-low: #8d5d14;
-		      --amber-dark: #8a5a12;
-		      --danger: #b42318;
-		      --shadow: 0 12px 30px rgba(23, 23, 23, 0.08);
-		    }
-		    :root[data-theme="dark"] {
-		      color-scheme: dark;
-		      --ink: #f1f3f7;
-		      --muted: #a5adba;
-		      --line: #343946;
-		      --surface: #151821;
-		      --page: #0b0d12;
-		      --soft: #1e222d;
-		      --subtle: #1a1e27;
-		      --active-row: #21171a;
-		      --button-bg: #1a1e27;
-		      --button-hover: #232938;
-		      --button-disabled-bg: #161a22;
-		      --button-disabled-ink: #707887;
-		      --bar-bg: #303642;
-		      --notice-bg: #2a1616;
-		      --notice-border: #603030;
-		      --notice-ink: #ffd7d4;
-		      --message-bg: #2a2414;
-		      --message-border: #5f4a19;
-		      --message-ink: #ffe2a3;
-		      --badge-bg: #2a171a;
-		      --badge-border: #6b3438;
-			      --red: #f05252;
-			      --red-hi: #ff6f6f;
-			      --red-low: #c83a3a;
-			      --red-dark: #c83a3a;
-			      --green: #35b779;
-			      --green-hi: #48d996;
-			      --green-low: #20915d;
-			      --blue: #60a5fa;
-			      --blue-hi: #7fb8ff;
-			      --blue-low: #3b82d6;
-			      --amber: #d79a2b;
-			      --amber-hi: #efbd54;
-			      --amber-low: #a86f16;
-			      --amber-dark: #a86f16;
-		      --danger: #ff6b63;
-		      --shadow: 0 14px 34px rgba(0, 0, 0, 0.34);
-		    }
-    html {
-      min-height: 100%;
-      background: var(--page);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background: var(--page);
-      color: var(--ink);
-      font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    .shell {
-      width: min(1240px, calc(100vw - 32px));
-      margin: 24px auto 40px;
-      position: relative;
-    }
-		    .topbar {
-		      display: flex;
-		      align-items: center;
-		      flex-wrap: wrap;
-		      gap: 16px;
-		      padding: 10px 14px;
-	      background: var(--surface);
-	      border: 1px solid var(--line);
-	      box-shadow: var(--shadow);
-	      border-radius: 8px;
-	    }
-		    .logo {
-		      width: 218px;
-		      height: 44px;
-		      object-fit: contain;
-		      border-radius: 6px;
-		      flex: 0 0 auto;
-		    }
-    .top-meta {
-	      display: flex;
-	      flex-wrap: wrap;
-	      gap: 10px;
-	      color: var(--muted);
-	      font-size: 13px;
-	      flex: 1 1 300px;
-	    }
-    #codexRestartRequired[hidden] {
-      display: none;
-    }
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      min-height: 24px;
-	      padding: 2px 8px;
-	      border: 1px solid var(--line);
-	      border-radius: 999px;
-	      background: linear-gradient(180deg, var(--surface), var(--subtle));
-	      color: var(--ink);
-	      white-space: nowrap;
-	    }
-    .dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 50%;
-      background: var(--green);
-      display: inline-block;
-    }
-	    .dot.busy { background: var(--amber); }
-	    .dot.disconnected { background: var(--danger); }
-		    .top-actions {
-		      margin-left: auto;
-		      display: flex;
-		      align-items: flex-end;
-		      gap: 8px;
-		      justify-content: center;
-		    }
-	    .stats-toggle {
-	      width: 30px;
-	      min-height: 30px;
-	      padding: 0;
-	      display: inline-flex;
-	      align-items: center;
-	      justify-content: center;
-	      border-radius: 999px;
-	    }
-	    .stats-toggle.active {
-	      color: #fff;
-	      border-color: var(--red);
-	      background: linear-gradient(180deg, var(--red-hi), var(--red-low));
-	      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.25);
-	    }
-		    .theme-toggle {
-		      width: 30px;
-		      min-height: 30px;
-		      padding: 0;
-		      display: inline-flex;
-		      align-items: center;
-		      justify-content: center;
-		      border-radius: 999px;
-		    }
-		    .stats-toggle svg,
-		    .theme-toggle svg {
-		      width: 16px;
-		      height: 16px;
-		      stroke: currentColor;
-		      stroke-width: 2;
-		      stroke-linecap: round;
-		      stroke-linejoin: round;
-		    }
-	    .notice, .message {
-	      margin-top: 14px;
-	      padding: 10px 12px;
-	      border: 1px solid var(--notice-border);
-	      border-left: 4px solid var(--danger);
-	      border-radius: 6px;
-	      background: var(--notice-bg);
-	      color: var(--notice-ink);
-	    }
-	    .notice:empty { display: none; }
-	    .message {
-	      display: none;
-	      border-color: var(--message-border);
-	      border-left-color: var(--amber);
-	      background: var(--message-bg);
-	      color: var(--message-ink);
-	    }
-    .message.visible { display: block; }
-	    .modal-backdrop {
-	      position: fixed;
-	      inset: 0;
-	      z-index: 80;
-      display: grid;
-      place-items: center;
-      padding: 18px;
-	      background: rgba(0, 0, 0, 0.42);
-	    }
-	    .modal-backdrop[hidden] { display: none; }
-	    .stats-backdrop {
-	      place-items: start center;
-	      padding-top: var(--stats-modal-top, 18px);
-	      box-sizing: border-box;
-	      background: transparent;
-	    }
-    .confirm-modal {
-      width: min(440px, calc(100vw - 32px));
-      display: grid;
-      gap: 12px;
-      padding: 16px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      color: var(--ink);
-      box-shadow: var(--shadow);
-    }
-    .confirm-modal h2 {
-      margin: 0;
-      font-size: 15px;
-    }
-    .confirm-modal p {
-      margin: 0;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.45;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-    }
-    .confirm-actions {
-      display: flex;
-      justify-content: flex-end;
-      gap: 8px;
-      margin-top: 2px;
-    }
-    .confirm-actions button {
-      width: auto;
-      min-height: 30px;
-      padding: 4px 11px;
-    }
-    .confirm-actions .danger {
-      color: #fff;
-      border-color: var(--red);
-      background: linear-gradient(180deg, var(--red-hi), var(--red-low));
-      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.25);
-    }
-    .ui-tooltip {
-      position: fixed;
-      z-index: 140;
-      max-width: min(340px, calc(100vw - 24px));
-      padding: 6px 8px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--surface);
-      color: var(--ink);
-      box-shadow: var(--shadow);
-      font-size: 12px;
-      line-height: 1.35;
-      overflow-wrap: anywhere;
-      pointer-events: none;
-    }
-    .ui-tooltip[hidden] {
-      display: none;
-    }
-	    .stats-modal {
-	      width: min(1240px, calc(100vw - 32px));
-	      height: calc(100vh - var(--stats-modal-top, 18px) - 18px);
-	      max-height: calc(100vh - var(--stats-modal-top, 18px) - 18px);
-	      min-height: 0;
-	      overflow: hidden;
-	      display: grid;
-	      grid-template-rows: auto minmax(0, 1fr);
-	      background: var(--surface);
-	      border: 1px solid var(--line);
-	      border-radius: 8px;
-	      box-shadow: var(--shadow);
-	      pointer-events: auto;
-	    }
-    .stats-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 12px 14px;
-      border-bottom: 1px solid var(--line);
-      background: var(--soft);
-    }
-    .stats-head h2 {
-      margin: 0;
-      font-size: 15px;
-    }
-    .stats-close {
-      width: 30px;
-      min-height: 30px;
-      padding: 0;
-      border-radius: 999px;
-    }
-    .stats-content {
-      display: grid;
-      align-content: start;
-      gap: 16px;
-      padding: 14px;
-      box-sizing: border-box;
-      min-width: 0;
-      max-width: 100%;
-      min-height: 0;
-      height: 100%;
-      overflow-y: auto;
-      overflow-x: hidden;
-    }
-    .stats-graph-card {
-      display: grid;
-      gap: 10px;
-      min-width: 0;
-      max-width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 10px;
-      background: var(--subtle);
-    }
-    .stats-graph-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 10px;
-    }
-    .stats-section h3 {
-      margin: 0 0 8px;
-      font-size: 12px;
-      text-transform: uppercase;
-      color: var(--muted);
-      letter-spacing: 0;
-    }
-    .stats-graph-card h3 {
-      margin: 0;
-      font-size: 12px;
-      text-transform: uppercase;
-      color: var(--muted);
-      letter-spacing: 0;
-    }
-    .stats-profile-toggles {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      justify-content: flex-end;
-      min-width: 0;
-    }
-    .stats-profile-toggle {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      min-width: 0;
-      max-width: 100%;
-      font-size: 12px;
-      color: var(--muted);
-      cursor: pointer;
-      overflow-wrap: anywhere;
-    }
-    .stats-profile-toggle input { margin: 0; }
-    .stats-profile-toggle span {
-      width: 9px;
-      height: 9px;
-      border-radius: 50%;
-      background: var(--profile-color);
-      display: inline-block;
-    }
-	    .stats-graph {
-	      position: relative;
-	      min-width: 0;
-	      max-width: 100%;
-	      min-height: 230px;
-	      overflow: hidden;
-	      border: 1px solid var(--line);
-	      border-radius: 6px;
-	      background: linear-gradient(180deg, var(--surface), var(--subtle));
-	      color: var(--muted);
-	      touch-action: pan-y;
-	    }
-	    .stats-graph-svg {
-	      width: 100%;
-	      height: 230px;
-	      display: block;
-	    }
-    .stats-graph-grid {
-      stroke: currentColor;
-      opacity: 0.12;
-      stroke-width: 1;
-    }
-    .stats-graph-axis {
-      stroke: currentColor;
-      opacity: 0.32;
-      stroke-width: 1.2;
-    }
-    .stats-graph-reference {
-      stroke: var(--amber);
-      stroke-width: 1;
-      stroke-dasharray: 5 5;
-      opacity: 0.75;
-    }
-    .stats-graph-label {
-      fill: currentColor;
-      opacity: 0.78;
-      font: 11px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    .stats-graph-marker {
-      stroke: var(--surface);
-      stroke-width: 2;
-    }
-    .stats-graph-cursor {
-      position: absolute;
-      top: 0;
-      bottom: 0;
-      width: 1px;
-      background: var(--red);
-      opacity: 0.72;
-      pointer-events: none;
-      transform: translateX(-0.5px);
-    }
-    .stats-graph-hover-dot {
-      position: absolute;
-      width: 10px;
-      height: 10px;
-      border: 2px solid var(--surface);
-      border-radius: 50%;
-      background: var(--red);
-      box-shadow: 0 0 0 2px rgba(216, 52, 52, 0.28);
-      pointer-events: none;
-      transform: translate(-50%, -50%);
-    }
-    .stats-graph-tooltip {
-      position: absolute;
-      z-index: 2;
-      display: grid;
-      gap: 4px;
-      min-width: 210px;
-      max-width: min(320px, calc(100% - 16px));
-      padding: 8px 9px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--surface);
-      color: var(--ink);
-      box-shadow: var(--shadow);
-      font-size: 12px;
-      pointer-events: none;
-    }
-    .stats-graph-tooltip[hidden],
-    .stats-graph-cursor[hidden],
-    .stats-graph-hover-dot[hidden] {
-      display: none;
-    }
-    .stats-graph-tooltip strong {
-      font-size: 12px;
-    }
-    .stats-graph-tooltip span {
-      color: var(--muted);
-      overflow-wrap: anywhere;
-    }
-	    .stats-graph-empty {
-	      min-height: 230px;
-	      display: grid;
-	      place-items: center;
-      color: var(--muted);
-      font-weight: 650;
-    }
-	    .stats-table-wrap {
-	      overflow: auto;
-	      max-width: 100%;
-	      max-height: min(320px, 34vh);
-	      border: 1px solid var(--line);
-	      border-radius: 6px;
-	    }
-    .stats-table {
-      width: 100%;
-      table-layout: fixed;
-      min-width: 0;
-      border-collapse: collapse;
-    }
-    .stats-table th,
-    .stats-table td {
-      padding: 8px 10px;
-      border-bottom: 1px solid var(--line);
-      white-space: normal;
-      overflow-wrap: anywhere;
-      word-break: break-word;
-      vertical-align: top;
-    }
-    .stats-table tbody tr:last-child td { border-bottom: 0; }
-    .stats-table td:first-child { font-weight: 700; color: var(--ink); }
-    .stats-section {
-      min-width: 0;
-      max-width: 100%;
-      overflow: hidden;
-    }
-	    .stats-recent {
-	      display: grid;
-	      gap: 7px;
-	      min-width: 0;
-	      max-width: 100%;
-	      max-height: 320px;
-	      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 8px;
-      background: var(--subtle);
-    }
-    .stats-event {
-      display: grid;
-      grid-template-columns: minmax(84px, 116px) minmax(0, 1fr);
-      gap: 10px;
-      min-width: 0;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .stats-event strong {
-      min-width: 0;
-      color: var(--ink);
-      overflow-wrap: anywhere;
-      word-break: break-word;
-    }
-    .session-tabs {
-      margin-top: 14px;
-      display: flex;
-      align-items: stretch;
-      gap: 8px;
-      overflow-x: auto;
-      padding: 2px 0 4px;
-      scrollbar-width: thin;
-    }
-	    .session-tab {
-	      position: relative;
-	      width: auto;
-	      min-width: 170px;
-	      max-width: 280px;
-	      min-height: 46px;
-	      justify-content: flex-start;
-      align-items: flex-start;
-      flex-direction: column;
-      gap: 2px;
-      padding: 7px 10px;
-      border-radius: 7px;
-      text-align: left;
-      color: var(--muted);
-	      background: linear-gradient(180deg, var(--surface), var(--subtle));
-	      flex: 0 0 auto;
-	    }
-	    .session-tab.dragging {
-	      opacity: 0.52;
-	    }
-	    .session-tab.drop-before {
-	      box-shadow: inset 3px 0 0 var(--red), inset 0 1px 0 rgba(255, 255, 255, 0.62);
-	    }
-	    .session-tab.drop-after {
-	      box-shadow: inset -3px 0 0 var(--red), inset 0 1px 0 rgba(255, 255, 255, 0.62);
-	    }
-	    .session-tab.active {
-	      border-color: var(--amber);
-	      color: var(--ink);
-	    }
-    .session-tab.selected {
-      border-color: var(--red);
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.62), 0 0 0 2px rgba(216, 52, 52, 0.1);
-    }
-    :root[data-theme="dark"] .session-tab.selected {
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 0 0 2px rgba(240, 82, 82, 0.18);
-    }
-    .session-tab-title {
-      max-width: 100%;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      font-weight: 780;
-      color: var(--ink);
-    }
-	    .session-tab-meta {
-	      max-width: 100%;
-	      overflow: hidden;
-	      text-overflow: ellipsis;
-	      font-size: 11px;
-	      color: var(--muted);
-	      padding-right: 18px;
-	    }
-	    .session-tab-close {
-	      position: absolute;
-	      top: 4px;
-	      right: 4px;
-	      display: inline-flex;
-	      align-items: center;
-	      justify-content: center;
-	      width: 20px;
-	      min-height: 20px;
-	      padding: 0;
-	      border-radius: 999px;
-	      color: var(--muted);
-	      background: transparent;
-	      border-color: transparent;
-	      box-shadow: none;
-	      font-size: 14px;
-	      line-height: 1;
-	      cursor: pointer;
-	    }
-	    .session-tab-close:hover:not(:disabled) {
-	      color: #fff;
-	      border-color: var(--red);
-	      background: linear-gradient(180deg, var(--red-hi), var(--red-low));
-	    }
-	    .session-tab.launch-tab {
-	      min-width: 64px;
-	      max-width: 64px;
-	      align-items: center;
-      justify-content: center;
-      text-align: center;
-      color: var(--ink);
-    }
-    .session-tab.launch-tab .session-tab-title {
-      font-size: 22px;
-      line-height: 1;
-    }
-    .session-tab.launch-tab .session-tab-meta {
-      font-size: 10px;
-      padding-right: 0;
-    }
-    .session-tabs-empty {
-      color: var(--muted);
-      border: 1px dashed var(--line);
-      border-radius: 7px;
-      background: var(--subtle);
-      padding: 9px 11px;
-      font-size: 12px;
-      font-weight: 650;
-    }
-    .launcher-dock {
-      position: absolute;
-      left: 0;
-      right: 0;
-      top: var(--control-dock-top, 0);
-      bottom: 0;
-      z-index: 66;
-      pointer-events: none;
-    }
-    .launcher-dock[hidden] {
-      display: none;
-    }
-    .launcher-modal {
-      width: 100%;
-      height: 100%;
-      min-height: 0;
-      display: grid;
-      grid-template-rows: auto minmax(0, 1fr);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      box-shadow: var(--shadow);
-      overflow: hidden;
-      pointer-events: auto;
-    }
-    .launcher-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 8px 12px;
-      border-bottom: 1px solid var(--line);
-      background: var(--soft);
-    }
-    .launcher-head h2 {
-      margin: 0;
-      font-size: 12px;
-      color: var(--ink);
-    }
-    .launcher-grid {
-      align-self: start;
-      display: grid;
-      grid-template-columns: minmax(220px, 1fr) minmax(150px, 210px) minmax(150px, 210px) auto;
-      align-items: end;
-      gap: 9px;
-      padding: 10px 12px;
-      background: var(--surface);
-    }
-    .launcher-field {
-      display: grid;
-      gap: 3px;
-      min-width: 130px;
-      flex: 0 1 auto;
-    }
-    .launcher-field.workdir {
-      min-width: min(100%, 220px);
-    }
-    .launcher-field.resume-session {
-      grid-column: 1 / 4;
-    }
-    .launcher-field[hidden] {
-      display: none;
-    }
-    .launcher-field span {
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 800;
-      text-transform: uppercase;
-    }
-    .launcher-field select {
-      min-height: 32px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--subtle);
-      color: var(--ink);
-      padding: 5px 8px;
-      max-width: 100%;
-    }
-    .launcher-actions {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
-    .launcher-actions button {
-      width: auto;
-      min-height: 32px;
-      padding: 4px 10px;
-    }
-    .control-dock {
-      position: absolute;
-      left: 0;
-      right: 0;
-      top: var(--control-dock-top, 0);
-      bottom: 0;
-      z-index: 65;
-      pointer-events: none;
-    }
-    .control-dock[hidden] { display: none; }
-    .control-modal {
-      width: 100%;
-      height: 100%;
-      min-height: 0;
-      position: relative;
-      display: grid;
-      grid-template-rows: auto auto auto minmax(0, 1fr) auto;
-	      background: var(--surface);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: var(--shadow);
-      overflow: hidden;
-      pointer-events: auto;
-    }
-    .control-head {
-	  grid-row: 1;
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 14px;
-      padding: 8px 12px;
-      border-bottom: 1px solid var(--line);
-      background: var(--soft);
-    }
-    .control-title-block {
-      min-width: 0;
-      display: grid;
-      gap: 2px;
-    }
-    .control-head h2 {
-      margin: 0;
-      font-size: 12px;
-      overflow-wrap: anywhere;
-    }
-    .control-close {
-      width: 30px;
-      min-height: 30px;
-      padding: 0;
-      border-radius: 999px;
-      flex: 0 0 auto;
-    }
-    .control-head-actions {
-      display: flex;
-      align-items: center;
-      justify-content: flex-end;
-      gap: 7px;
-      flex-wrap: wrap;
-      flex: 0 0 auto;
-    }
-	    .control-head-actions button {
-	      width: auto;
-	      min-height: 30px;
-	      padding: 3px 9px;
-	      border-radius: 999px;
-	    }
-	    #controlForget {
-	      display: none;
-	    }
-    .control-turn-select {
-      min-height: 30px;
-      max-width: min(42vw, 360px);
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--surface);
-      color: var(--ink);
-      padding: 4px 8px;
-    }
-    .control-toolbar {
-	  grid-row: 3;
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 10px;
-      padding: 8px 12px;
-      border-bottom: 1px solid var(--line);
-      background: var(--surface);
-    }
-    .control-view-tabs {
-      display: inline-flex;
-      gap: 6px;
-      flex: 0 0 auto;
-    }
-    .control-view-button {
-      width: auto;
-      min-height: 30px;
-      padding: 3px 10px;
-      border-radius: 999px;
-      color: var(--muted);
-      background: linear-gradient(180deg, var(--surface), var(--subtle));
-    }
-    .control-view-button.active {
-      color: #fff;
-      border-color: var(--red);
-      background: linear-gradient(180deg, var(--red-hi), var(--red-low));
-      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.28);
-    }
-    .control-search {
-      flex: 1 1 260px;
-      min-width: 160px;
-      min-height: 30px;
-      padding: 5px 9px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--subtle);
-      color: var(--ink);
-    }
-    .control-status-pills {
-	      grid-row: 2;
-	      display: flex;
-	      flex-wrap: wrap;
-	      align-items: center;
-	      gap: 6px;
-	      padding: 8px 12px 6px;
-	      background: var(--surface);
-	    }
-    .mobile-control-status,
-    .mobile-focus-restore {
-      display: none;
-    }
-    .control-compact-quota {
-      display: inline-grid;
-      grid-template-columns: auto auto minmax(76px, 112px) auto;
-      align-items: center;
-      gap: 6px;
-      min-height: 24px;
-      max-width: 100%;
-      padding: 2px 7px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: linear-gradient(180deg, var(--surface), var(--subtle));
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 780;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.38);
-    }
-    :root[data-theme="dark"] .control-compact-quota {
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07);
-    }
-    .control-compact-quota.state,
-    .control-compact-quota.count {
-      grid-template-columns: auto auto;
-    }
-    .control-compact-quota-name {
-      color: var(--ink);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      max-width: 92px;
-    }
-    .control-compact-quota-primary {
-      color: var(--green);
-      min-width: 30px;
-      text-align: right;
-    }
-    .control-compact-quota-primary.not-enforced {
-      color: var(--muted);
-    }
-    .control-compact-quota-weekly {
-      color: var(--blue);
-      min-width: 30px;
-    }
-    .control-compact-quota-text {
-      color: var(--muted);
-    }
-    .control-compact-quota-bar {
-      position: relative;
-      display: block;
-      width: 100%;
-      min-width: 76px;
-      height: 12px;
-      border: 1px solid var(--line);
-      background: var(--soft);
-      overflow: hidden;
-    }
-    .control-compact-quota-weekly-fill,
-    .control-compact-quota-primary-fill {
-      position: absolute;
-      left: 0;
-      bottom: 0;
-      display: block;
-      max-width: 100%;
-      transition: width 160ms ease;
-    }
-    .control-compact-quota-weekly-fill {
-      height: 12px;
-      background: linear-gradient(180deg, var(--blue-hi), var(--blue-low));
-    }
-    .control-compact-quota-primary-fill {
-      height: 8px;
-      background: linear-gradient(180deg, var(--green-hi), var(--green-low));
-    }
-	    .control-compact-quota.unlimited .control-compact-quota-bar,
-	    .control-compact-quota.unknown .control-compact-quota-bar {
-	      background: linear-gradient(90deg, rgba(59, 130, 214, 0.18), rgba(25, 135, 84, 0.16));
-	    }
-	    .control-compact-quota.secondary {
-	      opacity: 0.9;
-	    }
-    .control-content {
-	  grid-row: 4;
-      min-width: 0;
-      min-height: 0;
-      overflow: auto;
-      padding: 10px 12px 14px;
-      display: grid;
-      gap: 12px;
-    }
-    .control-modal.discussion-view .control-content {
-      align-content: start;
-      grid-auto-rows: max-content;
-    }
-    .control-modal.details-view .control-search,
-    .control-modal.resume-view .control-search,
-    .control-modal.details-view .control-compose,
-    .control-modal.resume-view .control-compose {
-      display: none;
-    }
-    .control-resume-list {
-      display: grid;
-      gap: 8px;
-    }
-    .control-resume-item {
-      width: 100%;
-      min-height: 0;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: start;
-      gap: 10px;
-      padding: 9px 10px;
-      text-align: left;
-      white-space: normal;
-      border-radius: 6px;
-      background: linear-gradient(180deg, var(--surface), var(--subtle));
-    }
-    .control-resume-item.selected {
-      border-color: var(--red);
-      box-shadow: inset 3px 0 0 var(--red);
-    }
-    .control-resume-main {
-      display: grid;
-      gap: 4px;
-      min-width: 0;
-    }
-    .control-resume-label {
-      color: var(--ink);
-      font-weight: 760;
-      overflow-wrap: anywhere;
-    }
-    .control-resume-meta {
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .control-resume-actions {
-      display: flex;
-      justify-content: flex-end;
-      gap: 8px;
-      flex-wrap: wrap;
-      margin-top: 10px;
-    }
-    .control-resume-actions button {
-      width: auto;
-      min-width: 96px;
-      border-radius: 999px;
-    }
-    .control-detail-section {
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--surface);
-      overflow: hidden;
-    }
-    .control-detail-section h3 {
-      margin: 0;
-      padding: 8px 10px;
-      font-size: 12px;
-      text-transform: uppercase;
-      color: var(--muted);
-      letter-spacing: 0;
-      font-weight: 800;
-      background: var(--subtle);
-      border-bottom: 1px solid var(--line);
-    }
-    .control-section-body {
-      padding: 8px;
-      display: grid;
-      gap: 8px;
-    }
-    .control-active-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
-      gap: 8px;
-    }
-    .control-active-card,
-    .control-event {
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--subtle);
-      padding: 8px;
-      min-width: 0;
-    }
-    .control-active-card strong,
-    .control-event strong {
-      color: var(--ink);
-    }
-    .control-active-card {
-      color: var(--muted);
-      font-size: 12px;
-      display: grid;
-      gap: 4px;
-    }
-    .control-events {
-      display: grid;
-      gap: 7px;
-    }
-	    .control-transcript {
-	      display: grid;
-	      gap: 8px;
-	      min-width: 0;
-	      align-content: start;
-	      grid-auto-rows: max-content;
-	    }
-	    .control-scroll-badge-row {
-	      position: sticky;
-	      z-index: 6;
-	      display: flex;
-	      pointer-events: none;
-	      height: 0;
-	    }
-	    .control-scroll-badge-row.top {
-	      top: 0;
-	      justify-content: flex-start;
-	    }
-	    .control-scroll-badge-row.bottom {
-	      bottom: 0;
-	      justify-content: flex-end;
-	    }
-	    .control-scroll-badge {
-	      width: auto;
-	      min-height: 24px;
-	      padding: 2px 8px;
-	      border-radius: 999px;
-	      border: 1px solid var(--line);
-	      color: var(--muted);
-	      background: linear-gradient(180deg, var(--surface), var(--subtle));
-	      box-shadow: var(--shadow);
-	      font-size: 11px;
-	      font-weight: 780;
-	      pointer-events: auto;
-	    }
-	    .control-scroll-badge[hidden] {
-	      display: none;
-	    }
-	    .control-transcript-window-note {
-	      color: var(--muted);
-	      font-size: 11px;
-	      font-weight: 650;
-	      text-align: center;
-	    }
-	    .control-turn-boundary,
-	    .control-prior-turn {
-	      display: flex;
-	      align-items: center;
-	      justify-content: space-between;
-	      gap: 8px;
-	      padding: 7px 8px;
-	      border: 1px dashed var(--line);
-	      border-radius: 6px;
-	      color: var(--muted);
-	      background: var(--surface);
-	      font-size: 11px;
-	      font-weight: 720;
-	    }
-	    .control-prior-turn-actions {
-	      display: flex;
-	      flex-wrap: wrap;
-	      justify-content: flex-end;
-	      gap: 6px;
-	    }
-	    .control-prior-turn button,
-	    .control-transcript-window-button {
-	      width: auto;
-	      min-height: 26px;
-	      padding: 3px 8px;
-	      border-radius: 999px;
-	      font-size: 11px;
-	    }
-	    .control-message {
-	      display: grid;
-	      gap: 4px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--subtle);
-      padding: 8px;
-      min-width: 0;
-	      align-self: start;
-    }
-    .control-message.user {
-      border-left: 3px solid var(--red);
-    }
-    .control-message.user_pending {
-      border-left: 3px solid var(--amber);
-      background: linear-gradient(180deg, rgba(242, 189, 67, 0.08), var(--subtle));
-    }
-    .control-message.assistant {
-      border-left: 3px solid var(--green);
-    }
-    .control-message.assistant_progress {
-      border-left: 3px solid var(--blue);
-      background: linear-gradient(180deg, var(--surface), var(--subtle));
-    }
-    .control-message.assistant_activity {
-      border-left-width: 4px;
-    }
-    .control-message.resume {
-      border-left: 3px solid var(--amber);
-    }
-    .control-message.context_compaction {
-      border-left: 3px solid var(--blue);
-      background: linear-gradient(180deg, rgba(59, 130, 214, 0.08), var(--subtle));
-    }
-    .control-compaction-summary {
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.45;
-    }
-    .control-message.tool {
-      border-left: 3px solid var(--amber);
-    }
-    .control-message-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 750;
-    }
-    .control-message-turn {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-    }
-    .control-message-spinner {
-      width: 11px;
-      height: 11px;
-      border: 2px solid var(--bar-bg);
-      border-top-color: var(--amber);
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-      flex: 0 0 auto;
-    }
-    .control-message-text {
-      min-width: 0;
-      max-width: 100%;
-      color: var(--ink);
-      font-size: 13px;
-      line-height: 1.45;
-      overflow-wrap: break-word;
-      word-break: normal;
-    }
-    .control-message-text.plain {
-      white-space: pre-wrap;
-    }
-    .control-message-text.markdown {
-      min-width: 0;
-      max-width: 100%;
-      white-space: normal;
-    }
-    .control-message-text.markdown > :first-child { margin-top: 0; }
-    .control-message-text.markdown > :last-child { margin-bottom: 0; }
-    .control-message-text.markdown p,
-    .control-message-text.markdown ul,
-    .control-message-text.markdown ol,
-    .control-message-text.markdown blockquote,
-    .control-message-text.markdown pre,
-    .control-message-text.markdown table {
-      min-width: 0;
-      max-width: 100%;
-      margin: 0 0 8px;
-      overflow-wrap: break-word;
-      word-break: normal;
-    }
-    .control-message-text.markdown h1,
-    .control-message-text.markdown h2,
-    .control-message-text.markdown h3,
-    .control-message-text.markdown h4 {
-      margin: 10px 0 6px;
-      color: var(--ink);
-      line-height: 1.25;
-      letter-spacing: 0;
-    }
-    .control-message-text.markdown h1 { font-size: 17px; }
-    .control-message-text.markdown h2 { font-size: 16px; }
-    .control-message-text.markdown h3 { font-size: 15px; }
-    .control-message-text.markdown h4 { font-size: 14px; }
-    .control-message-text.markdown ul,
-    .control-message-text.markdown ol {
-      padding-left: 22px;
-      box-sizing: border-box;
-      width: 100%;
-      overflow: hidden;
-    }
-    .control-message-text.markdown li {
-      min-width: 0;
-      max-width: 100%;
-      margin: 3px 0;
-      overflow-wrap: break-word;
-      word-break: normal;
-      white-space: normal;
-    }
-    .control-message-text.markdown blockquote {
-      padding: 3px 0 3px 10px;
-      border-left: 3px solid var(--line);
-      color: var(--muted);
-    }
-    .control-message-text.markdown code,
-    .control-message-text.markdown a {
-      padding: 2px 5px;
-      border: 1px solid rgba(59, 130, 214, 0.35);
-      border-radius: 4px;
-      background: linear-gradient(180deg, rgba(96, 165, 250, 0.14), rgba(96, 165, 250, 0.07));
-      color: var(--blue-low);
-      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.48);
-      white-space: normal;
-      overflow-wrap: anywhere;
-      word-break: break-word;
-    }
-    .control-message-text.markdown a {
-      text-decoration: none;
-      font-weight: 760;
-    }
-    .control-message-text.markdown a:hover {
-      border-color: rgba(59, 130, 214, 0.55);
-      background: linear-gradient(180deg, rgba(96, 165, 250, 0.2), rgba(96, 165, 250, 0.11));
-    }
-    :root[data-theme="dark"] .control-message-text.markdown code,
-    :root[data-theme="dark"] .control-message-text.markdown a {
-      border-color: rgba(127, 184, 255, 0.32);
-      background: linear-gradient(180deg, rgba(96, 165, 250, 0.16), rgba(96, 165, 250, 0.09));
-      color: var(--blue-hi);
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07);
-    }
-    .control-message-text.markdown pre {
-      max-width: 100%;
-      overflow-x: hidden;
-      padding: 8px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--surface);
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      word-break: break-word;
-    }
-    .control-message-text.markdown pre code {
-      display: block;
-      padding: 0;
-      border: 0;
-      background: transparent;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      word-break: break-word;
-    }
-    .control-message-text.markdown table {
-      display: block;
-      width: max-content;
-      max-width: 100%;
-      overflow-x: auto;
-      border-collapse: collapse;
-      table-layout: auto;
-    }
-    .control-message-text.markdown th,
-    .control-message-text.markdown td {
-      padding: 5px 7px;
-      border: 1px solid var(--line);
-      vertical-align: top;
-      text-align: left;
-    }
-    .control-message-text.markdown th {
-      background: var(--surface);
-      color: var(--ink);
-      font-size: 12px;
-      text-transform: none;
-    }
-    .control-message.assistant_progress .control-message-text,
-    .control-message.tool .control-message-text {
-      padding-left: 8px;
-      border-left: 1px solid var(--line);
-    }
-    .control-show-more {
-      width: auto;
-      min-height: 26px;
-      justify-self: start;
-      padding: 2px 8px;
-      border-radius: 999px;
-      font-size: 12px;
-      color: var(--muted);
-      background: var(--surface);
-    }
-    .control-show-more:hover {
-      color: var(--ink);
-      border-color: var(--red);
-    }
-    .control-activity-parts {
-      display: grid;
-      gap: 8px;
-    }
-	    .control-tool-block {
-	      display: grid;
-	      gap: 7px;
-	      margin-left: 14px;
-	      padding: 8px 9px;
-	      border: 1px solid var(--line);
-      border-left: 4px solid var(--amber);
-      background: linear-gradient(180deg, var(--surface), var(--subtle));
-      color: var(--ink);
-	      white-space: pre-wrap;
-	      overflow-wrap: anywhere;
-	    }
-	    .control-tool-summary {
-	      display: flex;
-	      align-items: center;
-	      justify-content: space-between;
-	      gap: 8px;
-	      min-width: 0;
-	    }
-	    .control-tool-title {
-	      display: inline-flex;
-	      align-items: center;
-	      gap: 6px;
-	      min-width: 0;
-	      font-weight: 800;
-	      color: var(--ink);
-	    }
-	    .control-tool-title code {
-	      max-width: min(100%, 48vw);
-	      overflow: hidden;
-	      text-overflow: ellipsis;
-	      border: 1px solid rgba(183, 121, 31, 0.35);
-	      border-radius: 4px;
-	      padding: 1px 5px;
-	      background: rgba(183, 121, 31, 0.1);
-	      color: var(--ink);
-	      font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-	    }
-	    .control-tool-status {
-	      flex: 0 0 auto;
-	      border: 1px solid var(--line);
-	      border-radius: 999px;
-	      padding: 1px 7px;
-	      color: var(--muted);
-	      background: var(--surface);
-	      font-size: 11px;
-	      font-weight: 780;
-	    }
-	    .control-tool-status.completed {
-	      border-color: rgba(25, 135, 84, 0.34);
-	      color: var(--green);
-	      background: rgba(25, 135, 84, 0.08);
-	    }
-	    .control-tool-status.in_progress {
-	      border-color: rgba(59, 130, 214, 0.34);
-	      color: var(--blue);
-	      background: rgba(59, 130, 214, 0.08);
-	    }
-		    .control-tool-command {
-		      min-width: 0;
-		      padding: 5px 7px;
-		      border: 1px solid var(--line);
-		      border-radius: 5px;
-	      background: var(--subtle);
-	      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-		      overflow-wrap: anywhere;
-		      white-space: pre-wrap;
-		    }
-	    .control-tool-special {
-	      display: grid;
-	      gap: 6px;
-	      padding: 7px;
-	      border: 1px solid var(--line);
-	      border-radius: 6px;
-	      background: color-mix(in srgb, var(--surface) 86%, var(--blue) 14%);
-	    }
-	    .control-tool-special-title {
-	      display: flex;
-	      align-items: center;
-	      justify-content: space-between;
-	      gap: 8px;
-	      font-size: 12px;
-	      font-weight: 850;
-	      color: var(--ink);
-	    }
-	    .control-tool-special-note {
-	      color: var(--muted);
-	      font-size: 12px;
-	    }
-	    .control-tool-plan-list {
-	      display: grid;
-	      gap: 4px;
-	    }
-	    .control-tool-plan-row {
-	      display: grid;
-	      grid-template-columns: 84px minmax(0, 1fr);
-	      gap: 7px;
-	      align-items: start;
-	      font-size: 12px;
-	    }
-	    .control-tool-plan-status {
-	      border: 1px solid var(--line);
-	      border-radius: 999px;
-	      padding: 1px 6px;
-	      color: var(--muted);
-	      background: var(--surface);
-	      text-align: center;
-	      font-size: 11px;
-	      font-weight: 800;
-	    }
-	    .control-tool-plan-status.completed {
-	      border-color: rgba(25, 135, 84, 0.34);
-	      color: var(--green);
-	      background: rgba(25, 135, 84, 0.08);
-	    }
-	    .control-tool-plan-status.in_progress {
-	      border-color: rgba(59, 130, 214, 0.34);
-	      color: var(--blue);
-	      background: rgba(59, 130, 214, 0.08);
-	    }
-	    .control-tool-plan-status.pending {
-	      color: var(--muted);
-	    }
-		    .control-tool-sections {
-		      display: grid;
-		      gap: 6px;
-		    }
-	    .control-tool-section {
-	      display: grid;
-	      gap: 3px;
-	    }
-	    .control-tool-section-label {
-	      color: var(--muted);
-	      font-size: 11px;
-	      font-weight: 800;
-	      text-transform: uppercase;
-	    }
-	    .control-tool-section pre {
-	      margin: 0;
-	      min-width: 0;
-	      max-height: 220px;
-	      overflow: auto;
-	      padding: 6px 7px;
-	      border: 1px solid var(--line);
-	      border-radius: 5px;
-	      background: var(--surface);
-	      color: var(--ink);
-	      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-	      white-space: pre-wrap;
-	      overflow-wrap: anywhere;
-	      word-break: break-word;
-	    }
-	    .control-tool-block .control-message-text {
-	      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-	      font-size: 12px;
-      line-height: 1.45;
-    }
-    .control-tool-block.control-signal {
-      border-left-color: var(--line);
-      color: var(--muted);
-      opacity: 0.76;
-    }
-    .control-tool-block strong {
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-    }
-	    .control-tool-section.patch pre {
-	      background: color-mix(in srgb, var(--surface) 88%, var(--blue) 12%);
-	    }
-	    .control-tool-section.collapsed pre {
-	      max-height: none;
-	      overflow: hidden;
-	      color: var(--muted);
-	    }
-    .tool-patch-line {
-      display: block;
-      min-height: 1.35em;
-    }
-    .tool-patch-line.meta {
-      color: var(--muted);
-      font-weight: 800;
-    }
-    .tool-patch-line.add {
-      color: var(--green);
-      background: rgba(25, 135, 84, 0.08);
-    }
-    .tool-patch-line.delete {
-      color: var(--red);
-      background: rgba(204, 70, 70, 0.08);
-    }
-    .control-tool-patch-summary {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 5px 8px;
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 720;
-    }
-    .control-tool-patch-file {
-      color: var(--ink);
-      overflow-wrap: anywhere;
-    }
-    .control-tool-section.patch.collapsed pre {
-      max-height: 10.2em;
-      overflow: hidden;
-      white-space: pre-wrap;
-    }
-    .control-message.compact .control-message-text {
-      overflow: hidden;
-      max-height: 5.8em;
-    }
-    .control-message.compact .control-message-text.plain {
-      white-space: nowrap;
-      text-overflow: ellipsis;
-      max-height: none;
-    }
-    .control-message.compact .control-message-text.expanded {
-      overflow: visible;
-      max-height: none;
-    }
-    .control-message.compact .control-message-text.expanded.plain {
-      white-space: pre-wrap;
-      text-overflow: clip;
-    }
-    @media (max-width: 640px) {
-      .control-tool-block {
-        margin-left: 8px;
-      }
-    }
-    .control-event {
-      display: grid;
-      grid-template-columns: 126px minmax(0, 1fr);
-      gap: 10px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .control-event.compact {
-      grid-template-columns: 112px minmax(0, 1fr);
-      padding: 6px 8px;
-    }
-    .control-event-detail {
-      display: grid;
-      gap: 4px;
-      min-width: 0;
-    }
-    .control-event-detail span {
-      overflow-wrap: anywhere;
-    }
-    .control-empty {
-      color: var(--muted);
-      border: 1px dashed var(--line);
-      border-radius: 6px;
-      padding: 12px;
-      text-align: center;
-      font-weight: 650;
-    }
-	    .control-compose {
-	      grid-row: 5;
-	      border-top: 1px solid var(--line);
-	      padding: 8px 12px;
-	      display: grid;
-	      grid-template-columns: minmax(0, 1fr) auto;
-	      gap: 10px;
-	      background: var(--soft);
-	      position: relative;
-	      z-index: 2;
-	    }
-    .control-compose textarea {
-      min-height: 42px;
-      height: 54px;
-      max-height: min(180px, 28vh);
-      resize: vertical;
-      padding: 8px 9px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--surface);
-      color: var(--ink);
-      font: inherit;
-    }
-    .control-compose button {
-      width: auto;
-      min-width: 92px;
-      align-self: stretch;
-    }
-    .profiles {
-      margin-top: 18px;
-      background: var(--surface);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      overflow: visible;
-      box-shadow: var(--shadow);
-    }
-    .discussion-active .profiles {
-      display: none;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      table-layout: fixed;
-    }
-	    .profile-col { width: 270px; }
-	    .model-col { width: 220px; }
-	    .actions-col { width: 130px; }
-    th {
-      padding: 11px 14px;
-      text-align: left;
-      font-size: 12px;
-      text-transform: uppercase;
-      color: var(--muted);
-      background: var(--soft);
-      border-bottom: 1px solid var(--line);
-    }
-    td {
-      padding: 14px;
-      border-bottom: 1px solid var(--line);
-      vertical-align: top;
-    }
-    tbody tr:last-child td { border-bottom: 0; }
-	    .profile-row.active { background: var(--active-row); }
-	    .profile-row.hidden-profile { background: var(--soft); }
-	    .profile-cell { min-width: 0; }
-	    .model-cell { color: var(--muted); min-width: 0; overflow: visible; }
-	    .actions { width: 130px; }
-	    .profile-visibility-action {
-	      color: var(--muted);
-	      background: transparent;
-	    }
-	    .profile-hidden-toggle {
-	      display: block;
-	      width: calc(100% - 28px);
-	      margin: 0 14px 14px;
-	      color: var(--muted);
-	      background: var(--soft);
-	    }
-	    .profile-hidden-badge {
-	      color: var(--muted);
-	      font-size: 11px;
-	      font-weight: 650;
-	    }
-	    .quota-cell { min-width: 0; overflow: hidden; }
-	    .profile-name {
-	      display: flex;
-	      align-items: center;
-      gap: 8px;
-      font-weight: 700;
-	      min-width: 0;
-	      overflow-wrap: anywhere;
-	      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.58);
-	    }
-	    :root[data-theme="dark"] .profile-name {
-	      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.45);
-	    }
-    .profile-email {
-      color: var(--muted);
-      margin-top: 3px;
-      overflow-wrap: anywhere;
-    }
-    .profile-plan {
-      color: var(--muted);
-      font-weight: 650;
-    }
-    .profile-chips {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 6px;
-      margin-top: 8px;
-    }
-    .profile-pill-form { margin: 0; }
-    .profile-pill {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: auto;
-      min-height: 22px;
-      padding: 1px 8px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 750;
-      color: var(--muted);
-	      background: linear-gradient(180deg, var(--surface), var(--subtle));
-	      border: 1px solid var(--line);
-	      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72), 0 1px 1px rgba(23, 23, 23, 0.04);
-	      cursor: pointer;
-	    }
-	    :root[data-theme="dark"] .profile-pill {
-	      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 1px 1px rgba(0, 0, 0, 0.26);
-	    }
-	    .fast-pill.enabled {
-	      color: #fff;
-	      background: linear-gradient(180deg, var(--blue-hi), var(--blue-low));
-	      border-color: var(--blue);
-	      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.28);
-	    }
-		    .login-pill {
-		      color: #fff;
-		      background: linear-gradient(180deg, var(--red-hi), var(--red-low));
-		      border-color: var(--danger);
-		      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.28);
-		    }
-		    .billing-pill {
-		      color: #5f3b00;
-		      background: linear-gradient(180deg, #ffd976, #e6af35);
-		      border-color: #d79b1e;
-		      cursor: default;
-		    }
-	    :root[data-theme="dark"] .billing-pill {
-	      color: #211500;
-		      background: linear-gradient(180deg, #ffd36b, #d79a2b);
-		      border-color: #f2bd43;
-		    }
-    .login-status {
-      margin-top: 8px;
-      padding: 8px;
-      border: 1px solid var(--line);
-      border-left: 3px solid var(--amber);
-      border-radius: 6px;
-      background: var(--subtle);
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .login-status.complete { border-left-color: var(--green); }
-    .login-status.error { border-left-color: var(--danger); }
-    .login-status.canceled { border-left-color: var(--muted); }
-    .auth-health {
-      margin-top: 5px;
-      font-size: 11px;
-      line-height: 1.35;
-      color: var(--amber-dark);
-      overflow-wrap: anywhere;
-    }
-    .auth-health.login_required {
-      color: var(--danger);
-    }
-    :root[data-theme="dark"] .auth-health {
-      color: #f2bd43;
-    }
-    :root[data-theme="dark"] .auth-health.login_required {
-      color: #ff9a9a;
-    }
-    .login-status-top,
-    .login-status-actions {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-    .login-status-top strong { color: var(--ink); }
-    .login-status-actions { margin-top: 5px; }
-    .login-link {
-      color: var(--red);
-      font-weight: 750;
-      text-decoration: none;
-    }
-    .login-cancel-form {
-      margin: 0;
-    }
-    .login-cancel-action {
-      min-height: 24px;
-      padding: 2px 8px;
-      border: 1px solid rgba(216, 52, 52, 0.45);
-      border-radius: 6px;
-      background: var(--surface);
-      color: var(--danger);
-      font-size: 12px;
-      font-weight: 750;
-    }
-    .login-code code {
-      padding: 1px 5px;
-      border: 1px solid var(--line);
-      border-radius: 4px;
-      background: var(--surface);
-      color: var(--ink);
-      font: 12px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    }
-    .login-detail {
-      margin-top: 5px;
-      overflow-wrap: anywhere;
-    }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      min-height: 20px;
-      padding: 1px 7px;
-      border-radius: 999px;
-      font-size: 11px;
-	      font-weight: 700;
-	      color: var(--red);
-	      border: 1px solid var(--badge-border);
-	      background: var(--badge-bg);
-	    }
-    button {
-      width: 100%;
-	      min-height: 32px;
-	      padding: 4px 8px;
-	      border-radius: 6px;
-	      border: 1px solid var(--line);
-		      background: linear-gradient(180deg, var(--button-bg), var(--button-hover));
-		      color: var(--ink);
-	      font-weight: 650;
-      cursor: pointer;
-      white-space: nowrap;
-      display: inline-flex;
-	      align-items: center;
-	      justify-content: center;
-	      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.62), 0 1px 1px rgba(23, 23, 23, 0.04);
-	    }
-	    :root[data-theme="dark"] button {
-	      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 1px 1px rgba(0, 0, 0, 0.28);
-	    }
-		    button:hover:not(:disabled) { border-color: var(--muted); background: var(--button-hover); }
-		    button:disabled { color: var(--button-disabled-ink); background: var(--button-disabled-bg); cursor: not-allowed; }
-	    .primary-action {
-	      background: linear-gradient(180deg, var(--red-hi), var(--red-low));
-	      border-color: var(--red);
-	      color: #fff;
-	      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.32);
-	    }
-	    .primary-action:hover:not(:disabled) { background: var(--red-dark); border-color: var(--red-dark); }
-	    .current-action,
-	    .current-action:disabled {
-	      background: linear-gradient(180deg, var(--green-hi), var(--green-low));
-	      border-color: var(--green);
-	      color: #fff;
-	      opacity: 1;
-	      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.28);
-	    }
-	    .primary-action.session-active-action,
-	    .primary-action.session-active-action:disabled {
-	      background: linear-gradient(180deg, var(--amber-hi), var(--amber-low));
-	      border-color: var(--amber);
-	      color: #fff;
-	      opacity: 1;
-	      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.28);
-	    }
-    .primary-action.session-active-action:hover:not(:disabled) {
-      background: var(--amber-dark);
-      border-color: var(--amber-dark);
-    }
-    form { margin: 0 0 7px; }
-    form:last-child { margin-bottom: 0; }
-    .login-menu,
-    .model-menu {
-      position: relative;
-      margin: 0;
-    }
-    .login-menu summary,
-    .model-menu summary {
-      list-style: none;
-    }
-    .login-menu summary::-webkit-details-marker,
-    .model-menu summary::-webkit-details-marker {
-      display: none;
-    }
-    .login-menu-panel,
-    .model-menu-panel,
-    .model-reasoning-menu {
-      position: absolute;
-      z-index: 35;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      box-shadow: var(--shadow);
-    }
-    .login-menu-panel {
-      left: 0;
-      top: calc(100% + 6px);
-      width: min(260px, calc(100vw - 32px));
-      padding: 8px;
-    }
-    .login-menu-note {
-      margin: 0 0 8px;
-      color: var(--muted);
-      font-size: 11px;
-      line-height: 1.35;
-    }
-    .login-menu-panel form,
-    .model-menu-panel form,
-    .model-reasoning-menu form {
-      margin: 0;
-    }
-    .danger-action {
-      color: var(--danger);
-    }
-    .menu-action,
-    .model-option-label,
-    .model-reasoning-option {
-      justify-content: flex-start;
-      min-height: 30px;
-      text-align: left;
-    }
-    .model-pill {
-      width: 100%;
-      min-height: 30px;
-      padding: 3px 9px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: var(--subtle);
-      color: var(--ink);
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      flex-wrap: wrap;
-      gap: 5px;
-      font-weight: 750;
-      cursor: pointer;
-	      text-align: center;
-	      line-height: 1.2;
-	      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.68), 0 1px 1px rgba(23, 23, 23, 0.04);
-	      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.58);
-	    }
-	    :root[data-theme="dark"] .model-pill {
-	      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 1px 1px rgba(0, 0, 0, 0.28);
-	      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.45);
-	    }
-    .model-menu-panel {
-      top: calc(100% + 6px);
-      left: 0;
-      width: 240px;
-      padding: 7px;
-    }
-    .model-option {
-      position: relative;
-      margin-bottom: 4px;
-    }
-    .model-option:last-child { margin-bottom: 0; }
-	    .model-option-label {
-	      width: 100%;
-	      justify-content: space-between;
-	      gap: 8px;
-	    }
-	    .model-option-label span:first-child,
-	    .model-reasoning-option {
-	      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.55);
-	    }
-	    :root[data-theme="dark"] .model-option-label span:first-child,
-	    :root[data-theme="dark"] .model-reasoning-option {
-	      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.42);
-	    }
-	    .model-option.selected > .model-option-label,
-	    .model-reasoning-option.selected {
-	      border-color: var(--green);
-	      color: var(--green);
-	      background: linear-gradient(180deg, rgba(34, 166, 106, 0.12), rgba(17, 109, 66, 0.08));
-	      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55);
-	    }
-    .model-option-arrow {
-      color: var(--muted);
-      font-size: 16px;
-      line-height: 1;
-    }
-    .model-reasoning-menu {
-      display: none;
-      top: 0;
-      left: calc(100% + 6px);
-      width: 132px;
-      padding: 7px;
-      gap: 4px;
-    }
-    .model-option:hover .model-reasoning-menu,
-    .model-option:focus-within .model-reasoning-menu,
-    .model-option.reasoning-open .model-reasoning-menu {
-      display: grid;
-    }
-    .action-note {
-      margin: -2px 0 7px;
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.3;
-    }
-		    .quota-panel { display: grid; gap: 8px; }
-    .quota-panel-head {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      min-width: 0;
-    }
-    .quota-refresh-form { margin: 0; }
-    .quota-refresh-icon {
-      width: 24px;
-      height: 24px;
-      min-width: 24px;
-      min-height: 24px;
-      flex: 0 0 24px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      padding: 0;
-      border-radius: 999px;
-      color: var(--muted);
-      background: var(--button-bg);
-    }
-    .quota-refresh-glyph {
-      width: 14px;
-      height: 14px;
-      stroke: currentColor;
-      stroke-width: 2;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-      flex: 0 0 auto;
-    }
-    .quota-refresh-icon.disabled {
-      pointer-events: none;
-      color: var(--button-disabled-ink);
-      background: var(--button-disabled-bg);
-    }
-    .quota-spinner-small {
-      width: 13px;
-      height: 13px;
-      border-width: 2px;
-      border-top-color: var(--red);
-    }
-	    .quota-updated {
-	      color: var(--muted);
-	      font-size: 12px;
-	      font-weight: 650;
-	      flex: 1 1 auto;
-	      min-width: 0;
-	      white-space: nowrap;
-	      overflow: hidden;
-	      text-overflow: ellipsis;
-	    }
-		    .quota-credits-pill {
-		      flex: 0 0 auto;
-		      margin-left: auto;
-		      padding: 3px 8px;
-	      border-radius: 999px;
-	      border: 1px solid var(--amber-dark);
-	      color: #2f2107;
-	      background: #f5c84b;
-	      font-size: 11px;
-	      font-weight: 820;
-	      line-height: 1.15;
-	      white-space: nowrap;
-	    }
-		    :root[data-theme="dark"] .quota-credits-pill {
-		      color: #281b04;
-		      background: #e4b83d;
-		      border-color: #f0cf66;
-		    }
-	    .reset-credit-form {
-	      flex: 0 0 auto;
-	      margin: 0 0 0 auto;
-	    }
-	    .quota-credits-pill + .reset-credit-form,
-	    .reset-credit-form + .quota-credits-pill {
-	      margin-left: 4px;
-	    }
-	    .quota-reset-credit-pill {
-	      padding: 3px 8px;
-	      border-radius: 999px;
-	      border: 1px solid #b7791f;
-	      color: #332205;
-	      background: linear-gradient(180deg, #f8d76b, #e4ad28);
-	      box-shadow: inset 0 1px 0 rgba(255,255,255,0.35);
-	      font-size: 11px;
-	      font-weight: 820;
-	      line-height: 1.15;
-	      white-space: nowrap;
-	    }
-		    .quota-reset-credit-pill:hover {
-		      border-color: #8f5c10;
-		      filter: brightness(0.98);
-		    }
-		    .quota-reset-credit-pill.disabled {
-		      display: inline-flex;
-		      align-items: center;
-		      border-color: var(--line);
-		      color: var(--muted);
-		      background: var(--button-disabled-bg);
-		      box-shadow: none;
-		      cursor: not-allowed;
-		    }
-		    .quota-reset-credit-pill.disabled:hover {
-		      border-color: var(--line);
-		      filter: none;
-		    }
-		    :root[data-theme="dark"] .quota-reset-credit-pill {
-		      color: #261901;
-		      background: linear-gradient(180deg, #f0ca58, #cf981f);
-		      border-color: #f0cf66;
-		    }
-		    :root[data-theme="dark"] .quota-reset-credit-pill.disabled {
-		      color: var(--muted);
-		      background: var(--button-disabled-bg);
-		      border-color: var(--line);
-		      box-shadow: none;
-		    }
-		    :root[data-theme="dark"] .quota-reset-credit-pill:hover {
-		      background: linear-gradient(180deg, #ffd76f, #dda52c);
-		      border-color: #ffe08a;
-		      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.32), 0 0 0 2px rgba(240, 207, 102, 0.16);
-		    }
-		    :root[data-theme="dark"] .quota-reset-credit-pill.disabled:hover {
-		      color: var(--muted);
-		      background: var(--button-disabled-bg);
-		      border-color: var(--line);
-		      box-shadow: none;
-		    }
-		    @media (prefers-color-scheme: dark) {
-		      :root:not([data-theme]) .quota-reset-credit-pill:hover {
-		        background: linear-gradient(180deg, #ffd76f, #dda52c);
-		        border-color: #ffe08a;
-		        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.32), 0 0 0 2px rgba(240, 207, 102, 0.16);
-		      }
-		      :root:not([data-theme]) .quota-reset-credit-pill.disabled:hover {
-		        color: var(--muted);
-		        background: var(--button-disabled-bg);
-		        border-color: var(--line);
-		        box-shadow: none;
-		      }
-		    }
-    .quota-bucket {
-	      border: 1px solid var(--line);
-	      border-radius: 0;
-	      padding: 8px 10px;
-	      background: var(--surface);
-	      max-width: 100%;
-	      overflow: hidden;
-	    }
-	    .quota-title {
-	      display: grid;
-	      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-	      align-items: center;
-	      gap: 8px;
-	      min-width: 0;
-      margin-bottom: 6px;
-	    }
-	    .quota-bucket-name {
-	      font-weight: 720;
-	      text-align: center;
-	      min-width: 0;
-	      overflow-wrap: anywhere;
-	      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.62);
-	    }
-	    :root[data-theme="dark"] .quota-bucket-name {
-	      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.45);
-	    }
-    .quota-stack {
-      display: grid;
-      min-width: 0;
-    }
-    .quota-horizon {
-      min-width: 0;
-      overflow-wrap: anywhere;
-      white-space: normal;
-      font-size: 12px;
-      font-weight: 750;
-      line-height: 1.2;
-    }
-	    .quota-horizon.primary {
-	      color: var(--green);
-	      text-align: right;
-	      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.58);
-	    }
-	    .quota-horizon.weekly {
-	      color: var(--blue);
-	      text-align: left;
-	      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.58);
-	    }
-	    .quota-horizon.primary.not-enforced {
-	      color: var(--muted);
-	    }
-	    :root[data-theme="dark"] .quota-horizon.primary,
-	    :root[data-theme="dark"] .quota-horizon.weekly {
-	      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.45);
-	    }
-    .quota-stack-row {
-      display: grid;
-      grid-template-columns: 44px minmax(120px, 1fr) 44px;
-      gap: 10px;
-      align-items: center;
-      min-width: 0;
-    }
-	    .quota-stack-bar {
-	      position: relative;
-	      height: 30px;
-	      border-radius: 0;
-		      background: linear-gradient(180deg, var(--surface), var(--bar-bg));
-		      box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.62), inset 0 -1px 1px rgba(23, 23, 23, 0.08);
-		      overflow: hidden;
-	      min-width: 0;
-    }
-    .quota-weekly-fill,
-    .quota-primary-fill {
-      position: absolute;
-      left: 0;
-	      border-radius: 0;
-	    }
-	    .quota-stack-unlimited .quota-stack-bar,
-	    .quota-stack-unknown .quota-stack-bar {
-	      background: var(--soft);
-	    }
-	    .quota-weekly-fill {
-	      top: 0;
-	      bottom: 0;
-		      background: linear-gradient(180deg, var(--blue-hi), var(--blue-low));
-		      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26), inset 0 -1px 0 rgba(0, 0, 0, 0.16);
-		      opacity: 0.86;
-    }
-	    .quota-primary-fill {
-	      bottom: 0;
-	      height: 20px;
-	      display: flex;
-	      align-items: center;
-	      justify-content: flex-end;
-		      background: linear-gradient(180deg, var(--green-hi), var(--green-low));
-		      color: #fff;
-		      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.28);
-		      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26), inset 0 -1px 0 rgba(0, 0, 0, 0.14);
-		      overflow: visible;
-	    }
-	    .quota-stack-unlimited .quota-weekly-fill,
-	    .quota-stack-unknown .quota-weekly-fill {
-	      opacity: 0.35;
-	    }
-	    .quota-stack-unlimited .quota-primary-fill,
-	    .quota-stack-unknown .quota-primary-fill {
-	      opacity: 0.82;
-	    }
-    .quota-primary-fill.empty {
-      background: transparent;
-      color: var(--muted);
-    }
-	    .quota-primary-label-outside {
-	      color: var(--green);
-      font-size: 11px;
-      font-weight: 800;
-      line-height: 1;
-	      white-space: nowrap;
-	      text-align: left;
-	      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.58);
-	    }
-	    .quota-primary-label-outside.not-enforced {
-	      color: var(--muted);
-	    }
-	    .quota-weekly-label {
-	      color: var(--blue);
-      font-size: 12px;
-      font-weight: 800;
-	      text-align: right;
-	      white-space: nowrap;
-	      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.58);
-	    }
-	    :root[data-theme="dark"] .quota-primary-label-outside,
-	    :root[data-theme="dark"] .quota-weekly-label {
-	      text-shadow: 0 1px 0 rgba(0, 0, 0, 0.45);
-	    }
-	    @media (prefers-color-scheme: dark) {
-	      :root:not([data-theme]) .profile-name,
-	      :root:not([data-theme]) .model-pill,
-	      :root:not([data-theme]) .model-option-label span:first-child,
-	      :root:not([data-theme]) .model-reasoning-option,
-	      :root:not([data-theme]) .quota-bucket-name,
-	      :root:not([data-theme]) .quota-horizon.primary,
-	      :root:not([data-theme]) .quota-horizon.weekly,
-	      :root:not([data-theme]) .quota-primary-label-outside,
-	      :root:not([data-theme]) .quota-weekly-label {
-	        text-shadow: 0 1px 0 rgba(0, 0, 0, 0.45);
-	      }
-	      :root:not([data-theme]) button,
-	      :root:not([data-theme]) .profile-pill,
-	      :root:not([data-theme]) .model-pill {
-	        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 1px 1px rgba(0, 0, 0, 0.28);
-	      }
-	    }
-    .quota-counts,
-    .quota-count-line {
-      display: grid;
-      gap: 4px;
-    }
-    .quota-count-line {
-      grid-template-columns: auto auto 1fr;
-      align-items: center;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .quota-count-line strong { color: var(--ink); }
-    .quota-count-reset { color: var(--muted); }
-		    .quota-empty, .quota-muted {
-		      color: var(--muted);
-		      background: var(--subtle);
-		      border: 1px dashed var(--line);
-		      border-radius: 6px;
-		      padding: 10px;
-		      text-align: center;
-		    }
-	    .quota-state {
-	      min-height: 86px;
-	      display: flex;
-	      flex-direction: column;
-	      align-items: center;
-	      justify-content: center;
-	      gap: 5px;
-	      line-height: 1.35;
-	    }
-	    .quota-state strong {
-	      color: var(--ink);
-	      font-size: 13px;
-	    }
-	    .quota-state span {
-	      max-width: 46ch;
-	      font-size: 12px;
-	    }
-	    .quota-state.warning {
-	      border-color: rgba(183, 121, 31, 0.45);
-	      color: #8a5a14;
-	      background: rgba(245, 201, 92, 0.14);
-	    }
-	    :root[data-theme="dark"] .quota-state.warning {
-	      color: #f0cf66;
-	      background: rgba(242, 189, 67, 0.1);
-	    }
-	    .quota-loading {
-	      min-height: 92px;
-	      display: flex;
-	      align-items: center;
-	      justify-content: center;
-	      gap: 10px;
-	      color: var(--muted);
-	      background: var(--subtle);
-	      border: 1px dashed var(--line);
-	      border-radius: 6px;
-	      font-weight: 650;
-	    }
-	    .spinner {
-	      width: 18px;
-	      height: 18px;
-	      border: 2px solid var(--bar-bg);
-	      border-top-color: var(--red);
-	      border-radius: 50%;
-	      animation: spin 0.8s linear infinite;
-	      flex: 0 0 auto;
-	    }
-	    @keyframes spin { to { transform: rotate(360deg); } }
-    .quota-empty.error, .quota-refresh-error { color: var(--danger); }
-    .quota-empty.error.billing, .quota-refresh-error.billing { color: #9a6100; }
-    :root[data-theme="dark"] .quota-empty.error.billing,
-    :root[data-theme="dark"] .quota-refresh-error.billing { color: #f2bd43; }
-    .quota-refresh-error {
-      font-size: 12px;
-      font-weight: 650;
-    }
-    .pin-menu {
-      position: relative;
-      margin: 0;
-    }
-    .pin-menu:last-child { margin-bottom: 0; }
-    .pin-menu summary { list-style: none; }
-    .pin-menu summary::-webkit-details-marker { display: none; }
-    .pin-summary {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      width: auto;
-      min-height: 22px;
-      padding: 0;
-      border: 0;
-      background: transparent;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-      cursor: pointer;
-      white-space: nowrap;
-    }
-    .pin-summary:hover { color: var(--ink); }
-    .pin-summary.session-active-action { color: var(--amber); }
-    .pin-icon {
-      width: 13px;
-      height: 13px;
-      flex: 0 0 auto;
-    }
-    .pin-menu-panel {
-      position: absolute;
-      left: 0;
-      z-index: 20;
-      width: min(430px, calc(100vw - 32px));
-      max-height: 340px;
-      overflow: auto;
-      margin-top: 6px;
-      padding: 8px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      box-shadow: var(--shadow);
-    }
-    .pin-menu-panel form { margin: 0 0 6px; }
-    .pin-menu-panel form:last-child { margin-bottom: 0; }
-    .pin-menu-item {
-      min-height: 0;
-      align-items: flex-start;
-      justify-content: flex-start;
-      flex-direction: column;
-      gap: 2px;
-      text-align: left;
-      white-space: normal;
-    }
-    .pin-menu-name {
-      font-weight: 750;
-      color: var(--ink);
-    }
-	    .pin-menu-path,
-	    .pin-menu-status,
-	    .pin-menu-empty {
-	      color: var(--muted);
-	      font-size: 12px;
-	      overflow-wrap: anywhere;
-	    }
-	    .pinned-sessions {
-	      margin-top: 8px;
-	      min-width: 0;
-	      max-width: 100%;
-	    }
-	    .session-chips {
-	      display: flex;
-	      flex-wrap: wrap;
-	      gap: 6px;
-    }
-    .session-chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      max-width: 100%;
-      padding: 4px 8px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: var(--subtle);
-      color: var(--muted);
-      font-size: 12px;
-      white-space: nowrap;
-      overflow: hidden;
-      cursor: help;
-    }
-    .session-chip.active {
-      color: var(--ink);
-      border-color: var(--amber);
-    }
-    .session-chip-path {
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-	    @media (max-width: 860px) {
-	      .shell {
-	        width: min(100vw - 20px, 760px);
-	        margin-top: 10px;
-	        display: flex;
-	        flex-direction: column;
-	      }
-		      .topbar { align-items: flex-start; }
-		      .logo { width: 180px; height: 36px; }
-		      .top-actions { margin-left: 0; align-items: flex-start; }
-      table, thead, tbody, tr, th, td { display: block; width: 100%; }
-      thead { display: none; }
-      td { border-bottom: 0; padding: 10px 12px; }
-	      tr { border-bottom: 1px solid var(--line); }
-	      tbody tr:last-child { border-bottom: 0; }
-		      .actions { display: grid; grid-template-columns: 1fr; gap: 8px; }
-	      .actions form { margin: 0; }
-	      .pin-menu { margin: 0; }
-	      .pin-menu-panel { left: 0; right: auto; width: min(430px, calc(100vw - 44px)); }
-	      .model-menu-panel { width: min(260px, calc(100vw - 44px)); }
-	      .model-reasoning-menu {
-	        left: 0;
-	        top: calc(100% + 4px);
-	        width: 100%;
-	      }
-	      .action-note { grid-column: 1 / -1; margin: 0; }
-	      .launcher-grid {
-	        grid-template-columns: 1fr;
-	      }
-	      .launcher-field.resume-session {
-	        grid-column: auto;
-	      }
-	      .stats-modal table { display: table; width: 100%; }
-	      .stats-modal thead { display: table-header-group; }
-	      .stats-modal tbody { display: table-row-group; }
-	      .stats-modal tr { display: table-row; border-bottom: 0; }
-	      .stats-modal th,
-	      .stats-modal td {
-	        display: table-cell;
-	        width: auto;
-	        padding: 8px 10px;
-	      }
-	      .control-active-grid { grid-template-columns: 1fr; }
-	      .control-event,
-	      .control-event.compact {
-	        grid-template-columns: 1fr;
-	      }
-	      .control-compose {
-	        grid-template-columns: 1fr;
-	        padding-bottom: max(8px, env(safe-area-inset-bottom));
-	      }
-	      .control-compose button {
-	        width: 100%;
-	      }
-	      .session-tabs {
-	        position: sticky;
-	        top: 0;
-	        z-index: 74;
-	        margin: 0 -10px;
-	        padding: 6px 10px;
-	        background: var(--surface);
-	        border-bottom: 1px solid var(--line);
-	      }
-	      .session-tab {
-	        min-width: 116px;
-	        max-width: 188px;
-	        min-height: 36px;
-	        padding: 6px 8px;
-	        justify-content: center;
-	      }
-	      .session-tab-meta,
-	      .session-tab-close {
-	        display: none;
-	      }
-	      .session-tab.launch-tab {
-	        min-width: 42px;
-	        max-width: 42px;
-	      }
-	      .mobile-control-status {
-	        position: sticky;
-	        top: var(--mobile-session-tabs-height, 48px);
-	        z-index: 73;
-	        display: flex;
-	        align-items: center;
-	        gap: 7px;
-	        min-height: 34px;
-	        margin: 0 -10px;
-	        padding: 5px 10px;
-	        border-bottom: 1px solid var(--line);
-	        background: var(--soft);
-	      }
-	      .mobile-control-status[hidden] {
-	        display: none;
-	      }
-	      .mobile-control-status-readouts {
-	        display: flex;
-	        min-width: 0;
-	        flex: 1 1 auto;
-	        align-items: center;
-	        gap: 6px;
-	        overflow-x: auto;
-	      }
-	      .mobile-control-status .pill,
-	      .mobile-control-status .control-compact-quota {
-	        flex: 0 0 auto;
-	      }
-	      .mobile-focus-toggle,
-	      .mobile-focus-restore {
-	        width: auto;
-	        min-height: 28px;
-	        padding: 3px 8px;
-	        border-radius: 999px;
-	        white-space: nowrap;
-	        font-size: 11px;
-	      }
-	      .control-dock {
-	        position: relative;
-	        inset: auto;
-	        z-index: 65;
-	        order: 1;
-	        flex: 0 0 auto;
-	        block-size: var(--mobile-control-dock-height, max(0px, calc(var(--mobile-viewport-height, 100dvh) - var(--mobile-control-chrome-height, 0px))));
-	        min-block-size: 0;
-	        margin-top: 0;
-	      }
-	      .mobile-control-stuck .shell::after {
-	        content: "";
-	        display: block;
-	        order: 1;
-	        flex: 0 0 var(--mobile-control-dock-height, 0px);
-	        min-block-size: 0;
-	        pointer-events: none;
-	      }
-	      .mobile-control-stuck .control-dock {
-	        position: fixed;
-	        top: var(--mobile-control-chrome-height, 0px);
-	        right: max(10px, calc((100vw - 760px) / 2));
-	        left: max(10px, calc((100vw - 760px) / 2));
-	        z-index: 75;
-	      }
-	      .profiles {
-	        order: 2;
-	      }
-	      .control-modal {
-	        block-size: 100%;
-	        border-radius: 7px;
-	      }
-	      .control-modal.discussion-view .control-content {
-	        overscroll-behavior: contain;
-	      }
-	      .control-status-pills {
-	        display: none;
-	      }
-	      .mobile-focus-restore {
-	        position: fixed;
-	        top: max(8px, env(safe-area-inset-top));
-	        right: 12px;
-	        bottom: auto;
-	        z-index: 76;
-	        box-shadow: var(--shadow);
-	      }
-	      .mobile-discussion-focus #sessionTabs,
-	      .mobile-discussion-focus #mobileControlStatus {
-	        display: none;
-	      }
-	      .mobile-discussion-focus .control-dock {
-	        position: fixed;
-	        top: var(--mobile-visual-viewport-top, 0px);
-	        right: max(10px, calc((100vw - 760px) / 2));
-	        left: max(10px, calc((100vw - 760px) / 2));
-	        bottom: auto;
-	        block-size: var(--mobile-viewport-height, 100dvh);
-	        margin-top: 0;
-	        z-index: 75;
-	      }
-	      .mobile-discussion-focus .mobile-focus-restore {
-	        display: inline-flex;
-	      }
-	      .mobile-discussion-focus .control-modal.discussion-view .control-toolbar,
-	      .mobile-discussion-focus .control-modal.discussion-view .control-head {
-	        display: none;
-	      }
-	      .mobile-composer-focus #sessionTabs,
-	      .mobile-composer-focus #mobileControlStatus,
-	      .mobile-composer-focus .control-modal.discussion-view .control-toolbar,
-	      .mobile-composer-focus .control-modal.discussion-view .control-head {
-	        display: none;
-	      }
-	      .mobile-composer-focus .control-dock {
-	        position: fixed;
-	        top: var(--mobile-visual-viewport-top, 0px);
-	        right: max(10px, calc((100vw - 760px) / 2));
-	        left: max(10px, calc((100vw - 760px) / 2));
-	        bottom: auto;
-	        block-size: var(--mobile-viewport-height, 100dvh);
-	        margin-top: 0;
-	        z-index: 75;
-	      }
-	      @media (prefers-reduced-motion: reduce) {
-	        .control-compact-quota-weekly-fill,
-	        .control-compact-quota-primary-fill {
-	          transition: none;
-	        }
-	      }
-	    }
-  </style>
-</head>
-<body>
-	  <main class="shell">
-	    <header class="topbar">
-		      <img class="logo" src="/assets/provision-wordmark.png" alt="Provision">
-	      <div class="top-meta">
-	        <span class="pill">Active <strong id="activeProfile">__ACTIVE_PROFILE__</strong></span>
-	        <span class="pill">Codex CLI <strong id="codexVersion">__CODEX_VERSION__</strong></span>
-	        <span id="codexRestartRequired" class="pill" hidden>Restart Provision</span>
-	        <span class="pill">Requests <strong id="activeRequests">__ACTIVE_REQUESTS__</strong></span>
-	        <span class="pill">Tunnels <strong id="activeTunnels">__ACTIVE_WEBSOCKETS__</strong></span>
-	        <span class="pill"><span id="proxyDot" class="dot"></span><span id="connectionState">Live (__BUSY__)</span></span>
-	      </div>
-	      <div class="top-actions">
-	        <button id="statsToggle" class="stats-toggle" type="button" aria-label="Open stats" title="Open stats"></button>
-	        <button id="themeToggle" class="theme-toggle" type="button" aria-label="Toggle color theme" title="Toggle color theme"></button>
-	      </div>
-    </header>
-    <div id="message" class="message" aria-live="polite"></div>
-    <section id="sessionTabs" class="session-tabs" aria-label="Provision-managed Codex CLI sessions"></section>
-    <section id="mobileControlStatus" class="mobile-control-status" aria-label="Current session context and quota" hidden>
-      <div id="mobileControlReadouts" class="mobile-control-status-readouts"></div>
-      <button id="mobileFocusToggle" class="mobile-focus-toggle" type="button" aria-pressed="false">Focus discussion</button>
-    </section>
-    <section id="launcherBar" class="launcher-dock" aria-label="Launch Codex CLI session" hidden>
-      <div class="launcher-modal" role="dialog" aria-modal="false" aria-labelledby="launcherTitle">
-        <div class="launcher-head">
-          <h2 id="launcherTitle">Launch Codex CLI</h2>
-          <button id="launcherClose" class="control-close" type="button" aria-label="Close launcher">x</button>
-        </div>
-        <div class="launcher-grid">
-          <label class="launcher-field workdir">
-            <span>Workdir</span>
-            <select id="launcherSession"></select>
-          </label>
-          <label class="launcher-field">
-            <span>Mode</span>
-            <select id="launcherMode">
-              <option value="new">New session</option>
-              <option value="resume-last">Resume latest</option>
-              <option value="resume-session">Resume selected</option>
-            </select>
-          </label>
-          <label class="launcher-field">
-            <span>Permissions</span>
-            <select id="launcherPermission">
-              <option value="workspace-write">Workspace write</option>
-              <option value="read-only">Read only</option>
-              <option value="full-access">Full access</option>
-              <option value="bypass">Bypass prompts</option>
-            </select>
-          </label>
-          <div class="launcher-actions">
-            <button id="launcherStart" type="button">Launch</button>
-          </div>
-          <label id="launcherResumeField" class="launcher-field resume-session" hidden>
-            <span>Resume Session</span>
-            <select id="launcherResumeSession"></select>
-          </label>
-        </div>
-      </div>
-    </section>
-    <div id="controlModal" class="control-dock" hidden>
-      <section class="control-modal" role="dialog" aria-modal="false" aria-labelledby="controlTitle">
-        <button id="mobileFocusRestore" class="mobile-focus-restore" type="button" hidden>Show controls</button>
-        <div class="control-head">
-          <div class="control-title-block">
-            <h2 id="controlTitle">Session</h2>
-          </div>
-          <div class="control-head-actions">
-            <select id="controlTurnSelect" class="control-turn-select" aria-label="Observed turn"></select>
-            <button id="controlForget" type="button">Forget</button>
-            <button id="controlClose" class="control-close" type="button" aria-label="Close session">x</button>
-          </div>
-	        </div>
-	        <div id="controlStatusPills" class="control-status-pills"></div>
-	        <div class="control-toolbar">
-          <div class="control-view-tabs" role="tablist" aria-label="Session view">
-            <button id="controlDiscussionView" class="control-view-button active" type="button" data-control-view="discussion">Discussion</button>
-            <button id="controlDetailsView" class="control-view-button" type="button" data-control-view="details">Session Details</button>
-            <button id="controlResumeView" class="control-view-button" type="button" data-control-view="resume">Resume</button>
-          </div>
-          <input id="controlSearch" class="control-search" type="search" placeholder="Search discussion">
-        </div>
-        <div id="controlContent" class="control-content"></div>
-        <form id="controlCompose" class="control-compose">
-          <textarea id="controlPrompt" placeholder="Live CLI input is not connected yet" disabled></textarea>
-          <button id="controlSend" type="submit" disabled>Send</button>
-        </form>
-      </section>
-    </div>
-    <div id="statsModal" class="modal-backdrop stats-backdrop" hidden>
-      <section class="stats-modal" role="dialog" aria-modal="true" aria-labelledby="statsTitle">
-        <div class="stats-head">
-          <h2 id="statsTitle">Stats</h2>
-          <button id="statsClose" class="stats-close" type="button" aria-label="Close stats">x</button>
-        </div>
-        <div id="statsContent" class="stats-content"></div>
-      </section>
-    </div>
-    <div id="confirmModal" class="modal-backdrop" hidden>
-      <section class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
-        <h2 id="confirmTitle">Confirm action</h2>
-        <p id="confirmMessage"></p>
-        <div class="confirm-actions">
-          <button id="confirmCancel" type="button">Cancel</button>
-          <button id="confirmAccept" class="danger" type="button">Confirm</button>
-        </div>
-      </section>
-    </div>
-    <div id="uiTooltip" class="ui-tooltip" hidden></div>
-	    <section id="profilesPanel" class="profiles">
-      <table>
-        <colgroup>
-          <col class="profile-col">
-          <col class="model-col">
-          <col class="quota-col">
-          <col class="actions-col">
-        </colgroup>
-        <thead>
-          <tr><th>Profile</th><th>Model</th><th>Remaining Quota</th><th></th></tr>
-        </thead>
-        <tbody id="profileRows">__ROWS__</tbody>
-      </table>
-      <button id="profileHiddenToggle" class="profile-hidden-toggle" type="button" hidden></button>
-    </section>
-  </main>
-  <script>
-	    const TOKEN = __TOKEN__;
-	    const INITIAL = __INITIAL_STATE__;
-	    const LOGIN_BROWSER_REMOTE_NOTE = __LOGIN_BROWSER_REMOTE_NOTE__;
-	    const THEME_KEY = "provision-theme";
-		    const SUN_ICON = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path><path d="M12 20v2"></path><path d="m4.93 4.93 1.41 1.41"></path><path d="m17.66 17.66 1.41 1.41"></path><path d="M2 12h2"></path><path d="M20 12h2"></path><path d="m6.34 17.66-1.41 1.41"></path><path d="m19.07 4.93-1.41 1.41"></path></svg>';
-		    const MOON_ICON = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20.5 14.4A7.5 7.5 0 0 1 9.6 3.5 8.5 8.5 0 1 0 20.5 14.4Z"></path></svg>';
-		    const CHART_ICON = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 3v18h18"></path><path d="m7 15 4-4 3 3 5-7"></path><path d="M19 7v5h-5"></path></svg>';
-		    const CONTROL_TRANSCRIPT_WINDOW_SIZE = 80;
-		    const CONTROL_TRANSCRIPT_WINDOW_STEP = 40;
-		    let socket = null;
-	    let reconnectTimer = null;
-	    let latestStatus = INITIAL.status || {};
-	    let latestLiveBusy = Boolean(INITIAL.status && INITIAL.status.live_busy);
-	    let latestStats = INITIAL.status && INITIAL.status.stats ? INITIAL.status.stats : { profiles: [], recent: [] };
-	    let latestModelCatalog = INITIAL.status && Array.isArray(INITIAL.status.model_catalog) ? INITIAL.status.model_catalog : [];
-	    let latestControlPlane = INITIAL.status && INITIAL.status.control_plane ? INITIAL.status.control_plane : { sessions: [] };
-	    let latestCodex = INITIAL.status && INITIAL.status.codex ? INITIAL.status.codex : {};
-	    let pendingRenderPacket = null;
-	    let pendingRenderFrame = null;
-	    let selectedControlSessionKey = "";
-		    let selectedLauncherSessionKey = "";
-		    let draggedSessionTabKey = "";
-		    let launcherPanelOpen = false;
-		    let launcherMode = "new";
-		    let launcherPermission = "workspace-write";
-		    let launcherResumeSessionId = "";
-		    let controlSearchText = "";
-		    let controlView = "discussion";
-			    let controlPromptHistoryIndex = null;
-			    let controlPromptHistorySessionKey = "";
-		    let controlPromptHistoryDraft = "";
-	    let pendingControlRender = false;
-	    let preserveControlScrollOnNextRender = false;
-		    let renderedControlScrollKey = "";
-		    let controlRenderDeferredAt = 0;
-		    let controlRenderDeferTimer = null;
-		    let controlTurnSelectInteracting = false;
-		    const controlScrollPositions = {};
-	    const controlInnerScrollPositions = {};
-	    const controlTranscriptWindows = {};
-	    const controlTurnPresentations = {};
-	    const expandedControlMessages = {};
-	    const markdownRenderCache = new Map();
-	    const observedTurnCache = {};
-	    const observedTurnRequests = {};
-	    const historyTurnCache = {};
-	    const historyTurnRequests = {};
-	    const historyTurnIndexes = {};
-	    const historyIndexRequests = {};
-	    const resumeCandidateIndexes = {};
-	    const resumeCandidateRequests = {};
-	    const selectedControlTurnKeys = {};
-		    const manuallySelectedControlTurnKeys = {};
-	    let mobileDiscussionFocused = false;
-	    let mobileComposerFocused = false;
-	    let mobileControlDockAnchorY = null;
-	    let mobileFocusScrollLockUntil = 0;
-	    let mobileTouchStartY = null;
-	    const MOBILE_FOCUS_GESTURE_DELTA = 28;
-	    const MOBILE_FOCUS_SCROLL_LOCK_MS = 280;
-		    const selectedResumeCandidateIds = {};
-	    const statsVisibleProfiles = {};
-	    let pendingConfirmation = null;
-		    let openPinMenuProfile = null;
-		    let openModelMenuProfile = null;
-	    let openLoginMenuProfile = null;
-	    let openReasoningProfile = null;
-	    let openReasoningModel = null;
-	    let showHiddenProfiles = false;
-		    let quotaRefreshTimer = null;
-		    let quotaRefreshInFlight = "";
-		    const pageDaemonPid = INITIAL.status ? INITIAL.status.pid || null : null;
-		    let quotaRefreshDaemonPid = INITIAL.status ? INITIAL.status.pid || null : null;
-		    const quotaRefreshQueue = [];
-	    const quotaRefreshAttempted = new Set();
-
-    function escapeHtml(value) {
-      return String(value ?? "").replace(/[&<>"']/g, (char) => ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#39;"
-      })[char]);
-    }
-
-	    function normalizeControlMessageTextForDisplay(value, role) {
-	      let text = String(value || "").replace(/\r\n?/g, "\n");
-	      if (["user", "user_pending", "resume", "context_compaction"].includes(String(role || ""))) {
-	        text = text.replace(/^[\s\uFEFF\u200B\u200C\u200D]+|[\s\uFEFF\u200B\u200C\u200D]+$/g, "");
-	      }
-	      return text;
-	    }
-
-	    function isContextCompactionPacket(item) {
-	      const role = String(item && item.role || "");
-	      if (role === "context_compaction") return true;
-	      if (role !== "tool") return false;
-	      const text = [item && item.text, item && item.full_text].filter(Boolean).join("\n");
-	      return /^(?:Tool|Command):\s*context(?:[ _-]?compaction)\b/im.test(text);
-	    }
-
-	    function safeMarkdownHref(value) {
-	      const raw = String(value || "").trim();
-	      if (!raw) return "";
-	      if (raw.startsWith("#")) return escapeHtml(raw);
-	      try {
-	        const parsed = new URL(raw, window.location.href);
-	        if (!["http:", "https:", "mailto:"].includes(parsed.protocol)) return "";
-	      } catch {
-	        return "";
-	      }
-	      return escapeHtml(raw);
-	    }
-
-	    function isLocalMarkdownFileReference(value) {
-	      const raw = String(value || "").trim();
-	      return /^(?:file:|\/|~\/|\.{1,2}\/)/i.test(raw);
-	    }
-
-	    function markdownLinkLabel(label, href) {
-	      const visible = String(label || "").replace(/\s+/g, " ").trim();
-	      return visible || String(href || "").trim();
-	    }
-
-	    function replaceMarkdownLinks(value, renderLink) {
-	      const source = String(value || "");
-	      let output = "";
-	      let cursor = 0;
-	      while (cursor < source.length) {
-	        const open = source.indexOf("[", cursor);
-	        if (open < 0) return output + source.slice(cursor);
-	        const labelEnd = source.indexOf("](", open + 1);
-	        if (labelEnd < 0 || source.slice(open + 1, labelEnd).includes("\n") || (open > 0 && source[open - 1] === "!")) {
-	          output += source.slice(cursor, open + 1);
-	          cursor = open + 1;
-	          continue;
-	        }
-	        const label = source.slice(open + 1, labelEnd);
-	        let index = labelEnd + 2;
-	        while (/[ \t]/.test(source[index] || "")) index += 1;
-	        let href = "";
-	        if (source[index] === "<") {
-	          const close = source.indexOf(">", index + 1);
-	          if (close < 0 || source.slice(index + 1, close).includes("\n")) {
-	            output += source.slice(cursor, open + 1);
-	            cursor = open + 1;
-	            continue;
-	          }
-	          href = source.slice(index + 1, close);
-	          index = close + 1;
-	        } else {
-	          const hrefStart = index;
-	          let depth = 0;
-	          while (index < source.length) {
-	            const char = source[index];
-	            if (char === "\n") break;
-	            if (char === "(" ) depth += 1;
-	            if (char === ")") {
-	              if (depth === 0) break;
-	              depth -= 1;
-	            }
-	            if (depth === 0 && /[ \t]/.test(char)) break;
-	            index += 1;
-	          }
-	          href = source.slice(hrefStart, index);
-	        }
-	        while (/[ \t]/.test(source[index] || "")) index += 1;
-	        if (source[index] === '"' || source[index] === "'") {
-	          const quote = source[index];
-	          index += 1;
-	          while (index < source.length && source[index] !== quote && source[index] !== "\n") index += 1;
-	          if (source[index] !== quote) {
-	            output += source.slice(cursor, open + 1);
-	            cursor = open + 1;
-	            continue;
-	          }
-	          index += 1;
-	          while (/[ \t]/.test(source[index] || "")) index += 1;
-	        }
-	        if (!href || source[index] !== ")") {
-	          output += source.slice(cursor, open + 1);
-	          cursor = open + 1;
-	          continue;
-	        }
-	        const match = source.slice(open, index + 1);
-	        output += source.slice(cursor, open) + renderLink(match, label, href);
-	        cursor = index + 1;
-	      }
-	      return output;
-	    }
-
-	    function restoreMarkdownTokens(html, inserts) {
-	      return html.replace(/\u0000(\d+)\u0000/g, (_match, index) => inserts[Number(index)] || "");
-	    }
-
-	    function renderMarkdownInline(value) {
-	      const inserts = [];
-	      const token = (html) => {
-	        inserts.push(html);
-	        return `\u0000${inserts.length - 1}\u0000`;
-	      };
-	      let text = String(value || "");
-	      text = text.replace(/`([^`\n]+)`/g, (_match, code) => (
-	        token(`<code>${escapeHtml(code)}</code>`)
-	      ));
-	      text = replaceMarkdownLinks(text, (match, label, href) => {
-	        const rawHref = String(href || "").trim();
-	        const visibleLabel = markdownLinkLabel(label, rawHref);
-	        if (isLocalMarkdownFileReference(rawHref)) {
-	          return token(`<code class="markdown-file-ref" title="${escapeHtml(rawHref)}">${escapeHtml(visibleLabel)}</code>`);
-	        }
-	        const safeHref = safeMarkdownHref(rawHref);
-	        if (!safeHref) {
-	          return match;
-	        }
-	        return token(`<a href="${safeHref}" target="_blank" rel="noreferrer">${renderMarkdownInline(visibleLabel)}</a>`);
-	      });
-	      text = text.replace(/(^|[\s([{,;])([A-Za-z_][A-Za-z0-9_.-]*=[A-Za-z0-9_./:-]+)/g, (_match, prefix, assignment) => (
-	        `${prefix}${token(`<code>${escapeHtml(assignment)}</code>`)}`
-	      ));
-	      let html = escapeHtml(text);
-	      html = html.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
-	      html = html.replace(/__([^_\n]+)__/g, "<strong>$1</strong>");
-	      html = html.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
-	      html = html.replace(/(^|[\s(])\*([^*\n]+)\*(?=$|[\s).,;:!?])/g, "$1<em>$2</em>");
-	      html = html.replace(/(^|[\s(])_([^_\n]+)_(?=$|[\s).,;:!?])/g, "$1<em>$2</em>");
-	      return restoreMarkdownTokens(html, inserts);
-	    }
-
-	    function parseJsonControlMessage(value) {
-	      const text = String(value || "").trim();
-	      if (!text || !/^[{[]/.test(text) || !/[}\]]$/.test(text)) return null;
-	      try {
-	        return JSON.parse(text);
-	      } catch {
-	        return null;
-	      }
-	    }
-
-	    function renderMarkdownCodeBlock(value, language = "") {
-	      const lang = language ? ` data-language="${escapeHtml(language)}"` : "";
-	      return `<pre${lang}><code>${escapeHtml(value)}</code></pre>`;
-	    }
-
-	    function renderJsonControlMessage(value) {
-	      const parsed = parseJsonControlMessage(value);
-	      if (parsed === null) return "";
-	      return renderMarkdownCodeBlock(JSON.stringify(parsed, null, 2), "json");
-	    }
-
-	    function cachedMarkdownRender(cacheKey, renderer) {
-	      if (markdownRenderCache.has(cacheKey)) {
-	        const value = markdownRenderCache.get(cacheKey);
-	        markdownRenderCache.delete(cacheKey);
-	        markdownRenderCache.set(cacheKey, value);
-	        return value;
-	      }
-	      const value = renderer();
-	      markdownRenderCache.set(cacheKey, value);
-	      while (markdownRenderCache.size > 600) {
-	        const first = markdownRenderCache.keys().next().value;
-	        markdownRenderCache.delete(first);
-	      }
-	      return value;
-	    }
-
-		    function repairStreamedMarkdownProse(value) {
-		      let source = String(value || "");
-		      source = source.replace(/\[\s*\n{2,}\s*([^\]\n]{1,160}?)\s*\]/g, (_match, label) => `[${label.trim()}]`);
-		      source = source.replace(/\[([^\]\n]{1,120}?)\s*\n{2,}\s*([^\]\n]{1,120}?)\]/g, (_match, left, right) => {
-		        const label = `${left.trim()}${right.trim()}`;
-		        return label.length <= 180 ? `[${label}]` : _match;
-		      });
-		      source = source.replace(/\]\s*\n{2,}\s*\(([^)\n]{1,500})\)/g, (_match, href) => `](${href.trim()})`);
-		      source = source.replace(/\bx\n{2,}Unit\b/g, "xUnit");
-		      return source;
-		    }
-
-		    function repairStreamedMarkdownSource(value) {
-		      const lines = String(value || "").replace(/\r\n?/g, "\n").split("\n");
-		      const rendered = [];
-		      let prose = [];
-		      let inFence = false;
-		      const flushProse = () => {
-		        if (!prose.length) return;
-		        rendered.push(...repairStreamedMarkdownProse(prose.join("\n")).split("\n"));
-		        prose = [];
-		      };
-		      for (const rawLine of lines) {
-		        const tildeFence = rawLine.match(/^(\s*)~~~([A-Za-z0-9_.+-]*)\s*$/);
-		        const line = tildeFence ? `${tildeFence[1]}\`\`\`${tildeFence[2]}` : rawLine;
-		        if (/^\s*```/.test(line)) {
-		          flushProse();
-		          rendered.push(line);
-		          inFence = !inFence;
-		          continue;
-		        }
-		        if (inFence) rendered.push(line);
-		        else prose.push(line);
-		      }
-		      flushProse();
-		      return rendered.join("\n");
-		    }
-
-	    function normalizeMarkdownSource(value) {
-	      const lines = repairStreamedMarkdownSource(value).split("\n");
-	      let inFence = false;
-	      let fenceLanguage = "";
-	      let repairFenceLines = false;
-	      let passthroughMarkdownFence = false;
-	      let yamlRepairStack = [];
-	      let jsonRepairIndent = 0;
-	      const normalizeFenceCodeLine = (line, lang) => {
-	        const raw = String(line || "");
-	        if (/^json$/i.test(lang)) {
-	          const rendered = [];
-	          for (const rawLine of raw.split("\n")) {
-	            let text = rawLine.trim();
-	            if (!text) {
-	              rendered.push("");
-	              continue;
-	            }
-	            const trailingClosers = [];
-	            while (!/^[}\]],?$/.test(text)) {
-	              const closeMatch = text.match(/^(.*\S)\s*([}\]])(,?)$/);
-	              if (!closeMatch) break;
-	              text = closeMatch[1].trimEnd();
-	              trailingClosers.unshift(`${closeMatch[2]}${closeMatch[3] || ""}`);
-	            }
-	            while (/^[}\]]/.test(text)) {
-	              jsonRepairIndent = Math.max(0, jsonRepairIndent - 1);
-	              const close = text.slice(0, text[1] === "," ? 2 : 1);
-	              rendered.push(`${" ".repeat(jsonRepairIndent * 2)}${close}`);
-	              text = text.slice(close.length).trim();
-	            }
-	            if (text) {
-	              rendered.push(`${" ".repeat(jsonRepairIndent * 2)}${text}`);
-	              if (/[{[]\s*,?$/.test(text)) {
-	                jsonRepairIndent += 1;
-	              }
-	            }
-	            for (const close of trailingClosers) {
-	              jsonRepairIndent = Math.max(0, jsonRepairIndent - 1);
-	              rendered.push(`${" ".repeat(jsonRepairIndent * 2)}${close}`);
-	            }
-	          }
-	          return rendered.join("\n");
-	        }
-	        if (/^(?:yaml|yml)$/i.test(lang)) {
-	          const matches = Array.from(raw.matchAll(/[A-Za-z_][A-Za-z0-9_-]*:/g));
-	          if (!matches.length) return raw;
-	          const parentKeys = new Set(["launcher", "quota", "resume", "metadata"]);
-	          const rendered = [];
-	          for (let index = 0; index < matches.length; index += 1) {
-	            const match = matches[index];
-	            const next = matches[index + 1];
-	            const segment = raw.slice(match.index, next ? next.index : undefined).trim();
-	            const colon = segment.indexOf(":");
-	            if (colon < 0) continue;
-	            const key = segment.slice(0, colon).trim();
-	            const value = segment.slice(colon + 1).trim();
-	            let indent = Math.max(0, yamlRepairStack.length) * 2;
-	            if (!value) {
-	              if (!yamlRepairStack.length || key === "session") {
-	                indent = 0;
-	                yamlRepairStack = [key];
-	              } else if (parentKeys.has(key) && yamlRepairStack[0] === "session") {
-	                indent = 2;
-	                yamlRepairStack = ["session", key];
-	              } else {
-	                yamlRepairStack.push(key);
-	              }
-	            }
-	            rendered.push(`${" ".repeat(indent)}${key}:${value ? ` ${value}` : ""}`);
-	          }
-	          return rendered.join("\n");
-	        }
-	        if (/^(?:text|txt)$/i.test(lang)) {
-	          return raw.replace(/(\S)(\d{2}:\d{2}:\d{2}\s+)/g, "$1\n$2");
-	        }
-	        return raw;
-	      };
-	      const normalizeLine = (line, options = {}) => {
-	        let normalized = line;
-	        if (options.markdownPassthrough) {
-	          normalized = normalized.replace(/\s*```\s*$/, "");
-	          normalized = normalized.replace(/^(#{1,4}\s+)([A-Z][A-Za-z0-9_./:+ -]*?)-\s+([A-Z0-9].*)$/, "$1$2\n\n- $3");
-	          normalized = normalized.replace(/^(#{1,4}\s+)([A-Z][A-Za-z0-9_./:+-]*?)([A-Z][a-z].*)$/, "$1$2\n\n$3");
-	          normalized = normalized.replace(/([A-Za-z0-9`)])-\s+([A-Z][A-Za-z0-9])/g, "$1\n- $2");
-	        }
-	        normalized = normalized.replace(/^(#{1,4}\s+.*?)(Working directory:\s*)/i, "$1\n\n$2");
-	        normalized = normalized.replace(/(Working directory:\s+.*?)(Current status:)/i, "$1\n\n$2");
-	        normalized = normalized.replace(/([^#\n])\s*(#{1,4}\s+\S)/g, "$1\n\n$2");
-	        normalized = normalized.replace(/([^\n])\s*([-*+]\s+\[[ xX]\]\s+\S)/g, "$1\n$2");
-	        normalized = normalized.replace(/([^\n])\s*([-*+]\s+\*\*\S)/g, "$1\n$2");
-		        normalized = normalized.replace(/([.!?:])\s*([-*+]\s+\S)/g, "$1\n$2");
-		        normalized = normalized.replace(/([.!?:])\s*-(\d+)(\s+\S.*)$/g, "$1\n- $2$3");
-	        normalized = normalized.replace(/([A-Za-z0-9`)])-\s+([A-Z`])/g, "$1\n- $2");
-	        normalized = normalized.replace(/^(\s*)-(\d+)(\s+\S.*)$/g, "$1- $2$3");
-	        return normalized;
-	      };
-	      return lines.map((line) => {
-	        const malformedFence = !inFence
-	          ? line.match(/^\s*```(markdown|md|json|yaml|yml|toml|ini|bash|sh|shell|python|py|javascript|js|typescript|ts|html|css|xml|sql|text|txt)(?=\S)(.*)$/i)
-	          : null;
-	        if (malformedFence) {
-	          const lang = malformedFence[1] || "";
-	          const rest = malformedFence[2] || "";
-	          if (/^(?:md|markdown)$/i.test(lang)) {
-	            passthroughMarkdownFence = true;
-	            return normalizeLine(rest, { markdownPassthrough: true });
-	          }
-	          inFence = true;
-	          fenceLanguage = lang;
-	          repairFenceLines = true;
-	          yamlRepairStack = [];
-	          jsonRepairIndent = 0;
-	          const trailingFence = rest.match(/^(.*\S)\s*```\s*$/);
-	          if (trailingFence) {
-	            inFence = false;
-	            fenceLanguage = "";
-	            repairFenceLines = false;
-	            const repaired = normalizeFenceCodeLine(trailingFence[1], lang);
-	            yamlRepairStack = [];
-	            jsonRepairIndent = 0;
-	            return `\`\`\`${lang}\n${repaired}\n\`\`\``;
-	          }
-	          return `\`\`\`${lang}\n${normalizeFenceCodeLine(rest, lang)}`;
-	        }
-	        if (passthroughMarkdownFence) {
-	          if (/^\s*```\s*$/.test(line)) {
-	            passthroughMarkdownFence = false;
-	            return "";
-	          }
-	          const trailingFence = line.match(/^(.*\S)\s*```\s*$/);
-	          if (trailingFence) {
-	            passthroughMarkdownFence = false;
-	            return normalizeLine(trailingFence[1], { markdownPassthrough: true });
-	          }
-	          return normalizeLine(line, { markdownPassthrough: true });
-	        }
-	        if (/^\s*```/.test(line)) {
-	          inFence = !inFence;
-	          fenceLanguage = inFence ? (line.trim().match(/^```([A-Za-z0-9_.+-]*)/) || [])[1] || "" : "";
-	          repairFenceLines = false;
-	          yamlRepairStack = [];
-	          jsonRepairIndent = 0;
-	          return line;
-	        }
-	        if (inFence) {
-	          const trailingFence = line.match(/^(.*\S)\s*```\s*$/);
-	          if (trailingFence) {
-	            inFence = false;
-	            const repaired = repairFenceLines
-	              ? normalizeFenceCodeLine(trailingFence[1], fenceLanguage)
-	              : trailingFence[1];
-	            fenceLanguage = "";
-	            repairFenceLines = false;
-	            yamlRepairStack = [];
-	            jsonRepairIndent = 0;
-	            return `${repaired}\n\`\`\``;
-	          }
-	          return repairFenceLines ? normalizeFenceCodeLine(line, fenceLanguage) : line;
-	        }
-	        return normalizeLine(line);
-	      }).join("\n");
-	    }
-
-	    function markdownBlockStarts(lines, index) {
-	      const line = lines[index] || "";
-	      const next = lines[index + 1] || "";
-	      return (
-	        /^```/.test(line.trim())
-	        || /^\s{0,3}#{1,4}\s+/.test(line)
-	        || /^\s{0,3}>\s?/.test(line)
-	        || /^\s*([-*+])\s+/.test(line)
-	        || /^\s*\d+\.\s+/.test(line)
-	        || /^\s{0,3}[-*_](?:\s*[-*_]){2,}\s*$/.test(line)
-	        || markdownTableStarts(line, next)
-	      );
-	    }
-
-	    function markdownTableStarts(line, next) {
-	      return line.includes("|") && /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(next || "");
-	    }
-
-	    function markdownTableCells(line) {
-	      let text = String(line || "").trim();
-	      if (text.startsWith("|")) text = text.slice(1);
-	      if (/(?:^|[^\\])(?:\\\\)*\|$/.test(text)) text = text.slice(0, -1);
-	      const cells = [];
-	      let cell = "";
-	      let escaped = false;
-	      let codeTickCount = 0;
-	      for (let index = 0; index < text.length; index += 1) {
-	        const char = text[index];
-	        if (char === "\\" && !escaped) {
-	          escaped = true;
-	          cell += char;
-	          continue;
-	        }
-	        if (char === "`" && !escaped) {
-	          let run = 1;
-	          while (text[index + run] === "`") run += 1;
-	          if (!codeTickCount) codeTickCount = run;
-	          else if (codeTickCount === run) codeTickCount = 0;
-	          cell += text.slice(index, index + run);
-	          index += run - 1;
-	          continue;
-	        }
-	        if (char === "|" && !escaped && !codeTickCount) {
-	          cells.push(cell.trim().replace(/\\\|/g, "|"));
-	          cell = "";
-	          continue;
-	        }
-	        cell += char;
-	        escaped = false;
-	      }
-	      cells.push(cell.trim().replace(/\\\|/g, "|"));
-	      return cells;
-	    }
-
-	    function renderMarkdownTable(lines, index) {
-	      const headers = markdownTableCells(lines[index]);
-	      let cursor = index + 2;
-	      const rows = [];
-	      while (cursor < lines.length && lines[cursor].includes("|") && lines[cursor].trim()) {
-	        rows.push(markdownTableCells(lines[cursor]));
-	        cursor += 1;
-	      }
-	      const head = headers.map((cell) => `<th>${renderMarkdownInline(cell)}</th>`).join("");
-	      const body = rows.map((row) => (
-	        `<tr>${headers.map((_header, cellIndex) => `<td>${renderMarkdownInline(row[cellIndex] || "")}</td>`).join("")}</tr>`
-	      )).join("");
-	      return {
-	        html: `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`,
-	        index: cursor
-	      };
-	    }
-
-	    function markdownIndentedCodeLines(lines, index) {
-	      const codeLines = [];
-	      let cursor = index;
-	      while (cursor < lines.length && (/^(?: {4}|\t)/.test(lines[cursor]) || !lines[cursor].trim())) {
-	        if (!lines[cursor].trim()) {
-	          codeLines.push("");
-	        } else {
-	          codeLines.push(lines[cursor].replace(/^(?: {4}|\t)/, ""));
-	        }
-	        cursor += 1;
-	      }
-	      while (codeLines.length && !codeLines[codeLines.length - 1]) codeLines.pop();
-	      return { codeLines, index: cursor };
-	    }
-
-	    function markdownIndentedCodeLooksIntentional(codeLines) {
-	      const meaningful = codeLines.map((line) => line.trim()).filter(Boolean);
-	      if (!meaningful.length) return false;
-	      const strongCodeLine = meaningful.some((line) => (
-	        /^[$>#]\s+/.test(line)
-	        || /\s--?[A-Za-z0-9][\w-]*/.test(line)
-	        || /(?:[{}[\];=]|=>|<\/?\w|&&|\|\|)/.test(line)
-	      ));
-	      const commandShaped = meaningful.every((line) => (
-	        /^[A-Za-z0-9_./-]+(?:\s+[A-Za-z0-9_./:-]+){0,8}$/.test(line)
-	      ));
-	      const proseLike = meaningful.some((line) => (
-	        line.split(/\s+/).length >= 10
-	        && /[,.!?;:]/.test(line)
-	        && !/\s--?[A-Za-z0-9][\w-]*/.test(line)
-	      ));
-	      return !proseLike && (strongCodeLine || (meaningful.length <= 4 && commandShaped));
-	    }
-
-	    function renderMarkdown(value) {
-	      const lines = normalizeMarkdownSource(value).split("\n");
-	      const blocks = [];
-	      let index = 0;
-	      while (index < lines.length) {
-	        const line = lines[index];
-	        const trimmed = line.trim();
-	        if (!trimmed) {
-	          index += 1;
-	          continue;
-	        }
-	        if (/^(?: {4}|\t)/.test(line)) {
-	          const rendered = markdownIndentedCodeLines(lines, index);
-	          if (markdownIndentedCodeLooksIntentional(rendered.codeLines)) {
-	            blocks.push(`<pre><code>${escapeHtml(rendered.codeLines.join("\n"))}</code></pre>`);
-	            index = rendered.index;
-	            continue;
-	          }
-	        }
-	        const fence = trimmed.match(/^```([A-Za-z0-9_.+-]*)\s*$/);
-	        if (fence) {
-	          const codeLines = [];
-	          index += 1;
-	          while (index < lines.length && !/^```\s*$/.test(lines[index].trim())) {
-	            codeLines.push(lines[index]);
-	            index += 1;
-	          }
-	          if (index < lines.length) index += 1;
-	          blocks.push(renderMarkdownCodeBlock(codeLines.join("\n"), fence[1] || ""));
-	          continue;
-	        }
-	        const heading = line.match(/^\s{0,3}(#{1,4})\s+(.+)$/);
-	        if (heading) {
-	          const level = heading[1].length;
-	          blocks.push(`<h${level}>${renderMarkdownInline(heading[2].trim())}</h${level}>`);
-	          index += 1;
-	          continue;
-	        }
-	        if (/^\s{0,3}[-*_](?:\s*[-*_]){2,}\s*$/.test(line)) {
-	          blocks.push("<hr>");
-	          index += 1;
-	          continue;
-	        }
-	        if (markdownTableStarts(line, lines[index + 1] || "")) {
-	          const rendered = renderMarkdownTable(lines, index);
-	          blocks.push(rendered.html);
-	          index = rendered.index;
-	          continue;
-	        }
-	        if (/^\s{0,3}>\s?/.test(line)) {
-	          const quoteLines = [];
-	          while (index < lines.length && /^\s{0,3}>\s?/.test(lines[index])) {
-	            quoteLines.push(lines[index].replace(/^\s{0,3}>\s?/, ""));
-	            index += 1;
-	          }
-	          blocks.push(`<blockquote>${renderMarkdown(quoteLines.join("\n"))}</blockquote>`);
-	          continue;
-	        }
-	        const unordered = line.match(/^\s*([-*+])\s+(.+)$/);
-	        const ordered = line.match(/^\s*(\d+)\.\s+(.+)$/);
-	        if (unordered || ordered) {
-	          const listTag = ordered ? "ol" : "ul";
-	          const start = ordered ? Math.max(1, Number(ordered[1] || 1)) : 1;
-	          const items = [];
-	          while (index < lines.length) {
-	            const current = lines[index];
-	            const itemMatch = listTag === "ol"
-	              ? current.match(/^\s*\d+\.\s+(.+)$/)
-	              : current.match(/^\s*[-*+]\s+(.+)$/);
-	            if (!itemMatch) {
-	              if (!current.trim() && index + 1 < lines.length) {
-	                const next = lines[index + 1] || "";
-	                const nextItem = listTag === "ol"
-	                  ? next.match(/^\s*\d+\.\s+(.+)$/)
-	                  : next.match(/^\s*[-*+]\s+(.+)$/);
-	                if (nextItem) {
-	                  index += 1;
-	                  continue;
-	                }
-	              }
-	              break;
-	            }
-	            const itemLines = [itemMatch[1]];
-	            index += 1;
-	            while (index < lines.length && /^\s{2,}\S/.test(lines[index]) && !markdownBlockStarts(lines, index)) {
-	              itemLines.push(lines[index].trim());
-	              index += 1;
-	            }
-	            items.push(`<li>${itemLines.map((itemLine) => renderMarkdownInline(itemLine)).join("<br>")}</li>`);
-	          }
-	          const startAttr = listTag === "ol" && start > 1 ? ` start="${start}"` : "";
-	          blocks.push(`<${listTag}${startAttr}>${items.join("")}</${listTag}>`);
-	          continue;
-	        }
-	        const paragraph = [];
-	        while (index < lines.length && lines[index].trim() && !markdownBlockStarts(lines, index)) {
-	          paragraph.push(lines[index].trim());
-	          index += 1;
-	        }
-	        if (paragraph.length) {
-	          blocks.push(`<p>${paragraph.map((part) => renderMarkdownInline(part)).join("<br>")}</p>`);
-	        } else {
-	          index += 1;
-	        }
-	      }
-	      return blocks.join("");
-	    }
-
-	    function formatNumber(value) {
-	      return Number(value || 0).toLocaleString();
-	    }
-
-	    function formatBytes(value) {
-	      const bytes = Number(value || 0);
-	      if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-	      if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-	      return `${bytes} B`;
-	    }
-
-	    function formatEventTime(value) {
-	      if (!value) return "";
-	      const date = new Date(value);
-	      if (Number.isNaN(date.getTime())) return String(value);
-	      return date.toLocaleString([], {
-	        month: "short",
-	        day: "numeric",
-	        hour: "2-digit",
-	        minute: "2-digit"
-	      });
-	    }
-
-	    function signedPercent(value) {
-	      const number = Number(value);
-	      if (!Number.isFinite(number)) return "";
-	      const sign = number > 0 ? "+" : "";
-	      return `${sign}${number.toFixed(Math.abs(number) < 1 && number !== 0 ? 1 : 0)}%`;
-	    }
-
-	    function quotaDeltaText(quota) {
-	      if (!quota || typeof quota !== "object") return "";
-	      const pieces = [];
-	      for (const [name, row] of Object.entries(quota)) {
-	        if (!row || typeof row !== "object") continue;
-	        const primaryDelta = signedPercent(row.primary_delta_percent);
-	        const weeklyDelta = signedPercent(row.weekly_delta_percent);
-	        const primary = row.primary_remaining_percent;
-	        const weekly = row.weekly_remaining_percent;
-	        const bits = [];
-	        if (primaryDelta) bits.push(`5h ${primaryDelta}`);
-	        if (weeklyDelta) bits.push(`weekly ${weeklyDelta}`);
-	        if (!bits.length && Number.isFinite(Number(primary))) bits.push(`5h ${Number(primary).toFixed(0)}%`);
-	        if (!bits.length && Number.isFinite(Number(weekly))) bits.push(`weekly ${Number(weekly).toFixed(0)}%`);
-	        if (bits.length) pieces.push(`${name}: ${bits.join(", ")}`);
-	      }
-	      return pieces.join("; ");
-	    }
-
-	    function statsEventText(event) {
-	      const type = String(event.type || "");
-	      const profile = String(event.profile || "unknown");
-	      if (type === "token_usage") {
-	        return `${profile} token usage: ${formatNumber(event.tokens)}${event.fast ? " fast" : ""}`;
-	      }
-	      if (type === "websocket_tunnel") {
-	        return `${profile} tunnel closed: ${formatBytes(event.bytes)}`;
-	      }
-	      if (type === "http_request") {
-	        const status = event.status ? `status ${event.status}` : "status unknown";
-	        return `${profile} ${event.path || "request"} ${status}`;
-	      }
-	      if (type === "quota_update") {
-	        const movement = quotaDeltaText(event.quota);
-	        const suffix = movement ? `: ${movement}` : "";
-	        return `${profile} quota update${event.source ? ` from ${event.source}` : ""}${event.fast ? " while fast" : ""}${suffix}`;
-	      }
-	      if (type === "reset_credit") {
-	        return `${profile} reset credit: ${event.outcome || "unknown"}`;
-	      }
-	      return `${profile} ${type || "event"}`;
-	    }
-
-	    function scrollSnapshot(element) {
-	      if (!element) return null;
-	      return {
-	        top: element.scrollTop,
-	        atBottom: element.scrollHeight - element.scrollTop - element.clientHeight < 24
-	      };
-	    }
-
-	    function restoreScrollSnapshot(element, snapshot) {
-	      if (!element || !snapshot) return;
-	      element.scrollTop = snapshot.atBottom
-	        ? Math.max(0, element.scrollHeight - element.clientHeight)
-	        : snapshot.top;
-	    }
-
-	    function formatAge(seconds) {
-	      const value = Number(seconds);
-	      if (!Number.isFinite(value)) return "";
-	      if (value < 60) return `${Math.max(0, Math.round(value))}s`;
-	      if (value < 3600) return `${Math.round(value / 60)}m`;
-	      return `${(value / 3600).toFixed(1)}h`;
-	    }
-
-	    function controlPlane(status) {
-	      return status && status.control_plane && typeof status.control_plane === "object"
-	        ? status.control_plane
-	        : latestControlPlane || { sessions: [] };
-	    }
-
-	    function controlSessions(status) {
-	      const plane = controlPlane(status);
-	      return Array.isArray(plane.sessions) ? plane.sessions : [];
-	    }
-
-	    function sessionTitle(session) {
-	      return String(session.title || session.name || session.display || session.cwd || "Session");
-	    }
-
-	    function sessionMeta(session) {
-	      const pieces = [];
-	      if (session.pinned_profile) pieces.push(`pinned ${session.pinned_profile}`);
-	      else if (session.last_profile) pieces.push(`last ${session.last_profile}`);
-	      const active = Number(session.active_requests || 0);
-	      const pending = Number(session.pending_websocket_work || 0);
-	      const tunnels = Number(session.active_tunnels || 0);
-	      if (active) pieces.push(`${active} request${active === 1 ? "" : "s"}`);
-	      if (pending) pieces.push(`${pending} turn${pending === 1 ? "" : "s"}`);
-	      else if (tunnels) pieces.push(`${tunnels} tunnel${tunnels === 1 ? "" : "s"}`);
-	      return pieces.join(" / ") || String(session.display || session.cwd || "idle");
-	    }
-
-	    function updateControlDockGeometry() {
-	      const modal = document.getElementById("controlModal");
-	      const tabs = document.getElementById("sessionTabs");
-	      if (!modal || !tabs) return;
-	      const top = tabs.offsetTop + tabs.offsetHeight + 8;
-	      modal.style.setProperty("--control-dock-top", `${Math.max(0, top)}px`);
-	      const launcher = document.getElementById("launcherBar");
-	      if (launcher) launcher.style.setProperty("--control-dock-top", `${Math.max(0, top)}px`);
-		      const stats = document.getElementById("statsModal");
-		      if (stats) {
-		        const tabsTop = tabs.getBoundingClientRect().top;
-		        stats.style.setProperty("--stats-modal-top", `${Math.max(0, tabsTop)}px`);
-	      }
-	      updateMobileControlChromeGeometry();
-	      updateMobileControlStickiness();
-	    }
-
-	    function controlScrollKey() {
-	      const turn = selectedControlTurnKeys[selectedControlSessionKey || ""] || "";
-	      return `${selectedControlSessionKey || "none"}:${controlView || "discussion"}:${turn}:${controlSearchText || ""}`;
-	    }
-
-	    function controlTranscriptWindowKey() {
-	      const turn = selectedControlTurnKeys[selectedControlSessionKey || ""] || "";
-	      return `${selectedControlSessionKey || "none"}:${turn}:${controlSearchText || ""}`;
-	    }
-
-		    function controlTranscriptWindow(total) {
-		      if (total <= CONTROL_TRANSCRIPT_WINDOW_SIZE) {
-		        return { start: 0, end: total };
-		      }
-		      const key = controlTranscriptWindowKey();
-		      const existing = controlTranscriptWindows[key];
-		      if (!existing) {
-		        const start = Math.max(0, total - CONTROL_TRANSCRIPT_WINDOW_SIZE);
-		        const value = { start, end: total, previousTotal: total };
-		        controlTranscriptWindows[key] = value;
-		        return value;
-		      }
-		      if (total > existing.previousTotal && existing.end >= existing.previousTotal) {
-		        const delta = total - existing.previousTotal;
-		        existing.end = total;
-		        existing.start = Math.max(0, existing.start + delta);
-		      }
-		      existing.start = Math.max(0, Math.min(existing.start, total - 1));
-		      existing.end = Math.max(existing.start + 1, Math.min(existing.end, total));
-		      existing.previousTotal = total;
-		      return existing;
-		    }
-
-		    function expandControlTranscriptWindow(direction) {
-		      const key = controlTranscriptWindowKey();
-		      const current = controlTranscriptWindows[key];
-		      if (!current) return false;
-		      const oldStart = current.start;
-		      const oldEnd = current.end;
-		      const total = Number(current.previousTotal || 0);
-		      if (direction === "above") {
-		        current.start = Math.max(0, current.start - CONTROL_TRANSCRIPT_WINDOW_STEP);
-		      } else {
-		        current.end = Math.min(total, current.end + CONTROL_TRANSCRIPT_WINDOW_STEP);
-		      }
-		      return oldStart !== current.start || oldEnd !== current.end;
-		    }
-
-	    function saveControlScroll() {
-	      const content = document.getElementById("controlContent");
-	      if (!content) return;
-	      const key = renderedControlScrollKey || controlScrollKey();
-	      controlScrollPositions[key] = content.scrollTop;
-	    }
-
-	    function saveControlInnerScroll() {
-	      const content = document.getElementById("controlContent");
-	      if (!content) return;
-	      const prefix = renderedControlScrollKey || controlScrollKey();
-	      content.querySelectorAll("[data-control-inner-scroll]").forEach((element) => {
-	        const key = element.dataset.controlInnerScroll || "";
-	        if (!key) return;
-	        controlInnerScrollPositions[`${prefix}::${key}`] = element.scrollTop;
-	      });
-	    }
-
-	    function restoreControlScroll() {
-	      const content = document.getElementById("controlContent");
-	      if (!content) return;
-	      const top = controlScrollPositions[controlScrollKey()];
-	      if (typeof top === "number") content.scrollTop = top;
-	    }
-
-	    function restoreControlInnerScroll() {
-	      const content = document.getElementById("controlContent");
-	      if (!content) return;
-	      const prefix = controlScrollKey();
-	      content.querySelectorAll("[data-control-inner-scroll]").forEach((element) => {
-	        const key = element.dataset.controlInnerScroll || "";
-	        const top = controlInnerScrollPositions[`${prefix}::${key}`];
-	        if (typeof top === "number") element.scrollTop = top;
-	      });
-	    }
-
-	    function controlContentAtBottom(content) {
-	      if (!content) return true;
-	      return content.scrollHeight - content.scrollTop - content.clientHeight < 24;
-	    }
-
-		    function updateControlScrollBadges() {
-		      const content = document.getElementById("controlContent");
-		      if (!content || controlView !== "discussion") return;
-		      const transcript = content.querySelector(".control-transcript");
-		      const topBadge = content.querySelector("[data-control-scroll='above']");
-		      const bottomBadge = content.querySelector("[data-control-scroll='below']");
-		      if (!transcript || !topBadge || !bottomBadge) return;
-		      const bounds = content.getBoundingClientRect();
-		      const hiddenAbove = Number(transcript.dataset.hiddenAbove || 0);
-		      const hiddenBelow = Number(transcript.dataset.hiddenBelow || 0);
-		      let visibleAbove = 0;
-		      let visibleBelow = 0;
-		      for (const item of transcript.querySelectorAll(".control-message[data-transcript-index]")) {
-		        const itemBounds = item.getBoundingClientRect();
-		        if (itemBounds.bottom < bounds.top + 8) visibleAbove += 1;
-		        if (itemBounds.top > bounds.bottom - 8) visibleBelow += 1;
-		      }
-		      const above = hiddenAbove + visibleAbove;
-		      const below = hiddenBelow + visibleBelow;
-		      topBadge.hidden = above <= 0;
-		      bottomBadge.hidden = below <= 0;
-		      topBadge.textContent = `${above} above`;
-		      bottomBadge.textContent = `${below} below`;
-		      topBadge.title = hiddenAbove > 0 ? `Show older hidden transcript entries (${hiddenAbove} hidden)` : "Scroll upward";
-		      bottomBadge.title = hiddenBelow > 0 ? `Show newer hidden transcript entries (${hiddenBelow} hidden)` : "Scroll downward";
-		    }
-
-	    function controlSelectionActive() {
-	      const modal = document.getElementById("controlModal");
-	      const selection = window.getSelection ? window.getSelection() : null;
-	      if (!modal || !selection || selection.isCollapsed || !selection.rangeCount) return false;
-	      const anchor = selection.anchorNode && selection.anchorNode.nodeType === Node.ELEMENT_NODE
-	        ? selection.anchorNode
-	        : selection.anchorNode ? selection.anchorNode.parentElement : null;
-	      const focus = selection.focusNode && selection.focusNode.nodeType === Node.ELEMENT_NODE
-	        ? selection.focusNode
-	        : selection.focusNode ? selection.focusNode.parentElement : null;
-	      return Boolean((anchor && modal.contains(anchor)) || (focus && modal.contains(focus)));
-	    }
-
-	    function controlRenderShouldDefer() {
-	      return controlSelectionActive();
-	    }
-
-	    function flushPendingControlRender() {
-	      if (!pendingControlRender || controlRenderShouldDefer()) return;
-	      renderControlModal(true);
-	    }
-
-	    function scheduleControlRenderFlush() {
-	      if (controlRenderDeferTimer) return;
-	      controlRenderDeferTimer = setTimeout(() => {
-	        controlRenderDeferTimer = null;
-	        if (pendingControlRender) renderControlModal(true);
-	      }, 2050);
-	    }
-
-	    function renderSessionTabs(status) {
-	      const container = document.getElementById("sessionTabs");
-	      if (!container) return;
-	      const sessions = controlSessions(status);
-	      const launchSelected = launcherPanelOpen ? " selected" : "";
-	      const launchTab = `
-	        <button class="session-tab launch-tab${launchSelected}" type="button" data-launch-tab="1" title="Launch a Codex CLI session">
-	          <span class="session-tab-title">+</span>
-	          <span class="session-tab-meta">Launch</span>
-	        </button>
-	      `;
-	      if (!sessions.length) {
-	        selectedControlSessionKey = "";
-	        container.innerHTML = '<div class="session-tabs-empty">No Provision-managed Codex CLI sessions observed yet</div>' + launchTab;
-	        resetMobileDiscussionFocus();
-	        syncDiscussionPaneVisibility();
-	        renderMobileControlStatus(null);
-	        updateControlDockGeometry();
-	        return;
-	      }
-	      if (selectedControlSessionKey && !sessions.some((session) => session.key === selectedControlSessionKey)) {
-	        selectedControlSessionKey = "";
-	        resetMobileDiscussionFocus();
-	        renderMobileControlStatus(null);
-	      }
-	      container.innerHTML = sessions.map((session) => {
-	        const key = String(session.key || "");
-	        const active = session.active ? " active" : "";
-	        const selected = key && key === selectedControlSessionKey ? " selected" : "";
-	        return `
-          <button class="session-tab${active}${selected}" type="button" draggable="true" data-session-key="${escapeHtml(key)}" title="${escapeHtml(session.cwd || session.display || key)}">
-            <span class="session-tab-close" data-session-close="${escapeHtml(key)}" aria-label="Close tab" title="Close tab">x</span>
-            <span class="session-tab-title">${escapeHtml(sessionTitle(session))}</span>
-            <span class="session-tab-meta">${escapeHtml(sessionMeta(session))}</span>
-          </button>
-	        `;
-	      }).join("") + launchTab;
-	      if (!selectedControlSessionKey || document.getElementById("controlModal").hidden) {
-	        resetMobileComposerFocus();
-	        renderMobileControlStatus(null);
-	      }
-	      syncDiscussionPaneVisibility();
-	      updateControlDockGeometry();
-	    }
-
-		    function orderedSessionKeysFromTabs() {
-		      return Array.from(document.querySelectorAll("#sessionTabs .session-tab[data-session-key]"))
-		        .map((tab) => tab.dataset.sessionKey || "")
-		        .filter(Boolean);
-		    }
-
-		    function clearSessionTabDropClasses() {
-		      document.querySelectorAll("#sessionTabs .session-tab").forEach((tab) => {
-		        tab.classList.remove("dragging", "drop-before", "drop-after");
-		      });
-		    }
-
-		    function sendSessionTabOrder() {
-		      if (!socket || socket.readyState !== WebSocket.OPEN) return;
-		      const sessionKeys = orderedSessionKeysFromTabs();
-		      if (!sessionKeys.length) return;
-		      socket.send(JSON.stringify({
-		        action: "reorder_sessions",
-		        session_keys: sessionKeys,
-		        token: TOKEN
-		      }));
-		    }
-
-		    function sessionTabDropPosition(tab, event) {
-		      const rect = tab.getBoundingClientRect();
-		      return event.clientX > rect.left + rect.width / 2 ? "after" : "before";
-		    }
-
-		    async function forgetControlSession(sessionKey) {
-		      if (!sessionKey || !socket || socket.readyState !== WebSocket.OPEN) return;
-		      const sessions = controlSessions({ control_plane: latestControlPlane });
-		      const session = sessions.find((item) => item.key === sessionKey);
-		      if (!session) return;
-		      const live = sessionIsLive(session);
-		      const label = String(session.cwd || session.display || sessionKey);
-		      if (live) {
-		        const first = await confirmAction({
-		          title: "Forget live session",
-		          message: `This session appears live. Forgetting it will close the associated Codex CLI launcher and remove it from the dashboard:\n\n${label}`,
-		          acceptLabel: "Continue",
-		          danger: true
-		        });
-		        if (!first) return;
-		        const second = await confirmAction({
-		          title: "Close launcher",
-		          message: `Confirm again: close this live launcher and forget the session?\n\n${label}`,
-		          acceptLabel: "Close launcher",
-		          danger: true
-		        });
-		        if (!second) return;
-		      } else {
-		        const confirmed = await confirmAction({
-		          title: "Forget session",
-		          message: `Forget this idle observed session from the dashboard?\n\n${label}`,
-		          acceptLabel: "Forget",
-		          danger: false
-		        });
-		        if (!confirmed) return;
-		      }
-		      socket.send(JSON.stringify({
-		        action: "forget_session",
-		        session_key: sessionKey,
-		        force_live: live,
-		        token: TOKEN
-		      }));
-		      if (selectedControlSessionKey === sessionKey) {
-		        selectedControlSessionKey = "";
-		        const modal = document.getElementById("controlModal");
-		        if (modal) modal.hidden = true;
-		      }
-		    }
-
-	    function launcherSessionScore(session) {
-	      const key = String(session.key || "");
-	      let score = 0;
-	      if (key && key === selectedControlSessionKey) score += 16;
-	      if (key && key === selectedLauncherSessionKey) score += 8;
-	      if (!session.ui_launched) score += 4;
-	      if (session.pty_control_available) score += 2;
-	      if (session.active) score += 1;
-	      return score;
-	    }
-
-		    function dedupedLauncherSessions(sessions) {
-		      const byWorkdir = new Map();
-	      for (const session of sessions) {
-	        const key = String(session.key || "");
-	        const cwd = String(session.cwd || session.display || key);
-	        if (!key || !cwd) continue;
-	        const workdirKey = cwd;
-	        const existing = byWorkdir.get(workdirKey);
-	        if (!existing || launcherSessionScore(session) > launcherSessionScore(existing)) {
-	          byWorkdir.set(workdirKey, session);
-	        }
-	      }
-		      return Array.from(byWorkdir.values());
-		    }
-
-		    function renderResumeCandidateOptions(candidates, selectedId) {
-		      if (!candidates.length) return '<option value="">No resumable sessions found</option>';
-		      return candidates.map((candidate) => {
-		        const id = String(candidate.id || "");
-		        const when = candidate.timestamp ? formatEventTime(candidate.timestamp) : "";
-		        const label = `${when ? `${when} - ` : ""}${candidate.label || id}`;
-		        return `<option value="${escapeHtml(id)}" ${id === selectedId ? "selected" : ""}>${escapeHtml(label)}</option>`;
-		      }).join("");
-		    }
-
-		    function renderLauncherBar(status) {
-		      const bar = document.getElementById("launcherBar");
-		      const select = document.getElementById("launcherSession");
-		      const modeSelect = document.getElementById("launcherMode");
-		      const permissionSelect = document.getElementById("launcherPermission");
-		      const resumeField = document.getElementById("launcherResumeField");
-		      const resumeSelect = document.getElementById("launcherResumeSession");
-		      const start = document.getElementById("launcherStart");
-		      if (!bar || !select || !modeSelect || !permissionSelect || !resumeField || !resumeSelect || !start) return;
-		      bar.hidden = !launcherPanelOpen;
-		      if (!launcherPanelOpen) {
-		        updateControlDockGeometry();
-		        return;
-	      }
-	      const sessions = controlSessions(status);
-	      const known = dedupedLauncherSessions(sessions);
-	      if (!selectedLauncherSessionKey && selectedControlSessionKey && known.some((session) => session.key === selectedControlSessionKey)) {
-	        selectedLauncherSessionKey = selectedControlSessionKey;
-	      }
-	      if (!selectedLauncherSessionKey || !known.some((session) => session.key === selectedLauncherSessionKey)) {
-	        selectedLauncherSessionKey = known.length ? String(known[0].key || "") : "";
-	      }
-	      select.innerHTML = known.length
-	        ? known.map((session) => {
-	          const key = String(session.key || "");
-	          const label = `${session.cwd || session.display || key}${session.associated_profile ? ` (${session.associated_profile})` : ""}`;
-	          return `<option value="${escapeHtml(key)}" ${key === selectedLauncherSessionKey ? "selected" : ""}>${escapeHtml(label)}</option>`;
-	        }).join("")
-		        : '<option value="">No observed workdirs</option>';
-	      select.disabled = !known.length;
-	      const selectedSession = known.find((session) => String(session.key || "") === selectedLauncherSessionKey) || null;
-	      if (selectedSession) requestResumeCandidates(selectedSession);
-	      const candidates = selectedSession ? resumeCandidatesForSession(selectedSession) : [];
-		      if (!launcherResumeSessionId || !candidates.some((candidate) => String(candidate.id || "") === launcherResumeSessionId)) {
-		        launcherResumeSessionId = candidates.length ? String(candidates[0].id || "") : "";
-		      }
-		      modeSelect.value = launcherMode;
-		      permissionSelect.value = launcherPermission;
-		      resumeField.hidden = launcherMode !== "resume-session";
-		      resumeSelect.innerHTML = renderResumeCandidateOptions(candidates, launcherResumeSessionId);
-		      resumeSelect.disabled = launcherMode !== "resume-session" || !candidates.length;
-		      const needsResumeSelection = launcherMode === "resume-session";
-		      start.disabled = !known.length
-		        || !socket
-		        || socket.readyState !== WebSocket.OPEN
-		        || (needsResumeSelection && !launcherResumeSessionId);
-		      updateControlDockGeometry();
-		    }
-
-	    function selectedControlSession() {
-	      const sessions = controlSessions({ control_plane: latestControlPlane });
-	      return sessions.find((session) => session.key === selectedControlSessionKey) || null;
-	    }
-
-	    function controlCapabilityText(session) {
-	      const interaction = latestControlPlane && typeof latestControlPlane.interaction === "object"
-	        ? latestControlPlane.interaction
-	        : {};
-	      const sessionInteraction = session && typeof session.interaction === "object"
-	        ? session.interaction
-	        : {};
-	      if (sessionInteraction.reason) return String(sessionInteraction.reason);
-	      return String(interaction.reason || "Launch this Codex CLI session with `provision` to enable live UI input.");
-	    }
-
-	    function controlInteractionAvailable(session) {
-	      return Boolean(session && session.interaction && session.interaction.available);
-	    }
-
-	    function updateControlComposeState(session) {
-	      const prompt = document.getElementById("controlPrompt");
-	      const button = document.getElementById("controlSend");
-	      const available = controlInteractionAvailable(session);
-	      prompt.disabled = !available;
-	      button.disabled = !available || !prompt.value.trim();
-	      prompt.placeholder = available
-	        ? "Send to running Codex CLI"
-	        : controlCapabilityText(session);
-	    }
-
-		    function resetControlPromptHistory() {
-		      controlPromptHistoryIndex = null;
-		      controlPromptHistorySessionKey = "";
-		      controlPromptHistoryDraft = "";
-		    }
-
-		    function controlPromptHistory(session) {
-		      const transcript = session && Array.isArray(session.transcript) ? session.transcript : [];
-		      const history = [];
-		      let previous = "";
-		      for (const item of transcript) {
-		        if (String(item.role || "") !== "user") continue;
-		        const text = String(item.full_text || item.text || "").trim();
-		        if (!text || text === previous) continue;
-		        previous = text;
-		        history.push(text);
-		      }
-		      return history;
-		    }
-
-		    function setControlPromptValue(value) {
-		      const prompt = document.getElementById("controlPrompt");
-		      if (!prompt) return;
-		      prompt.value = value;
-		      updateControlComposeState(selectedControlSession());
-		      requestAnimationFrame(() => {
-		        const end = prompt.value.length;
-		        try {
-		          prompt.setSelectionRange(end, end);
-		        } catch {
-		        }
-		      });
-		    }
-
-		    function handleControlPromptHistory(event) {
-		      if (!["ArrowUp", "ArrowDown"].includes(event.key) || event.shiftKey || event.altKey || event.metaKey || event.ctrlKey) {
-		        return false;
-		      }
-		      const prompt = event.currentTarget;
-		      if (!(prompt instanceof HTMLTextAreaElement) || prompt.disabled) return false;
-		      const browsing = controlPromptHistoryIndex !== null
-		        && controlPromptHistorySessionKey === selectedControlSessionKey;
-		      if (prompt.value.trim() && !browsing) return false;
-		      const history = controlPromptHistory(selectedControlSession());
-		      if (!history.length) return false;
-		      event.preventDefault();
-		      if (!browsing) {
-		        controlPromptHistorySessionKey = selectedControlSessionKey;
-		        controlPromptHistoryDraft = prompt.value;
-		        controlPromptHistoryIndex = history.length;
-		      }
-		      if (event.key === "ArrowUp") {
-		        controlPromptHistoryIndex = Math.max(0, Number(controlPromptHistoryIndex) - 1);
-		        setControlPromptValue(history[controlPromptHistoryIndex] || "");
-		        return true;
-		      }
-		      controlPromptHistoryIndex = Math.min(history.length, Number(controlPromptHistoryIndex) + 1);
-		      if (controlPromptHistoryIndex >= history.length) {
-		        const draft = controlPromptHistoryDraft;
-		        resetControlPromptHistory();
-		        setControlPromptValue(draft);
-		        return true;
-		      }
-		      setControlPromptValue(history[controlPromptHistoryIndex] || "");
-		      return true;
-		    }
-
-	    function renderControlActiveDetails(session) {
-	      const details = session.active_details && typeof session.active_details === "object" ? session.active_details : {};
-	      const requests = Array.isArray(details.requests) ? details.requests : [];
-	      const tunnels = Array.isArray(details.tunnels) ? details.tunnels : [];
-	      const requestCards = requests.map((request) => `
-	        <div class="control-active-card">
-	          <strong>Request</strong>
-	          <span>Profile: ${escapeHtml(request.profile || "unknown")}</span>
-	          ${request.age_seconds != null ? `<span>Age: ${escapeHtml(formatAge(request.age_seconds))}</span>` : ""}
-	        </div>
-	      `);
-	      const tunnelCards = tunnels.map((tunnel, index) => {
-	        const traffic = `${formatBytes(tunnel.bytes_up)} up / ${formatBytes(tunnel.bytes_down)} down`;
-	        const messages = `${formatNumber(tunnel.messages_up)} up / ${formatNumber(tunnel.messages_down)} down`;
-	        const bits = [];
-	        const hasTurn = Number(tunnel.pending_work || 0) > 0 || Boolean(tunnel.turn_id);
-	        const label = `${hasTurn ? "Turn tunnel" : "Session tunnel"} ${index + 1}`;
-	        if (Number(tunnel.pending_work || 0) > 0) bits.push("active");
-	        else bits.push("idle");
-	        if (tunnel.service_tier) bits.push(String(tunnel.service_tier));
-	        return `
-	          <div class="control-active-card">
-	            <strong>${escapeHtml(label)}${bits.length ? ` (${escapeHtml(bits.join(", "))})` : ""}</strong>
-	            <span>Profile: ${escapeHtml(tunnel.profile || "unknown")}</span>
-	            ${tunnel.turn_id ? `<span>Turn: ${escapeHtml(tunnel.turn_id)}</span>` : ""}
-	            ${tunnel.age_seconds != null ? `<span>Open: ${escapeHtml(formatAge(tunnel.age_seconds))}</span>` : ""}
-	            ${tunnel.last_data_age_seconds != null ? `<span>Last data: ${escapeHtml(formatAge(tunnel.last_data_age_seconds))} ago</span>` : ""}
-	            <span>Traffic: ${escapeHtml(traffic)}</span>
-	            <span>Messages: ${escapeHtml(messages)}</span>
-	          </div>
-	        `;
-	      });
-	      const cards = requestCards.concat(tunnelCards);
-	      if (!cards.length) return '<div class="control-empty">No active request or tunnel is currently attached to this session</div>';
-	      return `<div class="control-active-grid">${cards.join("")}</div>`;
-	    }
-
-	    function controlTranscriptMatches(item, query) {
-	      if (!query) return true;
-	      const haystack = `${item.role || ""} ${item.text || ""} ${item.full_text || ""} ${item.search_text || ""}`.toLowerCase();
-	      return haystack.includes(query.toLowerCase());
-	    }
-
-	    function controlTurnKey(turn) {
-	      return String(turn && (turn.key || turn.turn_id || turn.start_index) || "");
-	    }
-
-	    function historyCacheKey(sessionKey, turnKey) {
-	      return `${sessionKey || ""}\u0001${turnKey || ""}`;
-	    }
-
-	    function historyTurnPayload(session, turn) {
-	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
-	      const turnKey = controlTurnKey(turn);
-	      return historyTurnCache[historyCacheKey(sessionKey, turnKey)] || null;
-	    }
-
-	    function observedTurnPayload(session, turn) {
-	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
-	      const turnKey = controlTurnKey(turn);
-	      return observedTurnCache[historyCacheKey(sessionKey, turnKey)] || null;
-	    }
-
-	    function observedTurnNeedsLoad(session, turn) {
-	      if (!turn || turn.source === "history" || observedTurnPayload(session, turn)) return false;
-	      const window = session && session.transcript_window && typeof session.transcript_window === "object"
-	        ? session.transcript_window
-	        : null;
-	      if (!window) return false;
-	      const start = Number(window.start_index);
-	      const end = Number(window.end_index);
-	      const turnStart = Number(turn.start_index);
-	      const turnEnd = Number(turn.end_index);
-	      return Number.isFinite(start) && Number.isFinite(end)
-	        && Number.isFinite(turnStart) && Number.isFinite(turnEnd)
-	        && (turnStart < start || turnEnd > end);
-	    }
-
-	    function requestObservedTurn(session, turn, beforeIndex = null) {
-	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
-	      const turnKey = controlTurnKey(turn);
-	      if (!sessionKey || !turnKey || !socket || socket.readyState !== WebSocket.OPEN) return false;
-	      const key = `${historyCacheKey(sessionKey, turnKey)}\u0001${beforeIndex == null ? "latest" : beforeIndex}`;
-	      if (observedTurnRequests[key]) return false;
-	      if (beforeIndex == null && observedTurnPayload(session, turn)) return false;
-	      observedTurnRequests[key] = true;
-	      socket.send(JSON.stringify({
-	        action: "load_control_turn",
-	        session_key: sessionKey,
-	        turn_key: turnKey,
-	        before_index: beforeIndex,
-	        token: TOKEN
-	      }));
-	      return true;
-	    }
-
-	    function requestHistoryTurn(session, turn) {
-	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
-	      const turnKey = controlTurnKey(turn);
-	      if (!sessionKey || !turnKey || !socket || socket.readyState !== WebSocket.OPEN) return false;
-	      const key = historyCacheKey(sessionKey, turnKey);
-	      if (historyTurnCache[key] || historyTurnRequests[key]) return false;
-	      historyTurnRequests[key] = true;
-	      socket.send(JSON.stringify({
-	        action: "load_history_turn",
-	        session_key: sessionKey,
-	        turn_key: turnKey,
-	        token: TOKEN
-	      }));
-	      return true;
-	    }
-
-	    function historyTurnsForSession(session) {
-	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
-	      if (Object.prototype.hasOwnProperty.call(historyTurnIndexes, sessionKey)) {
-	        return historyTurnIndexes[sessionKey];
-	      }
-	      return session && Array.isArray(session.history_turns) ? session.history_turns : [];
-	    }
-
-	    function requestHistoryIndex(session) {
-	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
-	      if (!sessionKey || !socket || socket.readyState !== WebSocket.OPEN) return false;
-	      if (
-	        Object.prototype.hasOwnProperty.call(historyTurnIndexes, sessionKey)
-	        || historyIndexRequests[sessionKey]
-	      ) return false;
-	      historyIndexRequests[sessionKey] = true;
-	      socket.send(JSON.stringify({
-	        action: "load_history_index",
-	        session_key: sessionKey,
-	        token: TOKEN
-	      }));
-	      return true;
-	    }
-
-	    function resumeCandidatesForSession(session) {
-	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
-	      if (Object.prototype.hasOwnProperty.call(resumeCandidateIndexes, sessionKey)) {
-	        return resumeCandidateIndexes[sessionKey];
-	      }
-	      return session && Array.isArray(session.resume_candidates) ? session.resume_candidates : [];
-	    }
-
-	    function requestResumeCandidates(session) {
-	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
-	      if (!sessionKey || !socket || socket.readyState !== WebSocket.OPEN) return false;
-	      if (
-	        Object.prototype.hasOwnProperty.call(resumeCandidateIndexes, sessionKey)
-	        || resumeCandidateRequests[sessionKey]
-	      ) return false;
-	      resumeCandidateRequests[sessionKey] = true;
-	      socket.send(JSON.stringify({
-	        action: "load_resume_candidates",
-	        session_key: sessionKey,
-	        token: TOKEN
-	      }));
-	      return true;
-	    }
-
-	    function controlTurns(session, transcript = null) {
-	      const liveTurns = session && Array.isArray(session.turns)
-	        ? session.turns.map((turn) => ({ ...turn, source: turn.source || "live" }))
-	        : [];
-	      const historyTurns = historyTurnsForSession(session)
-	        .map((turn) => ({ ...turn, source: "history" }))
-	        .filter((historyTurn) => !liveTurns.some((liveTurn) => {
-	          const historyId = String(historyTurn.turn_id || "");
-	          const liveId = String(liveTurn.turn_id || "");
-	          if (historyId && liveId && !historyId.startsWith("history:")) return historyId === liveId;
-	          const historyLabel = String(historyTurn.label || "").trim().toLowerCase();
-	          const liveLabel = String(liveTurn.label || "").trim().toLowerCase();
-	          if (!historyLabel || historyLabel !== liveLabel) return false;
-	          const historyTime = Date.parse(String(historyTurn.timestamp || ""));
-	          const liveTime = Date.parse(String(liveTurn.timestamp || ""));
-	          return Number.isFinite(historyTime) && Number.isFinite(liveTime)
-	            && Math.abs(historyTime - liveTime) <= 15000;
-	        }));
-	      const turns = historyTurns.concat(liveTurns);
-	      if (turns.length) return turns;
-	      const rows = transcript || (session && Array.isArray(session.transcript) ? session.transcript : []);
-	      if (!rows.length) return [];
-	      return [{
-	        key: "observed-activity",
-	        source: "live",
-	        label: "Observed activity",
-	        start_index: 0,
-	        end_index: rows.length - 1,
-	        timestamp: rows[0].ts || "",
-	        updated_at: rows[rows.length - 1].updated_at || rows[rows.length - 1].ts || ""
-	      }];
-	    }
-
-	    function transcriptItemsForTurn(transcript, turn) {
-	      if (turn && turn.source === "history") return [];
-	      const start = Math.max(0, Number(turn && turn.start_index || 0));
-	      const end = Math.max(start, Number(turn && turn.end_index != null ? turn.end_index : start));
-	      return transcript.filter((item) => {
-	        const index = Number(item.control_index);
-	        return Number.isFinite(index) && index >= start && index <= end;
-	      });
-	    }
-
-	    function turnTranscriptItems(session, transcript, turn) {
-	      if (turn && turn.source === "history") {
-	        const payload = historyTurnPayload(session, turn);
-	        return payload && Array.isArray(payload.transcript) ? payload.transcript : [];
-	      }
-	      const observed = observedTurnPayload(session, turn);
-	      if (observed && Array.isArray(observed.transcript)) return observed.transcript;
-	      return transcriptItemsForTurn(transcript, turn);
-	    }
-
-	    function turnMatchesSearch(transcript, turn, query, session = null) {
-	      if (!query) return true;
-	      const label = String(turn && turn.label || "").toLowerCase();
-	      const needle = query.toLowerCase();
-	      if (label.includes(needle)) return true;
-	      const searchText = String(turn && turn.search_text || "").toLowerCase();
-	      if (searchText.includes(needle)) return true;
-	      return turnTranscriptItems(session, transcript, turn).some((item) => controlTranscriptMatches(item, query));
-	    }
-
-	    function turnOptionLabel(turn, transcript, query, session = null) {
-	      const when = turn && turn.timestamp ? formatEventTime(turn.timestamp) : "";
-	      const label = String(turn && turn.label || turn && turn.turn_id || "Observed turn");
-	      let prefix = when ? `${when} - ` : "";
-	      let suffix = turn && turn.pending ? " (pending)" : "";
-	      if (turn && turn.source === "history") suffix += turn.archived ? " (archived)" : " (history)";
-	      if (query) {
-	        const matches = turnTranscriptItems(session, transcript, turn)
-	          .filter((item) => controlTranscriptMatches(item, query)).length;
-	        if (matches > 0) suffix += ` (${matches} loaded match${matches === 1 ? "" : "es"})`;
-	        else if (String(turn && turn.search_text || "").toLowerCase().includes(query.toLowerCase())) suffix += " (match)";
-	      }
-	      return `${prefix}${label}${suffix}`;
-	    }
-
-	    function mobileLayoutActive() {
-	      return window.matchMedia("(max-width: 860px)").matches;
-	    }
-
-	    function discussionActive() {
-	      const modal = document.getElementById("controlModal");
-	      return Boolean(
-	        controlView === "discussion"
-	        && selectedControlSessionKey
-	        && modal
-	        && !modal.hidden
-	      );
-	    }
-
-	    function syncDiscussionPaneVisibility() {
-	      const profiles = document.getElementById("profilesPanel");
-	      const active = discussionActive();
-	      document.body.classList.toggle("discussion-active", active);
-	      if (profiles) profiles.hidden = active;
-	    }
-
-	    function updateMobileControlChromeGeometry() {
-	      const root = document.documentElement;
-	      const tabs = document.getElementById("sessionTabs");
-	      const status = document.getElementById("mobileControlStatus");
-	      if (!root || !tabs) return;
-	      const visualViewport = window.visualViewport;
-	      const viewportHeight = visualViewport && Number.isFinite(visualViewport.height)
-	        ? visualViewport.height
-	        : window.innerHeight;
-	      const focused = (mobileDiscussionFocused || mobileComposerFocused) && mobileLayoutActive();
-	      const viewportTop = visualViewport && Number.isFinite(visualViewport.offsetTop)
-	        ? Math.max(0, Math.round(visualViewport.offsetTop))
-	        : 0;
-	      const tabsHeight = focused ? 0 : tabs.offsetHeight;
-	      const statusHeight = focused || !status || status.hidden ? 0 : status.offsetHeight;
-	      const dockHeight = Math.max(0, Math.round(viewportHeight) - tabsHeight - statusHeight);
-	      root.style.setProperty("--mobile-viewport-height", `${Math.max(0, Math.round(viewportHeight))}px`);
-	      root.style.setProperty("--mobile-visual-viewport-top", `${viewportTop}px`);
-	      root.style.setProperty("--mobile-session-tabs-height", `${tabsHeight}px`);
-	      root.style.setProperty("--mobile-control-chrome-height", `${tabsHeight + statusHeight}px`);
-	      root.style.setProperty("--mobile-control-dock-height", `${dockHeight}px`);
-	    }
-
-	    function renderMobileControlStatus(session) {
-	      const status = document.getElementById("mobileControlStatus");
-	      const readouts = document.getElementById("mobileControlReadouts");
-	      const focus = document.getElementById("mobileFocusToggle");
-	      if (!status || !readouts || !focus) return;
-	      if (!session) {
-	        status.hidden = true;
-	        updateMobileControlChromeGeometry();
-	        return;
-	      }
-	      const pills = [];
-	      if (session.context && session.context.label) {
-	        const contextTitle = [
-	          session.context.input_tokens ? `${formatNumber(session.context.input_tokens)} input tokens` : "",
-	          session.context.remaining_tokens ? `${formatNumber(session.context.remaining_tokens)} tokens remaining` : "",
-	          session.context.updated_at ? `Updated ${formatEventTime(session.context.updated_at)}` : ""
-	        ].filter(Boolean).join(" / ");
-	        pills.push(`<span class="pill" title="${escapeHtml(contextTitle)}">Context <strong>${escapeHtml(session.context.label)}</strong></span>`);
-	      } else {
-	        pills.push('<span class="pill">Context <strong>unavailable</strong></span>');
-	      }
-	      if (session.quota_compact_html) pills.push(String(session.quota_compact_html));
-	      readouts.innerHTML = pills.join("");
-	      status.hidden = false;
-	      focus.hidden = controlView !== "discussion";
-	      focus.setAttribute("aria-pressed", mobileDiscussionFocused ? "true" : "false");
-	      focus.textContent = mobileDiscussionFocused ? "Show controls" : "Focus discussion";
-	      updateMobileControlChromeGeometry();
-	      requestAnimationFrame(updateMobileControlStickiness);
-	    }
-
-	    function resetMobileControlStickiness() {
-	      mobileControlDockAnchorY = null;
-	      document.body.classList.remove("mobile-control-stuck");
-	    }
-
-	    function updateMobileControlStickiness() {
-	      const modal = document.getElementById("controlModal");
-	      const status = document.getElementById("mobileControlStatus");
-	      if (
-	        !mobileLayoutActive()
-	        || !selectedControlSessionKey
-	        || !modal
-	        || modal.hidden
-	      ) {
-	        resetMobileControlStickiness();
-	        return;
-	      }
-	      if (mobileControlDockAnchorY == null) {
-	        if (!mobileDiscussionFocused && !mobileComposerFocused && status && status.hidden) return;
-	        const chrome = Number.parseFloat(
-	          getComputedStyle(document.documentElement).getPropertyValue("--mobile-control-chrome-height")
-	        ) || 0;
-	        const bounds = modal.getBoundingClientRect();
-	        mobileControlDockAnchorY = Math.max(0, bounds.top + window.scrollY - chrome);
-	      }
-	      const shouldStick = mobileDiscussionFocused || mobileComposerFocused || window.scrollY >= mobileControlDockAnchorY - 1;
-	      document.body.classList.toggle("mobile-control-stuck", shouldStick);
-	    }
-
-	    function documentAtBottom() {
-	      const root = document.documentElement;
-	      const visualViewport = window.visualViewport;
-	      const viewportHeight = visualViewport && Number.isFinite(visualViewport.height)
-	        ? visualViewport.height
-	        : window.innerHeight;
-	      const documentHeight = Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0);
-	      return window.scrollY + viewportHeight >= documentHeight - 3;
-	    }
-
-	    function mobileGestureTargetsDiscussion(target) {
-	      return target instanceof Element && Boolean(target.closest("#controlContent, #controlCompose, [data-control-inner-scroll]"));
-	    }
-
-	    function setMobileDiscussionFocus(focused) {
-	      if (!mobileLayoutActive() || controlView !== "discussion" || !selectedControlSessionKey) return false;
-	      if (focused) resetMobileComposerFocus();
-	      mobileDiscussionFocused = Boolean(focused);
-	      document.body.classList.toggle("mobile-discussion-focus", mobileDiscussionFocused);
-	      const restore = document.getElementById("mobileFocusRestore");
-	      if (restore) restore.hidden = !mobileDiscussionFocused;
-	      renderMobileControlStatus(selectedControlSession());
-	      requestAnimationFrame(() => {
-	        updateMobileControlChromeGeometry();
-	        if (mobileDiscussionFocused) window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "auto" });
-	      });
-	      return true;
-	    }
-
-	    function resetMobileDiscussionFocus() {
-	      mobileDiscussionFocused = false;
-	      document.body.classList.remove("mobile-discussion-focus");
-	      const restore = document.getElementById("mobileFocusRestore");
-	      if (restore) restore.hidden = true;
-	      updateMobileControlChromeGeometry();
-	    }
-
-	    function setMobileComposerFocus(focused) {
-	      if (!focused) {
-	        resetMobileComposerFocus();
-	        return false;
-	      }
-	      if (!mobileLayoutActive() || controlView !== "discussion" || !selectedControlSessionKey) return false;
-	      mobileComposerFocused = true;
-	      document.body.classList.add("mobile-composer-focus");
-	      mobileControlDockAnchorY = null;
-	      updateMobileControlChromeGeometry();
-	      requestAnimationFrame(updateMobileControlStickiness);
-	      return true;
-	    }
-
-	    function resetMobileComposerFocus() {
-	      mobileComposerFocused = false;
-	      document.body.classList.remove("mobile-composer-focus");
-	      mobileControlDockAnchorY = null;
-	      document.body.classList.remove("mobile-control-stuck");
-	      updateMobileControlChromeGeometry();
-	      requestAnimationFrame(updateMobileControlStickiness);
-	    }
-
-	    function handleMobileBoundaryGesture(deltaY, event) {
-	      if (
-	        !mobileLayoutActive()
-	        || !selectedControlSessionKey
-	        || controlView !== "discussion"
-	        || Math.abs(deltaY) < MOBILE_FOCUS_GESTURE_DELTA
-	        || mobileGestureTargetsDiscussion(event.target)
-	        || !documentAtBottom()
-	      ) return;
-	      if (Date.now() < mobileFocusScrollLockUntil) {
-	        if (event.cancelable) event.preventDefault();
-	        return;
-	      }
-	      if (deltaY > 0 && !mobileDiscussionFocused) {
-	        if (event.cancelable) event.preventDefault();
-	        setMobileDiscussionFocus(true);
-	      } else if (deltaY < 0 && mobileDiscussionFocused) {
-	        if (event.cancelable) event.preventDefault();
-	        setMobileDiscussionFocus(false);
-	        mobileFocusScrollLockUntil = Date.now() + MOBILE_FOCUS_SCROLL_LOCK_MS;
-	      }
-	    }
-
-	    function selectedTurnForSession(session, transcript) {
-	      const turns = controlTurns(session, transcript);
-	      if (!turns.length) return null;
-	      const query = controlSearchText.trim();
-	      const matchingTurns = query ? turns.filter((turn) => turnMatchesSearch(transcript, turn, query, session)) : turns;
-	      const available = matchingTurns.length ? matchingTurns : turns;
-	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
-	      const selectedKey = selectedControlTurnKeys[sessionKey] || "";
-	      const selected = available.find((turn) => controlTurnKey(turn) === selectedKey);
-	      const fallback = available[available.length - 1] || null;
-	      if (fallback) selectedControlTurnKeys[sessionKey] = controlTurnKey(selected || fallback);
-	      return selected || fallback;
-	    }
-
-	    function controlTurnPresentationKey(session) {
-	      return `${String(session && session.key || selectedControlSessionKey || "none")}:${controlSearchText || ""}`;
-	    }
-
-	    function controlTurnByKey(turns, key) {
-	      return turns.find((turn) => controlTurnKey(turn) === key) || null;
-	    }
-
-	    function controlTurnPresentation(session, transcript, selected) {
-	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
-	      const key = controlTurnPresentationKey(session);
-	      if (
-	        !sessionKey
-	        || controlSearchText.trim()
-	        || manuallySelectedControlTurnKeys[sessionKey]
-	        || !selected
-	        || selected.source === "history"
-	      ) {
-	        delete controlTurnPresentations[key];
-	        return null;
-	      }
-	      const turns = controlTurns(session, transcript).filter((turn) => turn.source !== "history");
-	      const latest = turns[turns.length - 1] || null;
-	      if (!latest) return null;
-	      const selectedKey = controlTurnKey(selected);
-	      const state = controlTurnPresentations[key] || {
-	        activeKey: selectedKey,
-	        pendingKey: "",
-	        hiddenKey: "",
-	        revealedKey: ""
-	      };
-	      if (!controlTurnByKey(turns, state.activeKey)) state.activeKey = selectedKey;
-	      if (controlTurnKey(latest) !== state.activeKey) state.pendingKey = controlTurnKey(latest);
-	      if (state.pendingKey && !controlTurnByKey(turns, state.pendingKey)) state.pendingKey = "";
-	      controlTurnPresentations[key] = state;
-	      return { state, turns, active: controlTurnByKey(turns, state.activeKey) || selected, pending: controlTurnByKey(turns, state.pendingKey) };
-	    }
-
-	    function finalizeControlTurnBridgeIfScrolledAway() {
-	      const content = document.getElementById("controlContent");
-	      const session = selectedControlSession();
-	      if (!content || !session || controlView !== "discussion") return;
-	      const presentation = controlTurnPresentations[controlTurnPresentationKey(session)];
-	      const boundary = content.querySelector("[data-control-turn-boundary]");
-	      if (!presentation || (!presentation.pendingKey && !presentation.revealedKey) || !boundary) return;
-	      const contentBounds = content.getBoundingClientRect();
-	      if (boundary.getBoundingClientRect().bottom >= contentBounds.top + 4) return;
-	      if (presentation.pendingKey) {
-	        const turns = controlTurns(session, Array.isArray(session.transcript) ? session.transcript : [])
-	          .filter((turn) => turn.source !== "history");
-	        const activeIndex = turns.findIndex((turn) => controlTurnKey(turn) === presentation.activeKey);
-	        const pendingIndex = turns.findIndex((turn) => controlTurnKey(turn) === presentation.pendingKey);
-	        const next = activeIndex >= 0 && pendingIndex > activeIndex ? turns[activeIndex + 1] : null;
-	        presentation.hiddenKey = presentation.activeKey;
-	        presentation.activeKey = next ? controlTurnKey(next) : presentation.pendingKey;
-	        if (presentation.activeKey === presentation.pendingKey) presentation.pendingKey = "";
-	        selectedControlTurnKeys[String(session.key || selectedControlSessionKey || "")] = presentation.activeKey;
-	      }
-	      presentation.revealedKey = "";
-	      controlScrollPositions[controlScrollKey()] = content.scrollTop;
-	      preserveControlScrollOnNextRender = true;
-	      renderControlModal(true);
-	    }
-
-	    function renderControlTurnOptions(session) {
-	      const transcript = session && Array.isArray(session.transcript) ? session.transcript : [];
-	      const turns = controlTurns(session, transcript);
-	      if (!turns.length) return '<option value="">No observed turns</option>';
-	      const selected = selectedTurnForSession(session, transcript);
-	      const selectedKey = controlTurnKey(selected);
-	      return turns.map((turn) => {
-	        const key = controlTurnKey(turn);
-	        const disabled = controlSearchText && !turnMatchesSearch(transcript, turn, controlSearchText, session) ? "disabled" : "";
-	        return `<option value="${escapeHtml(key)}" ${key === selectedKey ? "selected" : ""} ${disabled}>${escapeHtml(turnOptionLabel(turn, transcript, controlSearchText, session))}</option>`;
-	      }).join("");
-	    }
-
-	    function controlMessageKey(item, fallback) {
-	      const parts = [
-	        selectedControlSessionKey || "session",
-	        item.role || "message",
-	        item.turn_id || "",
-	        item.call_id || "",
-	        item.ts || ""
-	      ];
-	      if (item.ts || item.call_id || item.turn_id) return parts.join("|");
-	      parts.push(fallback || "");
-	      return parts.join("|");
-	    }
-
-	    function compactControlMessageNeedsExpansion(value) {
-	      const text = String(value || "");
-	      if (!text) return false;
-	      return text.split("\n").length > 4 || text.length > 360;
-	    }
-
-		    function splitToolStatusSuffix(value) {
-		      const match = String(value || "").match(/^(.*?)(?:\s+\(([^)]*)\))?$/);
-		      const label = match ? match[1].trim() : String(value || "").trim();
-		      const attrs = {};
-		      const suffix = match && match[2] ? match[2] : "";
-		      for (const part of suffix.split(/\s*,\s*/)) {
-		        const status = part.match(/^status\s+(.+)$/i);
-		        const exit = part.match(/^exit\s+(.+)$/i);
-		        const duration = part.match(/^duration\s+(.+)$/i);
-		        if (status) attrs.status = status[1].trim();
-		        else if (exit) attrs.exit = exit[1].trim();
-		        else if (duration) attrs.duration = duration[1].trim();
-		      }
-		      return { label, attrs };
-		    }
-
-		    function parseToolActivityText(value) {
-		      const lines = String(value || "").replace(/\r\n?/g, "\n").split("\n");
-		      const first = lines[0] || "";
-		      const firstMatch = first.match(/^(Tool|Command):\s*(.+)$/i);
-		      if (!firstMatch) return null;
-		      const parsedFirst = splitToolStatusSuffix(firstMatch[2]);
-		      const result = {
-		        kind: firstMatch[1].toLowerCase(),
-		        name: firstMatch[1].toLowerCase() === "tool" ? parsedFirst.label : "command",
-		        command: firstMatch[1].toLowerCase() === "command" ? parsedFirst.label : "",
-		        status: parsedFirst.attrs.status || "",
-		        exit: parsedFirst.attrs.exit || "",
-		        duration: parsedFirst.attrs.duration || "",
-		        sections: []
-		      };
-		      let currentSection = null;
-		      const pushSection = () => {
-		        if (!currentSection) return;
-		        const text = currentSection.lines.join("\n").replace(/\s+$/g, "");
-		        if (text.trim()) result.sections.push({ label: currentSection.label, text });
-		        currentSection = null;
-		      };
-		      for (const rawLine of lines.slice(1)) {
-		        const line = rawLine || "";
-		        const commandMatch = line.match(/^Command:\s*(.+)$/i);
-		        if (commandMatch) {
-		          pushSection();
-		          const parsedCommand = splitToolStatusSuffix(commandMatch[1]);
-		          result.command = parsedCommand.label || result.command;
-		          if (parsedCommand.attrs.status) result.status = parsedCommand.attrs.status;
-		          if (parsedCommand.attrs.exit) result.exit = parsedCommand.attrs.exit;
-		          if (parsedCommand.attrs.duration) result.duration = parsedCommand.attrs.duration;
-		          continue;
-		        }
-		        const sectionMatch = line.match(/^([A-Za-z][A-Za-z0-9 _/-]{1,40}):\s*$/);
-		        if (sectionMatch) {
-		          pushSection();
-		          currentSection = { label: sectionMatch[1].trim(), lines: [] };
-		          continue;
-		        }
-		        if (!currentSection) currentSection = { label: "Details", lines: [] };
-		        currentSection.lines.push(line);
-		      }
-		      pushSection();
-		      return result;
-		    }
-
-		    function isControlToolName(name) {
-		      return /^ctc_[a-f0-9]{16,}$/i.test(String(name || "").trim());
-		    }
-
-		    function toolSectionIsPatch(section) {
-		      const label = String(section && section.label || "").toLowerCase();
-		      const text = String(section && section.text || "");
-		      return ["arguments", "input", "patch", "content"].includes(label) && /^\*\*\* Begin Patch/m.test(text);
-		    }
-
-		    function renderPatchText(text) {
-			      return String(text || "").split("\n").map((line) => {
-			        let cls = "context";
-		        if (/^\*\*\* (Begin Patch|End Patch|Update File:|Add File:|Delete File:|Move to:)/.test(line) || /^@@/.test(line)) {
-		          cls = "meta";
-		        } else if (/^\+/.test(line)) {
-		          cls = "add";
-		        } else if (/^-/.test(line)) {
-		          cls = "delete";
-		        }
-		        return `<span class="tool-patch-line ${cls}">${escapeHtml(line || " ")}</span>`;
-			      }).join("");
-			    }
-
-			    function parseToolJsonText(value) {
-			      const text = String(value || "").trim();
-			      if (!text) return null;
-			      if (/^[{[]/.test(text)) {
-			        try {
-			          return JSON.parse(text);
-			        } catch {
-			          return null;
-			        }
-			      }
-			      const lines = text.split("\n");
-			      const simple = {};
-			      for (const line of lines) {
-			        const match = line.match(/^([A-Za-z_][A-Za-z0-9_.-]*):\s*(.*)$/);
-			        if (!match) return null;
-			        simple[match[1]] = match[2];
-			      }
-			      return Object.keys(simple).length ? simple : null;
-			    }
-
-			    function toolSectionByLabel(parsed, labels) {
-			      const wanted = new Set(labels.map((label) => label.toLowerCase()));
-			      return (parsed.sections || []).find((section) => wanted.has(String(section.label || "").toLowerCase())) || null;
-			    }
-
-			    function toolPayloadFromLabels(parsed, labels) {
-			      const section = toolSectionByLabel(parsed, labels);
-			      return section ? parseToolJsonText(section.text) : null;
-			    }
-
-			    function toolSectionIsCollapsible(section) {
-			      const label = String(section && section.label || "").toLowerCase();
-			      const text = String(section && section.text || "");
-			      return ["arguments", "input", "parameters", "params", "content", "patch"].includes(label)
-			        && (text.includes("\n") || text.length > 180);
-			    }
-
-		    function summarizeToolSection(section, parsed) {
-			      const text = String(section && section.text || "");
-			      const payload = parseToolJsonText(text);
-			      const name = String(parsed && parsed.name || "").toLowerCase();
-			      if (payload && name === "update_plan" && Array.isArray(payload.plan)) {
-			        return `${payload.plan.length} plan step${payload.plan.length === 1 ? "" : "s"}`;
-			      }
-			      if (payload && name === "create_goal" && payload.objective) {
-			        return `objective: ${payload.objective}`;
-			      }
-			      if (payload && name === "update_goal" && payload.status) {
-			        return `status: ${payload.status}`;
-			      }
-			      if (payload && typeof payload.cmd === "string" && payload.cmd.trim()) return payload.cmd.trim();
-			      if (payload && typeof payload.command === "string" && payload.command.trim()) return payload.command.trim();
-			      const first = text.split("\n").map((line) => line.trim()).find(Boolean) || "";
-		      return first.length > 220 ? `${first.slice(0, 220).trim()}...` : first;
-		    }
-
-		    function patchSummary(text) {
-		      const files = [];
-		      let added = 0;
-		      let deleted = 0;
-		      for (const line of String(text || "").split("\n")) {
-		        const file = line.match(/^\*\*\* (Update|Add|Delete) File:\s*(.+)$/);
-		        if (file) {
-		          files.push({ operation: file[1].toLowerCase(), path: file[2].trim() });
-		          continue;
-		        }
-		        const moved = line.match(/^\*\*\* Move to:\s*(.+)$/);
-		        if (moved && files.length) files[files.length - 1].movedTo = moved[1].trim();
-		        if (/^\+(?!\+\+)/.test(line)) added += 1;
-		        if (/^-(?!---)/.test(line)) deleted += 1;
-		      }
-		      return { files, added, deleted };
-		    }
-
-		    function patchPreviewText(text, maxLines = 12) {
-		      const lines = String(text || "").split("\n");
-		      if (lines.length <= maxLines) return String(text || "");
-		      const preview = lines.slice(0, maxLines);
-		      preview.push("… patch preview truncated …");
-		      return preview.join("\n");
-		    }
-
-		    function renderPatchToolSummary(parsed) {
-		      const section = (parsed.sections || []).find((candidate) => toolSectionIsPatch(candidate));
-		      if (!section) return "";
-		      const source = toolSectionByLabel(parsed, ["Source"]);
-		      const summary = patchSummary(section.text);
-		      const fileBits = summary.files.slice(0, 2).map((file) => {
-		        const target = file.movedTo ? ` → ${file.movedTo}` : "";
-		        return `<span class="control-tool-patch-file">${escapeHtml(file.operation)} ${escapeHtml(file.path)}${escapeHtml(target)}</span>`;
-		      });
-		      if (summary.files.length > 2) fileBits.push(`<span>+${summary.files.length - 2} files</span>`);
-		      const changes = [
-		        summary.added ? `+${summary.added}` : "",
-		        summary.deleted ? `-${summary.deleted}` : ""
-		      ].filter(Boolean);
-		      return `
-		        <div class="control-tool-patch-summary">
-		          ${source ? `<span>via ${escapeHtml(source.text)}</span>` : ""}
-		          ${fileBits.join("")}
-		          ${changes.length ? `<span>${escapeHtml(changes.join(" / "))} lines</span>` : ""}
-		        </div>
-		      `;
-		    }
-
-		    function toolSectionNeedsExpansion(section, parsed) {
-		      if (!toolSectionIsCollapsible(section)) return false;
-		      return summarizeToolSection(section, parsed) !== String(section && section.text || "");
-		    }
-
-			    function renderPlanToolSummary(parsed) {
-			      const name = String(parsed.name || "").toLowerCase();
-			      const args = toolPayloadFromLabels(parsed, ["Arguments", "Input", "Parameters"]);
-			      const result = toolPayloadFromLabels(parsed, ["Result", "Output"]);
-			      if (name === "update_plan" && args && Array.isArray(args.plan)) {
-			        const explanation = args.explanation
-			          ? `<div class="control-tool-special-note">${escapeHtml(args.explanation)}</div>`
-			          : "";
-			        const rows = args.plan.map((item) => {
-			          const status = String(item && item.status || "pending");
-			          const statusClass = status.toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
-			          const label = status.replace(/_/g, " ");
-			          return `
-			            <div class="control-tool-plan-row">
-			              <span class="control-tool-plan-status ${escapeHtml(statusClass)}">${escapeHtml(label)}</span>
-			              <span>${escapeHtml(item && item.step || "")}</span>
-			            </div>
-			          `;
-			        }).join("");
-			        return `
-			          <div class="control-tool-special">
-			            <div class="control-tool-special-title">
-			              <span>Updated plan</span>
-			              <span>${escapeHtml(args.plan.length)} step${args.plan.length === 1 ? "" : "s"}</span>
-			            </div>
-			            ${explanation}
-			            <div class="control-tool-plan-list">${rows}</div>
-			          </div>
-			        `;
-			      }
-			      if (name === "create_goal" && args && args.objective) {
-			        const budget = args.token_budget || args.tokenBudget
-			          ? `<div class="control-tool-special-note">Budget: ${escapeHtml(args.token_budget || args.tokenBudget)} tokens</div>`
-			          : "";
-			        return `
-			          <div class="control-tool-special">
-			            <div class="control-tool-special-title"><span>Created goal</span></div>
-			            <div>${escapeHtml(args.objective)}</div>
-			            ${budget}
-			          </div>
-			        `;
-			      }
-			      if (name === "update_goal" && args && args.status) {
-			        const goal = result && result.goal && typeof result.goal === "object" ? result.goal : null;
-			        const usage = goal
-			          ? [
-			              goal.tokensUsed != null ? `Tokens: ${formatNumber(goal.tokensUsed)}` : "",
-			              goal.timeUsedSeconds != null ? `Time: ${formatAge(goal.timeUsedSeconds)}` : ""
-			            ].filter(Boolean).join(" / ")
-			          : "";
-			        return `
-			          <div class="control-tool-special">
-			            <div class="control-tool-special-title">
-			              <span>Goal status</span>
-			              <span>${escapeHtml(String(args.status))}</span>
-			            </div>
-			            ${goal && goal.objective ? `<div>${escapeHtml(goal.objective)}</div>` : ""}
-			            ${usage ? `<div class="control-tool-special-note">${escapeHtml(usage)}</div>` : ""}
-			          </div>
-			        `;
-			      }
-			      if (name === "get_goal" && result && result.goal) {
-			        const goal = result.goal;
-			        return `
-			          <div class="control-tool-special">
-			            <div class="control-tool-special-title">
-			              <span>Current goal</span>
-			              <span>${escapeHtml(goal.status || "active")}</span>
-			            </div>
-			            ${goal.objective ? `<div>${escapeHtml(goal.objective)}</div>` : ""}
-			          </div>
-			        `;
-			      }
-			      return "";
-			    }
-
-		    function renderToolSection(section, ownerKey, sectionIndex, expanded, parsed) {
-		      const isPatch = toolSectionIsPatch(section);
-		      const collapsed = toolSectionNeedsExpansion(section, parsed) && !expanded;
-		      const displayText = isPatch && collapsed
-		        ? patchPreviewText(section.text)
-		        : (collapsed ? summarizeToolSection(section, parsed) : section.text);
-		      const body = isPatch ? renderPatchText(displayText) : escapeHtml(displayText);
-		      const scrollKey = `${ownerKey}:section:${sectionIndex}:${section.label}`;
-		      return `
-		        <div class="control-tool-section${isPatch ? " patch" : ""}${collapsed ? " collapsed" : ""}">
-		          <span class="control-tool-section-label">${escapeHtml(isPatch && collapsed ? "Patch preview" : section.label)}</span>
-		          <pre data-control-inner-scroll="${escapeHtml(scrollKey)}">${body}</pre>
-		        </div>
-		      `;
-		    }
-
-	    function renderControlToolBlock(item, fallback, options = {}) {
-	      const key = controlMessageKey(item, fallback);
-	      const displayText = String(item.text || "");
-	      const fullText = String(item.full_text || "");
-	      const compact = Boolean(options.compact);
-	      if (isContextCompactionPacket(item)) {
-	        return `<div class="control-tool-block control-compaction-packet">${renderControlMessageText(item, fallback, { markdown: false, compact: true, compactionPacket: true })}</div>`;
-	      }
-	      const hasMore = Boolean(item.truncated || (fullText && fullText !== displayText));
-		      const expanded = Boolean(expandedControlMessages[key]);
-		      const text = expanded && fullText ? fullText : displayText;
-		      const parsed = parseToolActivityText(text);
-		      if (!parsed) {
-		        return `<div class="control-tool-block"><strong>Tool / command</strong>${renderControlMessageText(item, fallback, { markdown: false, compact })}</div>`;
-		      }
-		      if (parsed.kind === "tool" && isControlToolName(parsed.name) && !parsed.command && !parsed.sections.length) {
-		        return `
-		          <div class="control-tool-block control-signal">
-		            <div class="control-tool-summary">
-		              <span class="control-tool-title">Control signal <code>${escapeHtml(parsed.name)}</code></span>
-		              <span class="control-tool-status observed">observed</span>
-		            </div>
-		          </div>
-		        `;
-		      }
-		      const status = parsed.status || "observed";
-		      const statusClass = status.toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
-		      const summaryBits = [parsed.exit ? `exit ${parsed.exit}` : "", parsed.duration || ""].filter(Boolean);
-			      const summary = summaryBits.length ? `<span>${escapeHtml(summaryBits.join(" / "))}</span>` : "";
-		      const special = renderPlanToolSummary(parsed) + renderPatchToolSummary(parsed);
-			      const command = parsed.command
-			        ? `<div class="control-tool-command">${escapeHtml(parsed.command)}</div>`
-			        : "";
-		      const hasCollapsedSections = parsed.sections.some((section) => toolSectionNeedsExpansion(section, parsed));
-			      const sections = parsed.sections.length
-			        ? `<div class="control-tool-sections">${parsed.sections.map((section, sectionIndex) => renderToolSection(section, key, sectionIndex, expanded, parsed)).join("")}</div>`
-			        : "";
-		      const hasPatch = parsed.sections.some((section) => toolSectionIsPatch(section));
-		      const button = hasMore || hasCollapsedSections
-		        ? `<button class="control-show-more" type="button" data-message-key="${escapeHtml(key)}">${expanded ? "Show less" : (hasPatch ? "Show full patch" : "Show more")}</button>`
-			        : "";
-		      return `
-		        <div class="control-tool-block">
-		          <div class="control-tool-summary">
-		            <span class="control-tool-title">${escapeHtml(parsed.kind === "command" ? "Command" : "Tool")} <code>${escapeHtml(parsed.name || parsed.command || "tool")}</code></span>
-		            <span class="control-tool-status ${escapeHtml(statusClass)}">${escapeHtml(status)}</span>
-			          </div>
-			          ${summary}
-			          ${special}
-			          ${command}
-			          ${sections}
-			          ${button}
-		        </div>
-		      `;
-		    }
-
-	    function renderControlMessageText(item, fallback, options = {}) {
-	      const key = controlMessageKey(item, fallback);
-	      const role = String(item.role || "");
-	      const displayText = normalizeControlMessageTextForDisplay(item.text, role);
-	      const fullText = normalizeControlMessageTextForDisplay(item.full_text, role);
-	      const compact = Boolean(options.compact);
-	      const compactionPacket = Boolean(options.compactionPacket) || isContextCompactionPacket(item);
-	      const hasMore = Boolean(
-	        item.truncated
-	        || (fullText && fullText !== displayText)
-	        || (compact && compactControlMessageNeedsExpansion(displayText))
-	      );
-	      const expanded = Boolean(expandedControlMessages[key]);
-	      const text = expanded && fullText ? fullText : displayText;
-	      const useMarkdown = options.markdown !== false && role !== "tool" && role !== "error";
-	      const className = `control-message-text ${useMarkdown ? "markdown" : "plain"}${expanded ? " expanded" : ""}`;
-	      const body = compactionPacket && !expanded
-	        ? '<div class="control-compaction-summary">Context compacted. The post-compaction packet is hidden by default.</div>'
-	        : (useMarkdown
-	          ? cachedMarkdownRender(`${role}\u0001${text}`, () => {
-	              const jsonBody = renderJsonControlMessage(text);
-	              return jsonBody || renderMarkdown(text);
-	            })
-	          : escapeHtml(text));
-	      const button = compactionPacket && (displayText || fullText)
-	        ? `<button class="control-show-more control-show-compaction-packet" type="button" data-message-key="${escapeHtml(key)}">${expanded ? "Hide post-compaction packet" : "Show post-compaction packet"}</button>`
-	        : (hasMore
-	          ? `<button class="control-show-more" type="button" data-message-key="${escapeHtml(key)}">${expanded ? "Show less" : "Show more"}</button>`
-	          : "");
-	      return `<div class="${className}" data-control-inner-scroll="${escapeHtml(`${key}:message`)}">${body}</div>${button}`;
-	    }
-
-	    function controlTranscriptGroups(items) {
-	      const groups = [];
-	      for (const item of items) {
-	        const role = String(item.role || "message");
-	        if (role === "assistant_progress" || role === "tool") {
-	          const turn = String(item.turn_id || "");
-	          const last = groups[groups.length - 1];
-	          if (turn && last && last.kind === "assistant_activity" && String(last.turn_id || "") === turn) {
-	            last.items.push(item);
-	            last.updated_at = item.updated_at || item.ts || last.updated_at;
-	          } else {
-	            groups.push({
-	              kind: "assistant_activity",
-	              role: "assistant_progress",
-	              turn_id: turn,
-	              ts: item.ts,
-	              updated_at: item.updated_at || item.ts,
-	              items: [item]
-	            });
-	          }
-	        } else {
-	          groups.push({ kind: "message", item });
-	        }
-	      }
-	      return groups;
-	    }
-
-	    function controlMessageRoleLabel(role) {
-	      if (role === "resume") return "resumed context";
-	      if (role === "context_compaction") return "context compaction";
-	      if (role === "assistant_progress") return "assistant activity";
-	      if (role === "tool") return "tool / command";
-	      if (role === "user_pending") return "user";
-	      return role;
-	    }
-
-	    function controlTurnMarkup(item) {
-	      const turnId = String(item && item.turn_id || "");
-	      if (turnId) return ` / ${escapeHtml(turnId)}`;
-	      if (String(item && item.role || "") === "user_pending") {
-	        return ` <span class="control-message-turn">/ <span class="control-message-spinner" aria-hidden="true"></span>pending</span>`;
-	      }
-	      return "";
-	    }
-
-	    function renderControlTranscriptGroup(group, index, total) {
-	      const compact = index < Math.max(0, total - 5) ? " compact" : "";
-	      if (group.kind === "assistant_activity") {
-	        const turn = group.turn_id ? ` / ${group.turn_id}` : "";
-	        const body = group.items.map((item, itemIndex) => {
-	          const role = String(item.role || "");
-	          if (role === "tool") {
-	            return renderControlToolBlock(item, `activity-${index}-${itemIndex}`, { compact: Boolean(compact) });
-	          }
-	          return renderControlMessageText(item, `activity-${index}-${itemIndex}`, { compact: Boolean(compact) });
-	        }).join("");
-	        return `
-	          <article class="control-message assistant_activity assistant_progress${compact}" data-transcript-index="${index}">
-	            <div class="control-message-head">
-	              <span>assistant activity${escapeHtml(turn)}</span>
-	              <span>${escapeHtml(formatEventTime(group.updated_at || group.ts))}</span>
-	            </div>
-	            <div class="control-activity-parts">${body}</div>
-	          </article>
-	        `;
-	      }
-	      const item = group.item;
-	      const role = String(item.role || "message");
-	      const displayRole = controlMessageRoleLabel(role);
-	      const compactionPacket = isContextCompactionPacket(item);
-	      const compactByDefault = compactionPacket;
-	      const messageCompact = Boolean(compact) || compactByDefault;
-	      const compactClass = messageCompact ? " compact" : "";
-	      return `
-	        <article class="control-message ${escapeHtml(role)}${compactClass}" data-transcript-index="${index}">
-	          <div class="control-message-head">
-	            <span>${escapeHtml(displayRole)}${controlTurnMarkup(item)}</span>
-	            <span>${escapeHtml(formatEventTime(item.updated_at || item.ts))}</span>
-	          </div>
-	          ${renderControlMessageText(item, `message-${index}`, { compact: messageCompact, compactionPacket })}
-	        </article>
-	      `;
-	    }
-
-	    function renderControlTranscript(session) {
-	      const transcript = Array.isArray(session.transcript) ? session.transcript.slice() : [];
-	      const turns = controlTurns(session, transcript);
-	      if (!transcript.length && !turns.length) {
-	        return '<div class="control-empty">No discussion text captured for this session yet</div>';
-	      }
-	      const turn = selectedTurnForSession(session, transcript);
-	      if (!turn) {
-	        return '<div class="control-empty">No observed turns for this session yet</div>';
-	      }
-	      if (controlSearchText && !turnMatchesSearch(transcript, turn, controlSearchText, session)) {
-	        return '<div class="control-empty">No observed turns match the current search</div>';
-	      }
-	      let visible = [];
-	      let sourceNote = "";
-	      let boundaryOffsets = [];
-	      let priorTurnMarkup = "";
-	      if (turn.source === "history") {
-	        const payload = historyTurnPayload(session, turn);
-	        if (!payload) {
-	          requestHistoryTurn(session, turn);
-	          return '<div class="control-empty">Loading Codex session history for the selected turn...</div>';
-	        }
-	        visible = Array.isArray(payload.transcript) ? payload.transcript.slice() : [];
-	        sourceNote = '<div class="control-transcript-window-note">Loaded from Codex session history.</div>';
-	      } else {
-	        if (observedTurnNeedsLoad(session, turn)) {
-	          requestObservedTurn(session, turn);
-	          return '<div class="control-empty">Loading earlier observed discussion for this turn...</div>';
-	        }
-	        const presentation = controlTurnPresentation(session, transcript, turn);
-	        const activeTurn = presentation ? presentation.active : turn;
-	        if (observedTurnNeedsLoad(session, activeTurn)) {
-	          requestObservedTurn(session, activeTurn);
-	          return '<div class="control-empty">Loading earlier observed discussion for this turn...</div>';
-	        }
-	        visible = turnTranscriptItems(session, transcript, activeTurn);
-	        const activePayload = observedTurnPayload(session, activeTurn);
-	        if (activePayload && activePayload.has_more_before) {
-	          const before = Number(activePayload.next_before_index);
-	          sourceNote = `<div class="control-transcript-window-note">Earlier observed discussion is available.</div><button class="control-transcript-window-button" type="button" data-control-turn-more="${escapeHtml(controlTurnKey(activeTurn))}" data-control-turn-before="${escapeHtml(before)}">Show earlier discussion</button>`;
-	        }
-	        if (presentation && presentation.pending) {
-	          const activeIndex = presentation.turns.findIndex((candidate) => controlTurnKey(candidate) === controlTurnKey(activeTurn));
-	          const pendingIndex = presentation.turns.findIndex((candidate) => controlTurnKey(candidate) === controlTurnKey(presentation.pending));
-	          const bridgeTurns = activeIndex >= 0 && pendingIndex >= activeIndex
-	            ? presentation.turns.slice(activeIndex, pendingIndex + 1)
-	            : [activeTurn, presentation.pending];
-	          visible = [];
-	          for (const [index, bridgeTurn] of bridgeTurns.entries()) {
-	            if (index > 0) boundaryOffsets.push(controlTranscriptGroups(visible).length);
-	            visible = visible.concat(turnTranscriptItems(session, transcript, bridgeTurn));
-	          }
-	        } else if (presentation && presentation.state.revealedKey) {
-	          const prior = controlTurnByKey(presentation.turns, presentation.state.revealedKey);
-	          const priorItems = prior ? turnTranscriptItems(session, transcript, prior) : [];
-	          const nextItems = turnTranscriptItems(session, transcript, activeTurn);
-	          visible = priorItems.concat(nextItems);
-	          boundaryOffsets = [controlTranscriptGroups(priorItems).length];
-	        } else if (presentation && presentation.state.hiddenKey) {
-	          const prior = controlTurnByKey(presentation.turns, presentation.state.hiddenKey);
-	          if (prior) {
-	            priorTurnMarkup = `
-	              <div class="control-prior-turn">
-	                <span>Previous turn is compacted for performance.</span>
-	                <span class="control-prior-turn-actions">
-	                  <button type="button" data-control-prior-show="${escapeHtml(controlTurnKey(prior))}">Show more</button>
-	                  <button type="button" data-control-prior-open="${escapeHtml(controlTurnKey(prior))}">Open previous turn</button>
-	                </span>
-	              </div>
-	            `;
-	          }
-	        }
-	        const pending = transcript.filter((item) => String(item.role || "") === "user_pending" && !visible.includes(item));
-	        if (pending.length) visible = visible.concat(pending);
-	      }
-	      if (controlSearchText) {
-	        const matched = visible.filter((item) => controlTranscriptMatches(item, controlSearchText));
-	        if (!matched.length && !String(turn.label || "").toLowerCase().includes(controlSearchText.toLowerCase())) {
-	          return '<div class="control-empty">No discussion entries in this turn match the current search</div>';
-	        }
-	      }
-	      const groups = controlTranscriptGroups(visible);
-	      const bridgeVisible = boundaryOffsets.length > 0;
-	      const transcriptWindow = bridgeVisible
-	        ? { start: 0, end: groups.length }
-	        : controlTranscriptWindow(groups.length);
-	      const windowedGroups = groups.slice(transcriptWindow.start, transcriptWindow.end);
-	      const olderButton = transcriptWindow.start > 0
-	        ? `<button class="control-transcript-window-button" type="button" data-control-window="above">Show ${Math.min(CONTROL_TRANSCRIPT_WINDOW_STEP, transcriptWindow.start)} older entries</button>`
-	        : "";
-	      const newerButton = transcriptWindow.end < groups.length
-	        ? `<button class="control-transcript-window-button" type="button" data-control-window="below">Show ${Math.min(CONTROL_TRANSCRIPT_WINDOW_STEP, groups.length - transcriptWindow.end)} newer entries</button>`
-	        : "";
-	      const matchedTurns = controlSearchText
-	        ? controlTurns(session, transcript).filter((candidate) => turnMatchesSearch(transcript, candidate, controlSearchText, session)).length
-	        : 0;
-	      const searchNote = matchedTurns > 1
-	        ? `<div class="control-transcript-window-note">${matchedTurns} turns match. Use the turn selector to navigate.</div>`
-	        : "";
-	      return `
-	        ${searchNote}
-	        ${sourceNote}
-	        ${priorTurnMarkup}
-	        <div class="control-transcript" data-total="${groups.length}" data-hidden-above="${transcriptWindow.start}" data-hidden-below="${groups.length - transcriptWindow.end}">
-	          ${olderButton}
-	          ${windowedGroups.map((group, offset) => {
-	            const index = transcriptWindow.start + offset;
-	            const boundary = bridgeVisible && boundaryOffsets.includes(index)
-	              ? '<div class="control-turn-boundary" data-control-turn-boundary>New turn</div>'
-	              : "";
-	            return `${boundary}${renderControlTranscriptGroup(group, index, groups.length)}`;
-	          }).join("")}
-	          ${bridgeVisible && boundaryOffsets.includes(groups.length) ? '<div class="control-turn-boundary" data-control-turn-boundary>New turn</div>' : ""}
-	          ${newerButton}
-	        </div>
-	      `;
-	    }
-
-	    function renderControlEvents(session) {
-	      const events = Array.isArray(session.events) ? session.events.slice().reverse() : [];
-	      if (!events.length) {
-	        return '<div class="control-empty">No recorded activity for this session yet</div>';
-	      }
-	      return `<div class="control-events">${events.map((event) => {
-	        const summary = event.summary || statsEventText(event);
-	        const profile = event.profile ? `<span>Profile: ${escapeHtml(event.profile)}</span>` : "";
-	        const type = event.type ? `<span>Type: ${escapeHtml(event.type)}</span>` : "";
-	        const tier = event.service_tier ? `<span>Tier: ${escapeHtml(event.service_tier)}</span>` : "";
-	        return `
-	          <div class="control-event compact">
-	            <span>${escapeHtml(formatEventTime(event.ts))}</span>
-	            <div class="control-event-detail">
-	              <strong>${escapeHtml(summary)}</strong>
-	              ${profile}
-	              ${type}
-	              ${tier}
-	            </div>
-	          </div>
-	        `;
-	      }).join("")}</div>`;
-	    }
-
-	    function sessionAssociatedProfile(session) {
-	      return String((session && (session.associated_profile || session.pinned_profile || session.last_profile)) || "");
-	    }
-
-	    function sessionIsLive(session) {
-	      if (!session) return false;
-	      if (session.pty_control_available || session.ui_launcher_running || session.active) return true;
-	      if (Number(session.active_requests || 0) > 0) return true;
-	      if (Number(session.active_tunnels || 0) > 0) return true;
-	      if (Number(session.pending_websocket_work || 0) > 0) return true;
-	      return false;
-	    }
-
-	    function updateControlHeaderActions(session) {
-	      const turnSelect = document.getElementById("controlTurnSelect");
-	      const forget = document.getElementById("controlForget");
-	      if (!turnSelect || !forget) return;
-	      const connected = socket && socket.readyState === WebSocket.OPEN;
-	      const turns = session ? controlTurns(session, Array.isArray(session.transcript) ? session.transcript : []) : [];
-	      if (!controlTurnSelectInteracting && document.activeElement !== turnSelect) {
-	        const nextOptions = session ? renderControlTurnOptions(session) : '<option value="">No observed turns</option>';
-	        turnSelect.innerHTML = nextOptions;
-	      }
-	      turnSelect.disabled = !turns.length;
-	      turnSelect.hidden = controlView !== "discussion";
-	      forget.disabled = !connected || !session;
-	      forget.title = sessionIsLive(session)
-	        ? "Close the associated launcher and forget this live session"
-	        : "Forget this idle observed session";
-	    }
-
-	    function sendLaunchSession(sessionKey, mode, sessionId = "") {
-	      if (!sessionKey || !socket || socket.readyState !== WebSocket.OPEN) return;
-	      const sessions = controlSessions({ control_plane: latestControlPlane });
-	      const session = sessions.find((item) => item.key === sessionKey) || {};
-	      socket.send(JSON.stringify({
-	        action: "launch_session",
-	        session_key: sessionKey,
-	        profile: sessionAssociatedProfile(session),
-	        mode,
-	        session_id: sessionId,
-	        permission: launcherPermission,
-	        token: TOKEN
-	      }));
-	    }
-
-	    function selectedResumeCandidateId(session) {
-	      const key = String(session && session.key || selectedControlSessionKey || "");
-	      const candidates = resumeCandidatesForSession(session);
-	      const selected = selectedResumeCandidateIds[key] || "";
-	      if (selected && candidates.some((candidate) => String(candidate.id || "") === selected)) return selected;
-	      const fallback = candidates.length ? String(candidates[0].id || "") : "";
-	      selectedResumeCandidateIds[key] = fallback;
-	      return fallback;
-	    }
-
-	    function renderResumePane(session) {
-	      const candidates = resumeCandidatesForSession(session);
-	      if (!candidates.length) {
-	        return '<div class="control-empty">No resumable Codex CLI sessions were found for this workdir.</div>';
-	      }
-	      const selectedId = selectedResumeCandidateId(session);
-	      const rows = candidates.map((candidate) => {
-	        const id = String(candidate.id || "");
-	        const when = candidate.timestamp ? formatEventTime(candidate.timestamp) : "";
-	        const selected = id === selectedId ? " selected" : "";
-	        const label = candidate.label || id;
-	        return `
-	          <button class="control-resume-item${selected}" type="button" data-resume-candidate="${escapeHtml(id)}">
-	            <span class="control-resume-main">
-	              <span class="control-resume-label">${escapeHtml(label)}</span>
-	              <span class="control-resume-meta">${escapeHtml([when, id].filter(Boolean).join(" / "))}</span>
-	            </span>
-	            <span class="badge">${id === selectedId ? "Selected" : "Choose"}</span>
-	          </button>
-	        `;
-	      }).join("");
-	      const disabled = !selectedId || !socket || socket.readyState !== WebSocket.OPEN ? "disabled" : "";
-	      return `
-	        <section class="control-detail-section">
-	          <h3>Resume Session</h3>
-	          <div class="control-section-body">
-	            <div class="control-resume-list">${rows}</div>
-	            <div class="control-resume-actions">
-	              <button type="button" data-resume-action="resume-session" ${disabled}>Resume</button>
-	              <button type="button" data-resume-action="fork-session" ${disabled}>Fork</button>
-	            </div>
-	          </div>
-	        </section>
-	      `;
-	    }
-
-	    function renderControlModal(force = false) {
-	      const modal = document.getElementById("controlModal");
-	      if (!modal || modal.hidden) return;
-	      if (!force && controlRenderShouldDefer()) {
-	        if (!controlRenderDeferredAt) controlRenderDeferredAt = Date.now();
-	        if (Date.now() - controlRenderDeferredAt < 2000) {
-	          pendingControlRender = true;
-	          scheduleControlRenderFlush();
-	          return;
-	        }
-	      }
-	      controlRenderDeferredAt = 0;
-	      const session = selectedControlSession();
-	      if (!session) {
-	        modal.hidden = true;
-	        resetMobileComposerFocus();
-	        syncDiscussionPaneVisibility();
-	        renderMobileControlStatus(null);
-	        return;
-	      }
-	      if (controlView !== "discussion" && mobileDiscussionFocused) {
-	        resetMobileDiscussionFocus();
-	      }
-	      if (controlView !== "discussion") resetMobileComposerFocus();
-	      syncDiscussionPaneVisibility();
-	      requestHistoryIndex(session);
-	      if (controlView === "resume") requestResumeCandidates(session);
-	      updateControlDockGeometry();
-	      document.getElementById("controlTitle").textContent = String(session.cwd || session.display || sessionTitle(session));
-	      const active = Number(session.active_requests || 0);
-	      const tunnels = Number(session.active_tunnels || 0);
-	      const pending = Number(session.pending_websocket_work || 0);
-	      const recent = Number(session.recent_websocket_activity || 0);
-	      const associatedProfile = sessionAssociatedProfile(session) || "unknown";
-	      const activeState = recent || pending || active || tunnels ? "Active" : "Idle";
-	      const pills = [
-	        `<span class="pill">${escapeHtml(session.pinned_profile ? `Pinned ${session.pinned_profile}` : `Profile ${associatedProfile}`)}</span>`,
-	        `<span class="pill">Requests <strong>${active}</strong></span>`,
-	        `<span class="pill">Tunnels <strong>${tunnels}</strong></span>`,
-	        `<span class="pill">Turns <strong>${pending}</strong></span>`,
-	        `<span class="pill">${activeState}</span>`
-	      ];
-	      if (session.context && session.context.label) {
-	        const contextTitle = [
-	          session.context.input_tokens ? `${formatNumber(session.context.input_tokens)} input tokens` : "",
-	          session.context.remaining_tokens ? `${formatNumber(session.context.remaining_tokens)} tokens remaining` : "",
-	          session.context.updated_at ? `Updated ${formatEventTime(session.context.updated_at)}` : ""
-	        ].filter(Boolean).join(" / ");
-	        pills.push(`<span class="pill" title="${escapeHtml(contextTitle)}">Context <strong>${escapeHtml(session.context.label)}</strong></span>`);
-	      }
-	      if (session.quota_compact_html) pills.push(String(session.quota_compact_html));
-	      document.getElementById("controlStatusPills").innerHTML = pills.join("");
-	      renderMobileControlStatus(session);
-	      const panel = modal.querySelector(".control-modal");
-	      if (panel) {
-	        panel.classList.toggle("details-view", controlView === "details");
-	        panel.classList.toggle("resume-view", controlView === "resume");
-	        panel.classList.toggle("discussion-view", controlView === "discussion");
-	      }
-	      document.querySelectorAll("[data-control-view]").forEach((button) => {
-	        button.classList.toggle("active", button.dataset.controlView === controlView);
-	        button.setAttribute("aria-selected", button.dataset.controlView === controlView ? "true" : "false");
-	      });
-	      const content = document.getElementById("controlContent");
-	      const nextScrollKey = controlScrollKey();
-	      const sameScrollSurface = renderedControlScrollKey === nextScrollKey;
-	      const shouldFollowDiscussion = !preserveControlScrollOnNextRender
-	        && controlView === "discussion"
-	        && !controlSearchText
-	        && (!sameScrollSurface || controlContentAtBottom(content));
-	      if (sameScrollSurface) {
-	        saveControlScroll();
-	        saveControlInnerScroll();
-	      }
-	      if (controlView === "details") {
-	        content.innerHTML = `
-	          <section class="control-detail-section">
-	            <h3>Active Turn State</h3>
-	            <div class="control-section-body">${renderControlActiveDetails(session)}</div>
-	          </section>
-	          <section class="control-detail-section">
-	            <h3>Session Activity</h3>
-	            <div class="control-section-body">${renderControlEvents(session)}</div>
-	          </section>
-	        `;
-	      } else if (controlView === "resume") {
-	        content.innerHTML = renderResumePane(session);
-	      } else {
-	        content.innerHTML = renderControlTranscript(session);
-	      }
-	      normalizeNativeTooltips(modal);
-	      renderedControlScrollKey = nextScrollKey;
-	      if (shouldFollowDiscussion) {
-	        content.scrollTop = content.scrollHeight;
-	      } else {
-	        restoreControlScroll();
-	      }
-	      requestAnimationFrame(restoreControlInnerScroll);
-	      updateControlComposeState(session);
-	      updateControlHeaderActions(session);
-	      requestAnimationFrame(() => {
-	        updateControlScrollBadges();
-	        finalizeControlTurnBridgeIfScrolledAway();
-	      });
-	      preserveControlScrollOnNextRender = false;
-	      pendingControlRender = false;
-	    }
-
-	    function statsProfileColor(index) {
-	      const colors = ["#d83434", "#198754", "#2563eb", "#b7791f", "#7c3aed", "#0891b2", "#be185d"];
-	      return colors[index % colors.length];
-	    }
-
-	    function statsProfiles(stats) {
-	      const names = new Set();
-	      for (const profile of Array.isArray(stats.profiles) ? stats.profiles : []) {
-	        if (profile && profile.profile) names.add(String(profile.profile));
-	      }
-	      for (const point of Array.isArray(stats.series) ? stats.series : []) {
-	        if (point && point.profile) names.add(String(point.profile));
-	      }
-	      return Array.from(names).sort();
-	    }
-
-	    function syncStatsVisibleProfiles(profiles) {
-	      for (const profile of profiles) {
-	        if (!(profile in statsVisibleProfiles)) statsVisibleProfiles[profile] = true;
-	      }
-	    }
-
-	    function renderStatsGraph(stats, profiles) {
-	      const series = Array.isArray(stats.series) ? stats.series : [];
-	      const activeProfiles = profiles.filter((profile) => statsVisibleProfiles[profile]);
-	      const points = series
-	        .filter((point) => activeProfiles.includes(String(point.profile || "")))
-	        .map((point) => ({
-	          profile: String(point.profile || "unknown"),
-	          ts: Date.parse(point.ts || ""),
-	          value: Number(point.value || 0),
-	          tokens: Number(point.tokens || 0),
-	          traffic: Number(point.traffic || 0),
-	          requests: Number(point.requests || 0),
-	          quotaUpdates: Number(point.quota_updates || 0)
-	        }))
-	        .filter((point) => Number.isFinite(point.ts) && Number.isFinite(point.value));
-	      if (!points.length) {
-	        return '<div class="stats-graph-empty">No usage activity recorded yet</div>';
-	      }
-	      const minTs = Math.min(...points.map((point) => point.ts));
-	      const maxTs = Math.max(...points.map((point) => point.ts));
-	      const maxValue = Math.max(1, ...points.map((point) => point.value));
-	      const width = 1000;
-	      const height = 230;
-	      const padLeft = 54;
-	      const padRight = 24;
-	      const padTop = 22;
-	      const padBottom = 34;
-	      const plotRight = width - padRight;
-	      const plotBottom = height - padBottom;
-	      const usableWidth = width - padLeft - padRight;
-	      const usableHeight = height - padTop - padBottom;
-	      const xFor = (ts) => padLeft + (maxTs === minTs ? usableWidth : ((ts - minTs) / (maxTs - minTs)) * usableWidth);
-	      const yFor = (value) => padTop + usableHeight - (value / maxValue) * usableHeight;
-	      const timeLabel = (ts) => new Date(ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
-	      const yTicks = [0, maxValue / 2, maxValue];
-	      const xTicks = maxTs === minTs ? [minTs] : [minTs, minTs + (maxTs - minTs) / 2, maxTs];
-	      const yGrid = yTicks.map((value) => {
-	        const y = yFor(value);
-	        return `
-	          <path class="stats-graph-grid" d="M${padLeft} ${y.toFixed(1)}H${width - padRight}"></path>
-	          <text class="stats-graph-label" x="${padLeft - 8}" y="${(y + 4).toFixed(1)}" text-anchor="end">${escapeHtml(formatNumber(Math.round(value)))}</text>
-	        `;
-	      }).join("");
-	      const xGrid = xTicks.map((ts) => {
-	        const x = xFor(ts);
-	        return `
-	          <path class="stats-graph-grid" d="M${x.toFixed(1)} ${padTop}V${height - padBottom}"></path>
-	          <text class="stats-graph-label" x="${x.toFixed(1)}" y="${height - 10}" text-anchor="${ts === minTs ? "start" : ts === maxTs ? "end" : "middle"}">${escapeHtml(timeLabel(ts))}</text>
-	        `;
-	      }).join("");
-	      const referenceY = yFor(maxValue);
-	      const reference = `
-	        <path class="stats-graph-reference" d="M${padLeft} ${referenceY.toFixed(1)}H${width - padRight}"></path>
-	        <text class="stats-graph-label" x="${width - padRight}" y="${(referenceY - 6).toFixed(1)}" text-anchor="end">peak ${escapeHtml(formatNumber(Math.round(maxValue)))}</text>
-	      `;
-	      const grouped = new Map();
-	      for (const point of points) {
-	        if (!grouped.has(point.profile)) grouped.set(point.profile, []);
-	        grouped.get(point.profile).push(point);
-	      }
-	      const lines = Array.from(grouped.entries()).map(([profile, rows]) => {
-	        const profileIndex = profiles.indexOf(profile);
-	        const color = statsProfileColor(profileIndex < 0 ? 0 : profileIndex);
-	        const sorted = rows.slice().sort((a, b) => a.ts - b.ts);
-	        const path = sorted.map((point, index) => {
-	          const x = xFor(point.ts);
-	          const y = yFor(point.value);
-	          return `${index ? "L" : "M"}${x.toFixed(1)} ${y.toFixed(1)}`;
-	        }).join(" ");
-	        const latest = sorted[sorted.length - 1];
-	        const marker = latest
-	          ? `<circle class="stats-graph-marker" cx="${xFor(latest.ts).toFixed(1)}" cy="${yFor(latest.value).toFixed(1)}" r="4.2" fill="${color}"></circle>`
-	          : "";
-	        return `
-	          <path d="${path}" fill="none" stroke="${color}" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"></path>
-	          ${marker}
-	        `;
-	      }).join("");
-	      const interactivePoints = points.map((point) => {
-	        const profileIndex = profiles.indexOf(point.profile);
-	        return {
-	          profile: point.profile,
-	          ts: point.ts,
-	          time: timeLabel(point.ts),
-	          value: point.value,
-	          tokens: point.tokens,
-	          traffic: point.traffic,
-	          requests: point.requests,
-	          quotaUpdates: point.quotaUpdates,
-	          x: xFor(point.ts),
-	          y: yFor(point.value),
-	          color: statsProfileColor(profileIndex < 0 ? 0 : profileIndex)
-	        };
-	      });
-	      return `
-	        <svg class="stats-graph-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Profile usage trend" data-points="${escapeHtml(JSON.stringify(interactivePoints))}" data-width="${width}" data-height="${height}" data-plot-left="${padLeft}" data-plot-right="${plotRight}" data-plot-top="${padTop}" data-plot-bottom="${plotBottom}">
-	          ${yGrid}
-	          ${xGrid}
-	          <path class="stats-graph-axis" d="M${padLeft} ${height - padBottom}H${width - padRight}"></path>
-	          <path class="stats-graph-axis" d="M${padLeft} ${padTop}V${height - padBottom}"></path>
-	          ${reference}
-	          ${lines}
-	        </svg>
-	        <div class="stats-graph-cursor" hidden></div>
-	        <div class="stats-graph-hover-dot" hidden></div>
-	        <div class="stats-graph-tooltip" hidden></div>
-	      `;
-	    }
-
-	    function statsGraphData(graph) {
-	      const svg = graph ? graph.querySelector(".stats-graph-svg") : null;
-	      if (!svg) return null;
-	      let points = [];
-	      try {
-	        points = JSON.parse(svg.dataset.points || "[]");
-	      } catch {
-	        points = [];
-	      }
-	      if (!Array.isArray(points) || !points.length) return null;
-	      const bounds = svg.getBoundingClientRect();
-	      const width = Number(svg.dataset.width || 1000);
-	      const height = Number(svg.dataset.height || 230);
-	      if (!bounds.width || !bounds.height || !width || !height) return null;
-	      const plot = {
-	        left: Number(svg.dataset.plotLeft || 0),
-	        right: Number(svg.dataset.plotRight || width),
-	        top: Number(svg.dataset.plotTop || 0),
-	        bottom: Number(svg.dataset.plotBottom || height)
-	      };
-	      return { svg, points, bounds, width, height, plot };
-	    }
-
-	    function nearestStatsPoint(graph, clientX, clientY) {
-	      const data = statsGraphData(graph);
-	      if (!data) return null;
-	      const x = ((clientX - data.bounds.left) / data.bounds.width) * data.width;
-	      const y = ((clientY - data.bounds.top) / data.bounds.height) * data.height;
-	      if (
-	        x < data.plot.left ||
-	        x > data.plot.right ||
-	        y < data.plot.top ||
-	        y > data.plot.bottom
-	      ) {
-	        return null;
-	      }
-	      let best = null;
-	      let bestScore = Infinity;
-	      for (const point of data.points) {
-	        const dx = Number(point.x || 0) - x;
-	        const dy = Number(point.y || 0) - y;
-	        const score = Math.abs(dx) * 2 + Math.abs(dy);
-	        if (score < bestScore) {
-	          best = point;
-	          bestScore = score;
-	        }
-	      }
-	      if (!best) return null;
-	      return { point: best, data };
-	    }
-
-	    function statsGraphTooltipHtml(point) {
-	      const traffic = Number(point.traffic || 0);
-	      const value = Number(point.value || 0);
-	      const tokens = Number(point.tokens || 0);
-	      const pieces = [
-	        `<strong>${escapeHtml(point.profile || "unknown")}</strong>`,
-	        `<span>${escapeHtml(point.time || "")}</span>`
-	      ];
-	      if (tokens) pieces.push(`<span>Tokens: ${escapeHtml(formatNumber(tokens))}</span>`);
-	      if (value && value !== tokens) pieces.push(`<span>Trend value: ${escapeHtml(formatNumber(value))}</span>`);
-	      if (traffic) pieces.push(`<span>Traffic: ${escapeHtml(formatBytes(traffic))}</span>`);
-	      if (Number(point.requests || 0)) pieces.push(`<span>Requests: ${escapeHtml(formatNumber(point.requests))}</span>`);
-	      if (Number(point.quotaUpdates || 0)) pieces.push(`<span>Quota updates: ${escapeHtml(formatNumber(point.quotaUpdates))}</span>`);
-	      return pieces.join("");
-	    }
-
-	    function updateStatsGraphHover(graph, event) {
-	      const nearest = nearestStatsPoint(graph, event.clientX, event.clientY);
-	      if (!nearest) {
-	        hideStatsGraphHover(graph);
-	        return;
-	      }
-	      const { point, data } = nearest;
-	      const cursor = graph.querySelector(".stats-graph-cursor");
-	      const dot = graph.querySelector(".stats-graph-hover-dot");
-	      const tooltip = graph.querySelector(".stats-graph-tooltip");
-	      if (!cursor || !dot || !tooltip) return;
-	      const left = (Number(point.x || 0) / data.width) * data.bounds.width;
-	      const top = (Number(point.y || 0) / data.height) * data.bounds.height;
-	      cursor.hidden = false;
-	      dot.hidden = false;
-	      tooltip.hidden = false;
-	      cursor.style.left = `${left}px`;
-	      dot.style.left = `${left}px`;
-	      dot.style.top = `${top}px`;
-	      dot.style.background = point.color || "";
-	      tooltip.innerHTML = statsGraphTooltipHtml(point);
-	      const tooltipWidth = tooltip.offsetWidth || 220;
-	      const tooltipHeight = tooltip.offsetHeight || 96;
-	      const preferredLeft = left > data.bounds.width * 0.58 ? left - tooltipWidth - 12 : left + 12;
-	      const tooltipLeft = Math.max(8, Math.min(data.bounds.width - tooltipWidth - 8, preferredLeft));
-	      const tooltipTop = Math.max(8, Math.min(data.bounds.height - tooltipHeight - 8, top - 42));
-	      tooltip.style.left = `${tooltipLeft}px`;
-	      tooltip.style.top = `${tooltipTop}px`;
-	    }
-
-	    function hideStatsGraphHover(graph) {
-	      for (const selector of [".stats-graph-cursor", ".stats-graph-hover-dot", ".stats-graph-tooltip"]) {
-	        const node = graph ? graph.querySelector(selector) : null;
-	        if (node) node.hidden = true;
-	      }
-	    }
-
-		    function setStatsOpen(open) {
-		      const modal = document.getElementById("statsModal");
-		      const toggle = document.getElementById("statsToggle");
-		      if (!modal) return;
-		      updateControlDockGeometry();
-		      modal.hidden = !open;
-		      if (toggle) toggle.classList.toggle("active", Boolean(open));
-		      if (open) renderStats(latestStats);
-		    }
-
-	    function renderStats(stats) {
-	      const content = document.getElementById("statsContent");
-	      if (!content) return;
-	      const contentScroll = scrollSnapshot(content);
-	      const recentScroll = scrollSnapshot(content.querySelector(".stats-recent"));
-	      const profiles = Array.isArray(stats.profiles) ? stats.profiles : [];
-	      const profileNames = statsProfiles(stats);
-	      syncStatsVisibleProfiles(profileNames);
-	      const toggles = profileNames.map((profile, index) => `
-	        <label class="stats-profile-toggle">
-	          <input type="checkbox" class="stats-profile-check" value="${escapeHtml(profile)}" ${statsVisibleProfiles[profile] ? "checked" : ""}>
-	          <span style="--profile-color: ${statsProfileColor(index)}"></span>
-	          ${escapeHtml(profile)}
-	        </label>
-	      `).join("");
-	      const rows = profiles.length ? profiles.map((profile) => {
-	        const traffic = `Up ${formatBytes(profile.bytes_up)} / Down ${formatBytes(profile.bytes_down)}`;
-	        const activeTunnels = Number(profile.active_tunnels || 0);
-	        const tunnelCount = activeTunnels
-	          ? `${formatNumber(profile.tunnels)} closed / ${formatNumber(activeTunnels)} active`
-	          : formatNumber(profile.tunnels);
-	        const tokens = `${formatNumber(profile.total_tokens)} total (${formatNumber(profile.input_tokens)} in, ${formatNumber(profile.output_tokens)} out)`;
-	        const fast = `${formatNumber(profile.fast_turns)} events / ${formatNumber(profile.fast_tokens)} tokens`;
-	        const quota = quotaDeltaText(profile.last_quota) || "-";
-	        return `
-	          <tr>
-	            <td>${escapeHtml(profile.profile || "unknown")}</td>
-	            <td>${formatNumber(profile.requests)}</td>
-	            <td>${escapeHtml(tunnelCount)}</td>
-	            <td>${escapeHtml(traffic)}</td>
-	            <td>${escapeHtml(tokens)}</td>
-	            <td>${escapeHtml(fast)}</td>
-	            <td>${formatNumber(profile.quota_updates)}</td>
-	            <td>${escapeHtml(quota)}</td>
-	          </tr>
-	        `;
-	      }).join("") : '<tr><td colspan="8">No stats recorded yet</td></tr>';
-	      const recent = Array.isArray(stats.recent) ? stats.recent.slice() : [];
-	      const recentHtml = recent.length ? recent.map((event) => `
-	        <div class="stats-event">
-	          <span>${escapeHtml(formatEventTime(event.ts))}</span>
-	          <strong>${escapeHtml(statsEventText(event))}</strong>
-	        </div>
-	      `).join("") : '<div class="stats-event"><span></span><strong>No recent events</strong></div>';
-	      content.innerHTML = `
-	        <section class="stats-graph-card">
-	          <div class="stats-graph-head">
-	            <h3>Usage Trend</h3>
-	            <div class="stats-profile-toggles">${toggles}</div>
-	          </div>
-	          <div class="stats-graph">${renderStatsGraph(stats, profileNames)}</div>
-	        </section>
-	        <section class="stats-section">
-	          <h3>Profiles</h3>
-	          <div class="stats-table-wrap">
-	            <table class="stats-table">
-	              <thead>
-	                <tr>
-	                  <th>Profile</th>
-	                  <th>Requests</th>
-	                  <th>Tunnels</th>
-	                  <th>Traffic</th>
-	                  <th>Tokens</th>
-	                  <th>Fast</th>
-	                  <th>Quota</th>
-	                  <th>Last Movement</th>
-	                </tr>
-	              </thead>
-	              <tbody>${rows}</tbody>
-	            </table>
-	          </div>
-	        </section>
-	        <section class="stats-section">
-	          <h3>Recent Activity</h3>
-	          <div class="stats-recent">${recentHtml}</div>
-	        </section>
-		      `;
-	      normalizeNativeTooltips(content);
-	      restoreScrollSnapshot(content, contentScroll);
-	      restoreScrollSnapshot(content.querySelector(".stats-recent"), recentScroll);
-		    }
-
-		    function showUiMessage(text) {
-		      const message = document.getElementById("message");
-		      if (!message) return;
-		      if (text) {
-		        message.textContent = text;
-		        message.classList.add("visible");
-		      } else {
-		        message.textContent = "";
-		        message.classList.remove("visible");
-		      }
-		    }
-
-	    function closeConfirmation(result) {
-	      const modal = document.getElementById("confirmModal");
-	      if (modal) modal.hidden = true;
-	      if (pendingConfirmation) {
-	        const resolve = pendingConfirmation.resolve;
-	        pendingConfirmation = null;
-	        resolve(Boolean(result));
-	      }
-	    }
-
-	    function confirmAction({ title = "Confirm action", message = "", acceptLabel = "Confirm", danger = true } = {}) {
-	      const modal = document.getElementById("confirmModal");
-	      const titleNode = document.getElementById("confirmTitle");
-	      const messageNode = document.getElementById("confirmMessage");
-	      const accept = document.getElementById("confirmAccept");
-	      const cancel = document.getElementById("confirmCancel");
-	      if (!modal || !titleNode || !messageNode || !accept || !cancel) {
-	        return Promise.resolve(false);
-	      }
-	      if (pendingConfirmation) closeConfirmation(false);
-	      titleNode.textContent = title;
-	      messageNode.textContent = message;
-	      accept.textContent = acceptLabel;
-	      accept.classList.toggle("danger", Boolean(danger));
-	      modal.hidden = false;
-	      accept.focus();
-	      return new Promise((resolve) => {
-	        pendingConfirmation = { resolve };
-	      });
-	    }
-
-	    function normalizeNativeTooltips(root = document) {
-	      if (!root || !root.querySelectorAll) return;
-	      root.querySelectorAll("[title]").forEach((node) => {
-		        const text = node.getAttribute("title") || "";
-		        node.removeAttribute("title");
-		        if (!text) return;
-		        node.setAttribute("data-tooltip", text);
-		        if (!node.getAttribute("aria-label") && !node.textContent.trim()) {
-		          node.setAttribute("aria-label", text);
-		        }
-	      });
-	    }
-
-	    function uiTooltipTarget(target) {
-	      if (!(target instanceof Element)) return null;
-		      const node = target.closest("[data-tooltip], [title]");
-		      if (!node) return null;
-		      if (node.hasAttribute("title")) normalizeNativeTooltips(node.parentElement || document);
-		      return node.getAttribute("data-tooltip") ? node : null;
-	    }
-
-	    function positionUiTooltip(event, target) {
-	      const tooltip = document.getElementById("uiTooltip");
-	      if (!tooltip || tooltip.hidden) return;
-	      const rect = target.getBoundingClientRect();
-	      const baseX = typeof event.clientX === "number" ? event.clientX : rect.left + rect.width / 2;
-	      const baseY = typeof event.clientY === "number" ? event.clientY : rect.bottom;
-	      const left = Math.max(8, Math.min(window.innerWidth - tooltip.offsetWidth - 8, baseX + 12));
-	      const top = Math.max(8, Math.min(window.innerHeight - tooltip.offsetHeight - 8, baseY + 14));
-	      tooltip.style.left = `${left}px`;
-	      tooltip.style.top = `${top}px`;
-	    }
-
-	    function showUiTooltip(event) {
-	      const target = uiTooltipTarget(event.target);
-	      const tooltip = document.getElementById("uiTooltip");
-	      if (!target || !tooltip) return;
-	      tooltip.textContent = target.getAttribute("data-tooltip") || "";
-	      if (!tooltip.textContent) return;
-	      tooltip.hidden = false;
-	      positionUiTooltip(event, target);
-	    }
-
-	    function hideUiTooltip() {
-	      const tooltip = document.getElementById("uiTooltip");
-	      if (tooltip) tooltip.hidden = true;
-	    }
-
-	    function setConnection(label, state) {
-	      const text = label === "Live" ? `Live (${latestLiveBusy ? "busy" : "idle"})` : label;
-	      document.getElementById("connectionState").textContent = text;
-	      const dot = document.getElementById("proxyDot");
-	      dot.className = "dot" + (state ? " " + state : "");
-	    }
-
-	    function savedTheme() {
-	      try {
-	        const value = localStorage.getItem(THEME_KEY);
-	        return value === "light" || value === "dark" ? value : null;
-	      } catch {
-	        return null;
-	      }
-	    }
-
-	    function systemTheme() {
-	      return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-	    }
-
-	    function effectiveTheme() {
-	      return savedTheme() || systemTheme();
-	    }
-
-	    function setTheme(theme) {
-	      document.documentElement.dataset.theme = theme;
-	      try {
-	        localStorage.setItem(THEME_KEY, theme);
-	      } catch {
-	      }
-	      updateThemeToggle();
-	    }
-
-	    function updateThemeToggle() {
-	      const button = document.getElementById("themeToggle");
-	      if (!button) return;
-	      const current = effectiveTheme();
-	      const target = current === "dark" ? "light" : "dark";
-	      button.innerHTML = target === "dark" ? MOON_ICON : SUN_ICON;
-	      button.title = `Switch to ${target} mode`;
-	      button.setAttribute("aria-label", `Switch to ${target} mode`);
-	    }
-
-	    function openMenuProfile(selector) {
-	      const openMenu = document.querySelector(`${selector}[open]`);
-	      return openMenu ? openMenu.dataset.profile || "" : null;
-	    }
-
-	    function rememberOpenMenus() {
-	      openPinMenuProfile = openMenuProfile("details.pin-menu");
-	      openModelMenuProfile = openMenuProfile("details.model-menu");
-	      openLoginMenuProfile = openMenuProfile("details.login-menu");
-	      const openReasoning = document.querySelector("details.model-menu[open] .model-option:hover, details.model-menu[open] .model-option.reasoning-open");
-	      if (openReasoning) {
-	        const modelMenu = openReasoning.closest("details.model-menu");
-	        openReasoningProfile = modelMenu ? modelMenu.dataset.profile || null : null;
-	        openReasoningModel = openReasoning.dataset.model || null;
-	      }
-	    }
-
-	    function restoreMenu(selector, profile) {
-	      if (!profile) return;
-	      document.querySelectorAll(selector).forEach((menu) => {
-	        menu.open = menu.dataset.profile === profile;
-	      });
-	    }
-
-	    function restoreOpenMenus() {
-	      restoreMenu("details.pin-menu", openPinMenuProfile);
-	      restoreMenu("details.model-menu", openModelMenuProfile);
-	      restoreMenu("details.login-menu", openLoginMenuProfile);
-	      restoreReasoningMenu();
-	    }
-
-	    function restoreReasoningMenu() {
-	      document.querySelectorAll(".model-option.reasoning-open").forEach((option) => {
-	        option.classList.remove("reasoning-open");
-	      });
-	      if (!openReasoningProfile || !openReasoningModel) return;
-	      const menu = Array.from(document.querySelectorAll("details.model-menu"))
-	        .find((item) => item.dataset.profile === openReasoningProfile);
-	      const option = menu
-	        ? Array.from(menu.querySelectorAll(".model-option")).find((item) => item.dataset.model === openReasoningModel)
-	        : null;
-	      if (option) option.classList.add("reasoning-open");
-	    }
-
-	    function closeMenus(selector) {
-	      document.querySelectorAll(`${selector}[open]`).forEach((menu) => {
-	        menu.open = false;
-	      });
-	    }
-
-	    function closeOpenMenus() {
-	      openPinMenuProfile = null;
-	      openModelMenuProfile = null;
-	      openLoginMenuProfile = null;
-	      openReasoningProfile = null;
-	      openReasoningModel = null;
-	      closeMenus("details.pin-menu");
-	      closeMenus("details.model-menu");
-	      closeMenus("details.login-menu");
-	    }
-
-	    function menuType(menu) {
-	      if (menu.classList.contains("pin-menu")) return "pin";
-	      if (menu.classList.contains("model-menu")) return "model";
-	      if (menu.classList.contains("login-menu")) return "login";
-	      return "";
-	    }
-
-	    function menuSelector(type) {
-	      if (type === "pin") return "details.pin-menu";
-	      if (type === "model") return "details.model-menu";
-	      if (type === "login") return "details.login-menu";
-	      return "";
-	    }
-
-	    function setOpenMenuProfile(type, profile) {
-	      if (type === "pin") openPinMenuProfile = profile;
-	      if (type === "model") openModelMenuProfile = profile;
-	      if (type === "login") openLoginMenuProfile = profile;
-	    }
-
-	    function getOpenMenuProfile(type) {
-	      if (type === "pin") return openPinMenuProfile;
-	      if (type === "model") return openModelMenuProfile;
-	      if (type === "login") return openLoginMenuProfile;
-	      return null;
-	    }
-
-		    function updateQuotaRefreshEpoch(status) {
-		      const pid = status ? status.pid || null : null;
-		      if (!pid || pid === quotaRefreshDaemonPid) return;
-		      if (pageDaemonPid && pid !== pageDaemonPid) {
-		        window.location.reload();
-		        return;
-		      }
-		      quotaRefreshDaemonPid = pid;
-	      quotaRefreshAttempted.clear();
-	      quotaRefreshQueue.length = 0;
-	      quotaRefreshInFlight = "";
-	      if (quotaRefreshTimer) {
-	        clearTimeout(quotaRefreshTimer);
-	        quotaRefreshTimer = null;
-	      }
-	    }
-
-	    function queueInitialQuotaRefreshes(profiles) {
-	      for (const profile of profiles || []) {
-	        const name = String(profile.name || "");
-	        const billingRequired = profile.billing_required && typeof profile.billing_required === "object" && profile.billing_required.required;
-	        if (!name || profile.quota_has_payload || profile.quota_refresh_error || billingRequired) continue;
-	        if (quotaRefreshAttempted.has(name)) continue;
-	        quotaRefreshAttempted.add(name);
-	        quotaRefreshQueue.push(name);
-	      }
-	    }
-
-	    function scheduleNextQuotaRefresh(delay = 0) {
-	      if (quotaRefreshTimer || quotaRefreshInFlight) return;
-	      quotaRefreshTimer = setTimeout(() => {
-	        quotaRefreshTimer = null;
-	        if (!socket || socket.readyState !== WebSocket.OPEN || quotaRefreshInFlight) return;
-	        while (quotaRefreshQueue.length) {
-	          const profile = quotaRefreshQueue.shift();
-	          if (!profile) continue;
-	          quotaRefreshInFlight = profile;
-	          socket.send(JSON.stringify({
-	            action: "refresh_quota",
-	            profile,
-	            token: TOKEN
-	          }));
-	          return;
-	        }
-	      }, delay);
-	    }
-
-		    function reasoningDisplay(value) {
-		      return String(value || "");
-		    }
-
-		    function profileStateFromValue(value) {
-		      if (!value) return null;
-		      if (typeof value === "string") {
-		        const raw = value.trim();
-		        if (raw === "deactivated_workspace") {
-		          return { code: raw, title: "Workspace deactivated", message: "This workspace is deactivated." };
-		        }
-		        if (raw.startsWith("{") && raw.endsWith("}")) {
-		          try {
-		            return profileStateFromValue(JSON.parse(raw));
-		          } catch {
-		            return null;
-		          }
-		        }
-		        return null;
-		      }
-		      if (typeof value !== "object") return null;
-		      const code = typeof value.code === "string" ? value.code : "";
-		      if (code === "deactivated_workspace") {
-		        return { code, title: "Workspace deactivated", message: "This workspace is deactivated." };
-		      }
-		      return profileStateFromValue(value.detail) || profileStateFromValue(value.error) || profileStateFromValue(value.message) || profileStateFromValue(value.reason);
-		    }
-
-	    function renderAuthHealth(profile) {
-	      if (profile.auth_health_html) return profile.auth_health_html;
-	      const health = profile.auth_health && typeof profile.auth_health === "object" ? profile.auth_health : null;
-	      if (!health) return "";
-	      const status = String(health.status || "");
-	      if (status !== "login_required" && status !== "refresh_failed") return "";
-	      const label = status === "login_required" ? "Login required" : "Auth refresh failed";
-	      const timestamp = formatEventTime(health.error_at || health.last_refresh_failed_at || "");
-	      const suffix = timestamp ? ` (${timestamp})` : "";
-	      return `
-	        <div class="auth-health ${escapeHtml(status)}" title="${escapeHtml(health.message || "")}">
-	          <strong>${escapeHtml(label)}</strong>${escapeHtml(suffix)}
-	        </div>
-	      `;
-	    }
-
-	    function renderQuotaRefreshControl(profileName) {
-	      if (!profileName) return '<span class="quota-refresh-spacer"></span>';
-	      return `
-	        <form method="post" action="/api/refresh-quota" class="quota-refresh-form" data-action="refresh_quota" data-profile="${escapeHtml(profileName)}">
-	          <input type="hidden" name="token" value="${escapeHtml(TOKEN)}">
-	          <input type="hidden" name="profile" value="${escapeHtml(profileName)}">
-	          <button class="quota-refresh-icon" aria-label="Refresh quota" title="Refresh quota">
-	            <svg class="quota-refresh-glyph" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-	              <path d="M20 12a8 8 0 1 1-2.34-5.66"></path>
-	              <path d="M20 4v5h-5"></path>
-	            </svg>
-	          </button>
-	        </form>
-	      `;
-	    }
-
-	    function renderQuotaCredits(label) {
-	      return label
-	        ? `<span class="quota-credits-pill" title="Codex credits balance">Credits: ${escapeHtml(label)}</span>`
-	        : "";
-	    }
-
-	    function renderResetCreditControl(resetCredit, profileName) {
-	      if (!resetCredit || typeof resetCredit !== "object") return "";
-	      const label = String(resetCredit.label || "");
-	      if (!label) return "";
-	      const message = String(resetCredit.message || "");
-	      if (resetCredit.disabled) {
-	        return `<span class="quota-reset-credit-pill disabled" title="${escapeHtml(message)}">${escapeHtml(label)}</span>`;
-	      }
-	      return `
-	        <form method="post" action="/api/consume-reset-credit" class="reset-credit-form" data-action="consume_reset_credit" data-profile="${escapeHtml(profileName)}" data-confirm="${escapeHtml(message)}">
-	          <input type="hidden" name="token" value="${escapeHtml(TOKEN)}">
-	          <input type="hidden" name="profile" value="${escapeHtml(profileName)}">
-	          <button class="quota-reset-credit-pill" title="Use one rate-limit reset credit">${escapeHtml(label)}</button>
-	        </form>
-	      `;
-	    }
-
-	    function renderQuotaState(state) {
-	      const data = state && typeof state === "object" ? state : {};
-	      const level = ["warning", "error", "info"].includes(String(data.level || "")) ? String(data.level) : "warning";
-	      const title = String(data.title || "Quota unavailable");
-	      const message = String(data.message || "Quota is unavailable for this profile.");
-	      return `
-	        <div class="quota-empty quota-state ${escapeHtml(level)}">
-	          <strong>${escapeHtml(title)}</strong>
-	          <span>${escapeHtml(message)}</span>
-	        </div>
-	      `;
-	    }
-
-	    function renderQuotaCountRows(rows) {
-	      return (rows || []).map((row) => {
-	        const reset = row.reset ? ` <span class="quota-count-reset">(${escapeHtml(row.reset)})</span>` : "";
-	        return `<div class="quota-count-line"><span>${escapeHtml(row.label || "")}</span><strong>${escapeHtml(row.value || "")}</strong>${reset}</div>`;
-	      }).join("") || '<div class="quota-muted">No window details</div>';
-	    }
-
-	    function renderQuotaHorizons(stack, bucket) {
-	      const name = String(bucket.name || "Quota bucket");
-	      const title = String(bucket.title || "");
-	      if (Array.isArray(stack.count_rows) && stack.count_rows.length) {
-	        return `
-	          <div class="quota-title">
-	            <span class="quota-horizon weekly"></span>
-	            <span class="quota-bucket-name" title="${escapeHtml(title)}">${escapeHtml(name)}</span>
-	            <span class="quota-horizon primary"></span>
-	          </div>
-	        `;
-	      }
-	      const primaryNotEnforced = Boolean(stack.primary_not_enforced);
-	      const primaryClass = primaryNotEnforced ? "primary not-enforced" : "primary";
-	      return `
-	        <div class="quota-title">
-	          <span class="quota-horizon weekly">${escapeHtml(stack.weekly_status || "")}</span>
-	          <span class="quota-bucket-name" title="${escapeHtml(title)}">${escapeHtml(name)}</span>
-	          <span class="quota-horizon ${primaryClass}">${escapeHtml(stack.primary_reset_text || "")}</span>
-	        </div>
-	      `;
-	    }
-
-	    function renderQuotaStack(stack) {
-	      if (Array.isArray(stack.count_rows) && stack.count_rows.length) {
-	        return renderQuotaCountRows(stack.count_rows);
-	      }
-	      const primaryStyle = Number(stack.primary_style || 0);
-	      const weeklyStyle = Number(stack.weekly_style || 0);
-	      const primaryText = String(stack.primary_text || "");
-	      const weeklyText = String(stack.weekly_text || "");
-	      const primaryEmpty = String(stack.primary_empty || "");
-	      const primaryNotEnforced = Boolean(stack.primary_not_enforced);
-	      const special = String(stack.special || "");
-	      const stackClass = `${special ? ` quota-stack-${special}` : ""}${primaryNotEnforced ? " quota-stack-primary-not-enforced" : ""}`;
-	      const aria = String(stack.aria || "");
-	      const barAttrs = special || primaryNotEnforced
-	        ? `role="img" aria-label="${escapeHtml(aria)}"`
-	        : `role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${primaryStyle.toFixed(0)}" aria-label="${escapeHtml(aria)}"`;
-	      const primaryLabelClass = primaryNotEnforced ? "quota-primary-label-outside not-enforced" : "quota-primary-label-outside";
-	      return `
-	        <div class="quota-stack${escapeHtml(stackClass)}">
-	          <div class="quota-stack-row">
-	            <span class="quota-weekly-label">${escapeHtml(weeklyText)}</span>
-	            <div class="quota-stack-bar" ${barAttrs}>
-	              <span class="quota-weekly-fill" style="width: ${weeklyStyle.toFixed(2)}%"></span>
-	              <span class="quota-primary-fill${escapeHtml(primaryEmpty)}" style="width: ${primaryStyle.toFixed(2)}%"></span>
-	            </div>
-	            <span class="${primaryLabelClass}">${escapeHtml(primaryText)}</span>
-	          </div>
-	        </div>
-	      `;
-	    }
-
-	    function renderQuotaBucket(bucket) {
-	      const stack = bucket && typeof bucket.stack === "object" ? bucket.stack : {};
-	      return `
-	        <div class="quota-bucket">
-	          ${renderQuotaHorizons(stack, bucket || {})}
-	          ${renderQuotaStack(stack)}
-	        </div>
-	      `;
-	    }
-
-	    function renderStructuredQuota(profile, profileName) {
-	      const quota = profile.quota && typeof profile.quota === "object" ? profile.quota : null;
-	      if (!quota) return profile.quota_html || '<div class="quota-empty">No quota cached</div>';
-	      const updated = String(quota.updated || "No quota cached");
-	      let body = "";
-	      const buckets = Array.isArray(quota.buckets) ? quota.buckets : [];
-	      if (buckets.length) {
-	        body = buckets.map((bucket) => renderQuotaBucket(bucket)).join("");
-	      } else if (quota.state) {
-	        body = renderQuotaState(quota.state);
-	      } else {
-	        const empty = String(quota.empty || "No quota cached");
-	        const emptyClass = quota.refresh_error_billing ? "quota-empty error billing" : empty === "Quota payload has no bucket details" ? "quota-muted" : "quota-empty";
-	        body = `<div class="${emptyClass}">${escapeHtml(empty)}</div>`;
-	      }
-	      const refreshError = quota.refresh_error
-	        ? `<div class="quota-refresh-error${quota.refresh_error_billing ? " billing" : ""}">Last refresh failed: ${escapeHtml(quota.refresh_error)}</div>`
-	        : "";
-	      return `
-	        <div class="quota-panel">
-	          <div class="quota-panel-head">
-	            ${renderQuotaRefreshControl(profileName)}
-	            <span class="quota-updated">${escapeHtml(updated)}</span>
-	            ${renderResetCreditControl(quota.reset_credit, profileName)}
-	            ${renderQuotaCredits(quota.credits_label)}
-	          </div>
-	          ${body}
-	          ${refreshError}
-	        </div>
-	      `;
-	    }
-
-	    function modelCatalog(profile) {
-	      const profileCatalog = profile && Array.isArray(profile.model_catalog) ? profile.model_catalog : [];
-	      return profileCatalog.length ? profileCatalog : (latestModelCatalog.length ? latestModelCatalog : [
-	        { id: "gpt-5.6-sol", display: "GPT-5.6-Sol", reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"] },
-		        { id: "gpt-5.6-terra", display: "GPT-5.6-Terra", reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"] },
-		        { id: "gpt-5.6-luna", display: "GPT-5.6-Luna", reasoning: ["low", "medium", "high", "xhigh", "max"] },
-		        { id: "gpt-5.5", display: "GPT-5.5", reasoning: ["low", "medium", "high", "xhigh"] },
-		        { id: "gpt-5.4", display: "GPT-5.4", reasoning: ["low", "medium", "high", "xhigh"] },
-		        { id: "gpt-5.4-mini", display: "GPT-5.4-Mini", reasoning: ["low", "medium", "high", "xhigh"] },
-	        { id: "gpt-5.2", display: "GPT-5.2", reasoning: ["low", "medium", "high", "xhigh"] }
-	      ]);
-	    }
-
-	    function stableRenderHash(value) {
-	      let hash = 2166136261;
-	      const text = String(value || "");
-	      for (let index = 0; index < text.length; index += 1) {
-	        hash ^= text.charCodeAt(index);
-	        hash = Math.imul(hash, 16777619);
-	      }
-	      return String(hash >>> 0);
-	    }
-
-		    function renderProfileChips(profile, name) {
-		      const chips = [];
-		      if (profile.active) chips.push('<span class="badge active-badge">Active</span>');
-			      const billingRequired = profile.billing_required && typeof profile.billing_required === "object" && profile.billing_required.required;
-			      if (billingRequired) {
-			        const detail = String(profile.billing_required.error || "This Codex CLI profile returned HTTP 402 Payment Required.");
-			        const state = profileStateFromValue(profile.billing_required.error);
-			        const title = state ? state.message : `Billing required: Provision has paused automatic quota refreshes for this profile. ${detail}`;
-			        const label = state ? state.title : "Billing required";
-			        chips.push(`<span class="profile-pill billing-pill" title="${escapeHtml(title)}">${escapeHtml(label)}</span>`);
-			      }
-		      const fastEnabled = Boolean(profile.fast_mode);
-	      chips.push(`
-	        <form method="post" action="/api/toggle-fast" class="profile-pill-form" data-action="toggle_fast" data-profile="${escapeHtml(name)}">
-	          <input type="hidden" name="token" value="${escapeHtml(TOKEN)}">
-	          <input type="hidden" name="profile" value="${escapeHtml(name)}">
-	          <button class="profile-pill fast-pill${fastEnabled ? " enabled" : ""}" title="Toggle fast mode">Fast</button>
-	        </form>
-	      `);
-	      const loginRequired = profile.login_required && typeof profile.login_required === "object" && profile.login_required.required;
-	      const loginStatus = profile.login_status && typeof profile.login_status === "object" ? profile.login_status : null;
-	      const loginState = loginStatus ? String(loginStatus.status || "") : "";
-	      const loginRunning = loginState === "running" || loginState === "canceling";
-	      if (loginRequired || loginRunning) {
-	        const loginTitle = loginRunning ? "Login already running" : String((profile.login_required && profile.login_required.error) || "Refresh profile login");
-	        const disabled = loginRunning ? "disabled" : "";
-	        const cancelDisabled = loginState === "canceling" ? "disabled" : "";
-	        const cancelForm = loginRunning ? `
-	          <form method="post" action="/api/login" data-action="cancel_login" data-profile="${escapeHtml(name)}">
-	            <input type="hidden" name="token" value="${escapeHtml(TOKEN)}">
-	            <input type="hidden" name="profile" value="${escapeHtml(name)}">
-	            <input type="hidden" name="login_action" value="cancel_login">
-	            <button class="menu-action danger-action" ${cancelDisabled}>Cancel Login</button>
-	          </form>
-	        ` : "";
-	        chips.push(`
-	          <details class="login-menu profile-login-menu" data-profile="${escapeHtml(name)}">
-	            <summary class="profile-pill login-pill" title="${escapeHtml(loginTitle)}">Login</summary>
-	            <div class="login-menu-panel">
-	              <div class="login-menu-note">${escapeHtml(LOGIN_BROWSER_REMOTE_NOTE)}</div>
-	              <form method="post" action="/api/login" data-action="start_login" data-profile="${escapeHtml(name)}">
-	                <input type="hidden" name="token" value="${escapeHtml(TOKEN)}">
-	                <input type="hidden" name="profile" value="${escapeHtml(name)}">
-	                <input type="hidden" name="mode" value="browser">
-	                <button class="menu-action" ${disabled}>Browser Login</button>
-	              </form>
-	              <form method="post" action="/api/login" data-action="start_login" data-profile="${escapeHtml(name)}">
-	                <input type="hidden" name="token" value="${escapeHtml(TOKEN)}">
-	                <input type="hidden" name="profile" value="${escapeHtml(name)}">
-	                <input type="hidden" name="mode" value="device">
-	                <button class="menu-action" ${disabled}>Device Auth</button>
-	              </form>
-	              ${cancelForm}
-	            </div>
-	          </details>
-	        `);
-	      }
-	      return `<div class="profile-chips">${chips.join("")}</div>`;
-	    }
-
-		    function renderModelMenu(profile, name) {
-		      const setting = profile.model_setting && typeof profile.model_setting === "object" ? profile.model_setting : {};
-		      const currentModel = String(setting.model || "gpt-5.6-sol");
-		      const currentReasoning = String(setting.reasoning_effort || (currentModel === "gpt-5.6-sol" ? "low" : "medium"));
-			      const label = `${currentModel.toLowerCase()} ${reasoningDisplay(currentReasoning)}`;
-	      const items = modelCatalog(profile).map((item) => {
-	        const model = String(item.id || "");
-	        if (!model) return "";
-	        const display = String(item.display || model);
-	        const note = String(item.note || "");
-	        const selected = model === currentModel ? " selected" : "";
-		        const levels = Array.isArray(item.reasoning) && item.reasoning.length ? item.reasoning : ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
-	        const reasoning = levels.map((level) => {
-	          const value = String(level || "");
-	          if (!value) return "";
-	          const reasoningSelected = model === currentModel && value === currentReasoning ? " selected" : "";
-	          return `
-	            <form method="post" action="/api/model" data-action="set_model" data-profile="${escapeHtml(name)}">
-	              <input type="hidden" name="token" value="${escapeHtml(TOKEN)}">
-	              <input type="hidden" name="profile" value="${escapeHtml(name)}">
-	              <input type="hidden" name="model" value="${escapeHtml(model)}">
-	              <input type="hidden" name="reasoning_effort" value="${escapeHtml(value)}">
-	              <button class="model-reasoning-option${reasoningSelected}">${escapeHtml(reasoningDisplay(value))}</button>
-	            </form>
-	          `;
-	        }).join("");
-	        return `
-	          <div class="model-option${selected}" data-model="${escapeHtml(model)}" title="${escapeHtml(note)}">
-	            <button class="model-option-label" type="button">
-	              <span>${escapeHtml(display)}</span>
-	              <span class="model-option-arrow">&rsaquo;</span>
-	            </button>
-	            <div class="model-reasoning-menu">${reasoning}</div>
-	          </div>
-	        `;
-	      }).join("");
-	      return `
-	        <details class="model-menu" data-profile="${escapeHtml(name)}">
-	          <summary class="model-pill" title="Select model and reasoning effort">
-	            <span>${escapeHtml(label)}</span>
-	          </summary>
-	          <div class="model-menu-panel">${items}</div>
-	        </details>
-	      `;
-	    }
-
-	    function profileRow(profile, pendingAction, pendingProfile) {
-	      const name = String(profile.name || "");
-	      const plan = String(profile.plan_type || "unknown");
-	      const hidden = Boolean(profile.hidden);
-	      const reason = String(profile.switch_disabled_reason || "");
-	      const pending = pendingProfile === name ? pendingAction : "";
-	      const disabled = reason || pending ? "disabled" : "";
-	      const useTitle = reason || (pending ? "Action in progress" : "");
-	      const useLabel = pending === "switch" ? "Switching" : String(profile.switch_button_label || "Use");
-	      let useClass = profile.active ? "primary-action current-action" : "primary-action";
-	      if (profile.active && profile.has_active_sessions) useClass += " session-active-action";
-	      const quotaPendingLabel = pending === "consume_reset_credit" ? "Using reset credit" : "Refreshing quota";
-	      const isQuotaPending = pending === "refresh_quota" || pending === "consume_reset_credit";
-	      const quota = isQuotaPending
-	        ? `<div class="quota-panel"><div class="quota-panel-head"><span class="quota-refresh-icon disabled" aria-hidden="true"><span class="spinner quota-spinner-small"></span></span><span class="quota-updated">${quotaPendingLabel}</span></div><div class="quota-loading"><span class="spinner"></span><span>${quotaPendingLabel}</span></div></div>`
-	        : renderStructuredQuota(profile, name);
-	      const pinMenu = profile.pin_menu_html || "";
-	      const pinnedSessions = profile.pinned_sessions_html || "";
-	      const loginStatusHtml = profile.login_status_html || "";
-	      const authHealthHtml = renderAuthHealth(profile);
-	      return `
-	        <tr class="profile-row${profile.active ? " active" : ""}${hidden ? " hidden-profile" : ""}" data-profile="${escapeHtml(name)}" data-profile-key="${escapeHtml(name)}">
-	          <td class="profile-cell">
-	            <div class="profile-name">${escapeHtml(name)} <span class="profile-plan">(${escapeHtml(plan)})</span>${hidden ? ' <span class="profile-hidden-badge">Hidden</span>' : ""}</div>
-	            <div class="profile-email">${escapeHtml(profile.email || profile.account_id || "")}</div>
-	            ${authHealthHtml}
-	            ${renderProfileChips(profile, name)}
-	            ${pinMenu}
-	            ${pinnedSessions}
-	            ${loginStatusHtml}
-	          </td>
-	          <td class="model-cell">${renderModelMenu(profile, name)}</td>
-	          <td class="quota-cell">${quota}</td>
-	          <td class="actions">
-	            <form method="post" action="/api/switch" data-action="switch" data-profile="${escapeHtml(name)}">
-	              <input type="hidden" name="token" value="${escapeHtml(TOKEN)}">
-	              <input type="hidden" name="profile" value="${escapeHtml(name)}">
-	              <button class="${useClass}" ${disabled} title="${escapeHtml(useTitle)}">${escapeHtml(useLabel)}</button>
-	            </form>
-	            <form method="post" action="/api/profile-visibility" data-action="set_profile_visibility" data-profile="${escapeHtml(name)}">
-	              <input type="hidden" name="token" value="${escapeHtml(TOKEN)}">
-	              <input type="hidden" name="profile" value="${escapeHtml(name)}">
-	              <input type="hidden" name="hidden" value="${hidden ? "false" : "true"}">
-	              <button class="profile-visibility-action" title="${hidden ? "Show this profile in the dashboard" : "Hide this profile from the dashboard"}">${hidden ? "Unhide" : "Hide"}</button>
-	            </form>
-	          </td>
-	        </tr>
-	      `;
-	    }
-
-	    function renderProfileRows(profiles, pendingAction, pendingProfile) {
-	      const body = document.getElementById("profileRows");
-	      if (!body) return;
-	      const allProfiles = Array.isArray(profiles) ? profiles : [];
-	      const hiddenCount = allProfiles.filter((profile) => Boolean(profile && profile.hidden)).length;
-	      const toggle = document.getElementById("profileHiddenToggle");
-	      if (toggle) {
-	        toggle.hidden = hiddenCount === 0;
-	        toggle.textContent = showHiddenProfiles
-	          ? `Hide hidden profiles (${hiddenCount})`
-	          : `Show hidden profiles (${hiddenCount})`;
-	        toggle.setAttribute("aria-pressed", showHiddenProfiles ? "true" : "false");
-	      }
-	      const visibleProfiles = showHiddenProfiles
-	        ? allProfiles
-	        : allProfiles.filter((profile) => !Boolean(profile && profile.hidden));
-	      const existing = new Map();
-	      Array.from(body.children).forEach((row) => {
-	        if (row instanceof HTMLElement) existing.set(row.dataset.profileKey || "", row);
-	      });
-	      const seen = new Set();
-	      const template = document.createElement("template");
-	      for (const [index, profile] of visibleProfiles.entries()) {
-	        const name = String(profile && profile.name || `profile-${index}`);
-	        const html = profileRow(profile, pendingAction, pendingProfile).trim();
-	        const hash = stableRenderHash(html);
-	        let row = existing.get(name);
-	        if (!row || row.dataset.renderHash !== hash) {
-	          template.innerHTML = html;
-	          const next = template.content.firstElementChild;
-	          if (!(next instanceof HTMLElement)) continue;
-	          next.dataset.profileKey = name;
-	          next.dataset.renderHash = hash;
-	          if (row) {
-	            row.replaceWith(next);
-	          } else {
-	            body.appendChild(next);
-	          }
-	          row = next;
-	          normalizeNativeTooltips(row);
-	        }
-	        seen.add(name);
-	        body.appendChild(row);
-	      }
-	      for (const [key, row] of existing.entries()) {
-	        if (!seen.has(key)) row.remove();
-	      }
-	    }
-
-    function render(packet) {
-      const status = packet.status || {};
-      latestStatus = status;
-      const sections = new Set(Array.isArray(packet.sections) ? packet.sections : ["full"]);
-      const fullRender = sections.has("full") || !Array.isArray(packet.sections);
-      const profilesChanged = fullRender || sections.has("profiles");
-      const controlChanged = fullRender || sections.has("control_plane");
-      const statsChanged = fullRender || sections.has("stats");
-      updateQuotaRefreshEpoch(status);
-      const pendingAction = packet.pending_action || "";
-      const pendingProfile = String(packet.pending_profile || "");
-      const activeRequests = Number(status.active_requests || 0);
-      const activeTunnels = Number(status.active_websockets || 0);
-      const liveBusy = Boolean(status.live_busy);
-      latestLiveBusy = liveBusy;
-      latestStats = status.stats || latestStats || { profiles: [], recent: [] };
-      latestControlPlane = status.control_plane || latestControlPlane || { sessions: [] };
-      latestCodex = status.codex || latestCodex || {};
-      if (Array.isArray(status.model_catalog)) latestModelCatalog = status.model_catalog;
-	      if ((pendingAction === "refresh_quota" || pendingAction === "consume_reset_credit") && pendingProfile) {
-	        quotaRefreshInFlight = pendingProfile;
-	      } else if (quotaRefreshInFlight) {
-	        quotaRefreshInFlight = "";
-	        scheduleNextQuotaRefresh(250);
-	      }
-	      if (profilesChanged) queueInitialQuotaRefreshes(status.profiles || []);
-	      scheduleNextQuotaRefresh(250);
-	      document.getElementById("activeProfile").textContent = status.active_profile || "none";
-	      const codexCli = status.codex && status.codex.cli ? status.codex.cli : {};
-	      document.getElementById("codexVersion").textContent = codexCli.version || "unknown";
-	      const restartState = status.codex && status.codex.restart_required ? status.codex.restart_required : {};
-	      const restartRequired = Boolean(restartState.required);
-	      const restartNotice = document.getElementById("codexRestartRequired");
-	      restartNotice.hidden = !restartRequired;
-	      restartNotice.title = restartRequired ? String(restartState.reason || "Restart Provision when active work is idle.") : "";
-	      document.getElementById("activeRequests").textContent = String(activeRequests);
-	      document.getElementById("activeTunnels").textContent = String(activeTunnels);
-	      if (controlChanged) {
-	        renderSessionTabs(status);
-	        renderLauncherBar(status);
-	      }
-	      const connection = document.getElementById("connectionState");
-	      const isDisconnected = connection.textContent === "Disconnected";
-	      if (!isDisconnected) {
-	        connection.textContent = `Live (${liveBusy ? "busy" : "idle"})`;
-	        document.getElementById("proxyDot").className = "dot" + (liveBusy ? " busy" : "");
-	      }
-	      if (profilesChanged) {
-	        rememberOpenMenus();
-	        renderProfileRows(status.profiles || [], pendingAction, pendingProfile);
-	        restoreOpenMenus();
-	      }
-	      if (statsChanged && !document.getElementById("statsModal").hidden) {
-	        renderStats(latestStats);
-      }
-	      if (controlChanged) renderControlModal();
-	      if (fullRender || profilesChanged || controlChanged || statsChanged) normalizeNativeTooltips(document);
-	      if (typeof packet.message === "string") {
-	        showUiMessage(packet.message);
-	      }
-    }
-
-	    function mergeStateDelta(packet) {
-	      const delta = packet.status || {};
-	      const previous = latestStatus || {};
-	      const merged = {
-	        ...previous,
-	        ...delta,
-	        profiles: Object.prototype.hasOwnProperty.call(delta, "profiles")
-	          ? delta.profiles
-	          : (previous.profiles || []),
-	        sessions: Object.prototype.hasOwnProperty.call(delta, "sessions")
-	          ? delta.sessions
-	          : (previous.sessions || []),
-	        control_plane: Object.prototype.hasOwnProperty.call(delta, "control_plane")
-	          ? delta.control_plane
-	          : (previous.control_plane || latestControlPlane || { sessions: [] }),
-	        stats: Object.prototype.hasOwnProperty.call(delta, "stats")
-	          ? delta.stats
-	          : (previous.stats || latestStats || { profiles: [], recent: [] }),
-	        codex: Object.prototype.hasOwnProperty.call(delta, "codex")
-	          ? delta.codex
-	          : (previous.codex || latestCodex || {}),
-	        model_catalog: Object.prototype.hasOwnProperty.call(delta, "model_catalog")
-	          ? delta.model_catalog
-	          : (previous.model_catalog || latestModelCatalog || [])
-	      };
-	      latestStatus = merged;
-	      return { ...packet, type: "state", status: merged };
-	    }
-
-	    function scheduleRender(packet) {
-	      const statePacket = packet.type === "state_delta" ? mergeStateDelta(packet) : packet;
-	      if (packet.type === "state") latestStatus = packet.status || {};
-	      pendingRenderPacket = statePacket;
-	      if (pendingRenderFrame) return;
-	      pendingRenderFrame = requestAnimationFrame(() => {
-	        const nextPacket = pendingRenderPacket;
-	        pendingRenderPacket = null;
-	        pendingRenderFrame = null;
-	        if (nextPacket) render(nextPacket);
-	      });
-	    }
-
-	    function handleHistoryTurnPacket(packet) {
-	      const sessionKey = String(packet.session_key || "");
-	      const turnKey = String(packet.turn_key || "");
-	      const key = historyCacheKey(sessionKey, turnKey);
-	      delete historyTurnRequests[key];
-	      if (!packet.ok) {
-	        showUiMessage(packet.error ? `History load failed: ${packet.error}` : "History load failed.");
-	        return;
-	      }
-	      if (packet.payload && typeof packet.payload === "object") {
-	        historyTurnCache[key] = packet.payload;
-	      }
-	      if (sessionKey === selectedControlSessionKey && selectedControlTurnKeys[sessionKey] === turnKey) {
-	        renderControlModal(true);
-	      }
-	    }
-
-	    function handleObservedTurnPacket(packet) {
-	      const sessionKey = String(packet.session_key || "");
-	      const turnKey = String(packet.turn_key || "");
-	      const cacheKey = historyCacheKey(sessionKey, turnKey);
-	      for (const key of Object.keys(observedTurnRequests)) {
-	        if (key.startsWith(`${cacheKey}\u0001`)) delete observedTurnRequests[key];
-	      }
-	      if (!packet.ok) {
-	        showUiMessage(packet.error ? `Discussion load failed: ${packet.error}` : "Discussion load failed.");
-	        return;
-	      }
-	      if (packet.payload && typeof packet.payload === "object" && Array.isArray(packet.payload.transcript)) {
-	        const incoming = packet.payload;
-	        const existing = observedTurnCache[cacheKey];
-	        const incomingLast = incoming.transcript.length
-	          ? Number(incoming.transcript[incoming.transcript.length - 1].control_index)
-	          : NaN;
-	        const existingFirst = existing && Array.isArray(existing.transcript) && existing.transcript.length
-	          ? Number(existing.transcript[0].control_index)
-	          : NaN;
-	        if (existing && Number.isFinite(incomingLast) && Number.isFinite(existingFirst) && incomingLast < existingFirst) {
-	          const merged = incoming.transcript.concat(existing.transcript);
-	          observedTurnCache[cacheKey] = { ...existing, transcript: merged, has_more_before: incoming.has_more_before, next_before_index: incoming.next_before_index };
-	        } else {
-	          observedTurnCache[cacheKey] = incoming;
-	        }
-	      }
-	      if (sessionKey === selectedControlSessionKey) renderControlModal(true);
-	    }
-
-	    function handleHistoryIndexPacket(packet) {
-	      const sessionKey = String(packet.session_key || "");
-	      delete historyIndexRequests[sessionKey];
-	      if (!packet.ok) {
-	        showUiMessage(packet.error ? `History index failed: ${packet.error}` : "History index failed.");
-	        return;
-	      }
-	      historyTurnIndexes[sessionKey] = Array.isArray(packet.turns) ? packet.turns : [];
-	      if (sessionKey === selectedControlSessionKey) renderControlModal(true);
-	    }
-
-	    function handleResumeCandidatesPacket(packet) {
-	      const sessionKey = String(packet.session_key || "");
-	      delete resumeCandidateRequests[sessionKey];
-	      if (!packet.ok) {
-	        showUiMessage(packet.error ? `Resume lookup failed: ${packet.error}` : "Resume lookup failed.");
-	        return;
-	      }
-	      resumeCandidateIndexes[sessionKey] = Array.isArray(packet.candidates) ? packet.candidates : [];
-	      if (sessionKey === selectedControlSessionKey) renderControlModal(true);
-	      if (sessionKey === selectedLauncherSessionKey) {
-	        renderLauncherBar({ control_plane: latestControlPlane });
-	      }
-	    }
-
-	    function clearPendingSessionLookups() {
-	      for (const key of Object.keys(observedTurnRequests)) delete observedTurnRequests[key];
-	      for (const key of Object.keys(historyTurnRequests)) delete historyTurnRequests[key];
-	      for (const key of Object.keys(historyIndexRequests)) delete historyIndexRequests[key];
-	      for (const key of Object.keys(resumeCandidateRequests)) delete resumeCandidateRequests[key];
-	    }
-
-    function connect() {
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
-      const url = new URL("/api/ui-ws", window.location.href);
-      url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-      url.searchParams.set("token", TOKEN);
-      socket = new WebSocket(url.toString());
-	      socket.addEventListener("open", () => {
-	        setConnection("Live", "");
-	        renderLauncherBar({ control_plane: latestControlPlane });
-	        updateControlHeaderActions(selectedControlSession());
-	        scheduleNextQuotaRefresh(250);
-	      });
-      socket.addEventListener("message", (event) => {
-        try {
-          const packet = JSON.parse(event.data);
-          if (packet.type === "state") {
-            scheduleRender(packet);
-          } else if (packet.type === "state_delta") {
-            scheduleRender(packet);
-	        } else if (packet.type === "history_turn") {
-	          handleHistoryTurnPacket(packet);
-	        } else if (packet.type === "control_turn") {
-	          handleObservedTurnPacket(packet);
-	        } else if (packet.type === "history_index") {
-	          handleHistoryIndexPacket(packet);
-	        } else if (packet.type === "resume_candidates") {
-	          handleResumeCandidatesPacket(packet);
-	        } else if (packet.type === "heartbeat") {
-            latestLiveBusy = Boolean(packet.live_busy);
-            setConnection("Live", latestLiveBusy ? "busy" : "");
-          }
-        } catch {
-          setConnection("Live", "");
-        }
-      });
-	      socket.addEventListener("close", () => {
-	        clearPendingSessionLookups();
-	        quotaRefreshInFlight = "";
-	        setConnection("Disconnected", "disconnected");
-	        renderLauncherBar({ control_plane: latestControlPlane });
-	        updateControlHeaderActions(selectedControlSession());
-	        reconnectTimer = setTimeout(connect, 1500);
-	      });
-	      socket.addEventListener("error", () => {
-	        clearPendingSessionLookups();
-	        quotaRefreshInFlight = "";
-	        setConnection("Disconnected", "disconnected");
-	        renderLauncherBar({ control_plane: latestControlPlane });
-	        updateControlHeaderActions(selectedControlSession());
-	      });
-    }
-
-	    document.addEventListener("submit", async (event) => {
-      const form = event.target.closest("form[data-action]");
-      if (!form) return;
-	      if (!socket || socket.readyState !== WebSocket.OPEN) return;
-	      event.preventDefault();
-	      const action = form.dataset.action;
-	      const profile = form.dataset.profile || "";
-	      const confirmMessage = form.dataset.confirm || "";
-	      if (confirmMessage) {
-	        const confirmed = await confirmAction({
-	          title: action === "consume_reset_credit" ? "Use reset credit" : "Confirm action",
-	          message: confirmMessage,
-	          acceptLabel: action === "consume_reset_credit" ? "Use credit" : "Confirm",
-	          danger: action === "consume_reset_credit"
-	        });
-	        if (!confirmed) return;
-	      }
-	      if ((action === "refresh_quota" || action === "consume_reset_credit") && profile) {
-	        quotaRefreshAttempted.add(profile);
-	        let queuedIndex = quotaRefreshQueue.indexOf(profile);
-	        while (queuedIndex !== -1) {
-	          quotaRefreshQueue.splice(queuedIndex, 1);
-	          queuedIndex = quotaRefreshQueue.indexOf(profile);
-	        }
-	        quotaRefreshInFlight = profile;
-	      }
-      socket.send(JSON.stringify({
-        ...Object.fromEntries(new FormData(form).entries()),
-        action,
-        profile,
-        token: TOKEN
-	      }));
-	    });
-
-	    document.getElementById("profileHiddenToggle").addEventListener("click", () => {
-	      showHiddenProfiles = !showHiddenProfiles;
-	      renderProfileRows(
-	        latestStatus && Array.isArray(latestStatus.profiles) ? latestStatus.profiles : [],
-	        "",
-	        ""
-	      );
-	    });
-
-	    document.addEventListener("toggle", (event) => {
-	      const menu = event.target;
-	      if (!(menu instanceof HTMLDetailsElement)) return;
-	      const type = menuType(menu);
-	      if (!type) return;
-	      const selector = menuSelector(type);
-	      if (menu.open) {
-	        setOpenMenuProfile(type, menu.dataset.profile || "");
-	        document.querySelectorAll(`${selector}[open]`).forEach((other) => {
-	          if (other !== menu) other.open = false;
-	        });
-	      } else if (getOpenMenuProfile(type) === (menu.dataset.profile || "")) {
-	        setOpenMenuProfile(type, null);
-	        if (type === "model") {
-	          openReasoningProfile = null;
-	          openReasoningModel = null;
-	        }
-	      }
-	    }, true);
-
-	    document.addEventListener("mouseover", (event) => {
-	      const target = event.target;
-	      if (!(target instanceof Element)) return;
-	      const option = target.closest(".model-option");
-	      if (!option) return;
-	      const menu = option.closest("details.model-menu");
-	      if (!menu || !menu.open) return;
-	      openReasoningProfile = menu.dataset.profile || null;
-	      openReasoningModel = option.dataset.model || null;
-	      document.querySelectorAll(".model-option.reasoning-open").forEach((item) => {
-	        if (item !== option) item.classList.remove("reasoning-open");
-	      });
-	      option.classList.add("reasoning-open");
-	    });
-
-	    document.addEventListener("focusin", (event) => {
-	      const target = event.target;
-	      if (!(target instanceof Element)) return;
-	      const option = target.closest(".model-option");
-	      if (!option) return;
-	      const menu = option.closest("details.model-menu");
-	      if (!menu || !menu.open) return;
-	      openReasoningProfile = menu.dataset.profile || null;
-	      openReasoningModel = option.dataset.model || null;
-	      option.classList.add("reasoning-open");
-	    });
-
-	    document.addEventListener("click", (event) => {
-	      const target = event.target;
-	      if (
-	        target instanceof Element
-	        && target.closest("details.pin-menu, details.model-menu, details.login-menu")
-	      ) return;
-	      closeOpenMenus();
-	    });
-
-	    document.addEventListener("pointerover", showUiTooltip);
-	    document.addEventListener("pointermove", (event) => {
-	      const target = uiTooltipTarget(event.target);
-	      if (target) positionUiTooltip(event, target);
-	    });
-	    document.addEventListener("pointerout", (event) => {
-	      const next = event.relatedTarget;
-	      if (next instanceof Element && uiTooltipTarget(next)) return;
-	      hideUiTooltip();
-	    });
-	    document.addEventListener("focusin", showUiTooltip);
-	    document.addEventListener("focusout", hideUiTooltip);
-
-	    document.getElementById("launcherSession").addEventListener("change", (event) => {
-	      selectedLauncherSessionKey = event.target.value || "";
-	      launcherResumeSessionId = "";
-	      renderLauncherBar({ control_plane: latestControlPlane });
-	    });
-
-	    document.getElementById("launcherMode").addEventListener("change", (event) => {
-	      launcherMode = event.target.value || "new";
-	      renderLauncherBar({ control_plane: latestControlPlane });
-	    });
-
-	    document.getElementById("launcherPermission").addEventListener("change", (event) => {
-	      launcherPermission = event.target.value || "workspace-write";
-	    });
-
-		    document.getElementById("launcherResumeSession").addEventListener("change", (event) => {
-		      launcherResumeSessionId = event.target.value || "";
-		      renderLauncherBar({ control_plane: latestControlPlane });
-		    });
-
-	    document.getElementById("launcherStart").addEventListener("click", () => {
-	      const sessionId = launcherMode === "resume-session" ? launcherResumeSessionId : "";
-	      if (launcherMode === "resume-session" && !sessionId) return;
-	      sendLaunchSession(
-	        selectedLauncherSessionKey,
-	        launcherMode,
-	        sessionId
-	      );
-	      launcherPanelOpen = false;
-	      renderSessionTabs({ control_plane: latestControlPlane });
-	      renderLauncherBar({ control_plane: latestControlPlane });
-	    });
-
-	    document.getElementById("launcherClose").addEventListener("click", () => {
-	      launcherPanelOpen = false;
-	      renderSessionTabs({ control_plane: latestControlPlane });
-	      renderLauncherBar({ control_plane: latestControlPlane });
-	    });
-
-	    document.getElementById("controlTurnSelect").addEventListener("change", (event) => {
-	      if (!selectedControlSessionKey) return;
-	      const selectedTurn = event.target.value || "";
-	      selectedControlTurnKeys[selectedControlSessionKey] = selectedTurn;
-	      if (selectedTurn) manuallySelectedControlTurnKeys[selectedControlSessionKey] = selectedTurn;
-	      else delete manuallySelectedControlTurnKeys[selectedControlSessionKey];
-	      delete controlTurnPresentations[controlTurnPresentationKey(selectedControlSession())];
-	      saveControlScroll();
-	      renderControlModal(true);
-	    });
-
-	    document.getElementById("controlTurnSelect").addEventListener("pointerenter", () => {
-	      controlTurnSelectInteracting = true;
-	    });
-
-	    document.getElementById("controlTurnSelect").addEventListener("pointerleave", () => {
-	      controlTurnSelectInteracting = false;
-	      updateControlHeaderActions(selectedControlSession());
-	    });
-
-	    document.getElementById("controlTurnSelect").addEventListener("focus", () => {
-	      controlTurnSelectInteracting = true;
-	    });
-
-	    document.getElementById("controlTurnSelect").addEventListener("blur", () => {
-	      controlTurnSelectInteracting = false;
-	      updateControlHeaderActions(selectedControlSession());
-	    });
-
-	    document.getElementById("sessionTabs").addEventListener("click", (event) => {
-	      const target = event.target;
-	      if (!(target instanceof Element)) return;
-		      const close = target.closest("[data-session-close]");
-		      if (close) {
-		        event.preventDefault();
-		        event.stopPropagation();
-		        forgetControlSession(close.dataset.sessionClose || "");
-		        return;
-		      }
-	      const launchTab = target.closest("[data-launch-tab]");
-	      if (launchTab) {
-	        saveControlScroll();
-			        resetControlPromptHistory();
-		        launcherPanelOpen = true;
-	        selectedControlSessionKey = "";
-	        pendingControlRender = false;
-	        document.getElementById("controlModal").hidden = true;
-	        renderSessionTabs({ control_plane: latestControlPlane });
-	        renderLauncherBar({ control_plane: latestControlPlane });
-	        return;
-	      }
-	      const tab = target.closest(".session-tab");
-	      if (!tab) return;
-		      saveControlScroll();
-		      resetControlPromptHistory();
-		      launcherPanelOpen = false;
-	      selectedControlSessionKey = tab.dataset.sessionKey || "";
-	      selectedLauncherSessionKey = selectedControlSessionKey;
-	      document.getElementById("controlModal").hidden = false;
-	      renderSessionTabs({ control_plane: latestControlPlane });
-	      renderLauncherBar({ control_plane: latestControlPlane });
-	      updateControlDockGeometry();
-	      renderControlModal(true);
-	    });
-
-		    document.getElementById("sessionTabs").addEventListener("dragstart", (event) => {
-		      const target = event.target;
-		      if (!(target instanceof Element)) return;
-		      const tab = target.closest(".session-tab[data-session-key]");
-		      if (!tab) return;
-		      draggedSessionTabKey = tab.dataset.sessionKey || "";
-		      tab.classList.add("dragging");
-		      if (event.dataTransfer) {
-		        event.dataTransfer.effectAllowed = "move";
-		        event.dataTransfer.setData("text/plain", draggedSessionTabKey);
-		      }
-		    });
-
-		    document.getElementById("sessionTabs").addEventListener("dragover", (event) => {
-		      if (!draggedSessionTabKey) return;
-		      const target = event.target;
-		      if (!(target instanceof Element)) return;
-		      const tab = target.closest(".session-tab[data-session-key]");
-		      if (!tab || tab.dataset.sessionKey === draggedSessionTabKey) return;
-		      event.preventDefault();
-		      clearSessionTabDropClasses();
-		      tab.classList.add(sessionTabDropPosition(tab, event) === "after" ? "drop-after" : "drop-before");
-		    });
-
-		    document.getElementById("sessionTabs").addEventListener("dragleave", (event) => {
-		      const target = event.target;
-		      if (!(target instanceof Element)) return;
-		      const tab = target.closest(".session-tab[data-session-key]");
-		      if (tab) tab.classList.remove("drop-before", "drop-after");
-		    });
-
-		    document.getElementById("sessionTabs").addEventListener("drop", (event) => {
-	      if (!draggedSessionTabKey) return;
-	      event.preventDefault();
-	      const container = document.getElementById("sessionTabs");
-		      const dragged = Array.from(container.querySelectorAll(".session-tab[data-session-key]"))
-		        .find((tab) => tab.dataset.sessionKey === draggedSessionTabKey);
-		      const target = event.target instanceof Element ? event.target.closest(".session-tab[data-session-key]") : null;
-		      if (dragged && target && target !== dragged) {
-		        const position = sessionTabDropPosition(target, event);
-		        container.insertBefore(dragged, position === "after" ? target.nextSibling : target);
-		        sendSessionTabOrder();
-		      }
-		      draggedSessionTabKey = "";
-		      clearSessionTabDropClasses();
-		    });
-
-		    document.getElementById("sessionTabs").addEventListener("dragend", () => {
-		      draggedSessionTabKey = "";
-		      clearSessionTabDropClasses();
-		    });
-
-	    document.getElementById("controlForget").addEventListener("click", async () => {
-		      await forgetControlSession(selectedControlSessionKey);
-	    });
-
-	    document.getElementById("controlClose").addEventListener("click", () => {
-	      document.getElementById("controlModal").hidden = true;
-	      selectedControlSessionKey = "";
-	      pendingControlRender = false;
-	      renderSessionTabs({ control_plane: latestControlPlane });
-	      renderLauncherBar({ control_plane: latestControlPlane });
-	    });
-
-	    document.getElementById("controlModal").addEventListener("click", (event) => {
-	      if (event.target === event.currentTarget) {
-	        event.currentTarget.hidden = true;
-	        selectedControlSessionKey = "";
-	        pendingControlRender = false;
-	        renderSessionTabs({ control_plane: latestControlPlane });
-	        renderLauncherBar({ control_plane: latestControlPlane });
-	      }
-	    });
-
-	    document.querySelectorAll("[data-control-view]").forEach((button) => {
-	      button.addEventListener("click", () => {
-	        saveControlScroll();
-	        controlView = button.dataset.controlView || "discussion";
-	        renderControlModal(true);
-	      });
-	    });
-
-	    document.getElementById("controlSearch").addEventListener("input", (event) => {
-	      controlSearchText = event.target.value || "";
-	      renderControlModal(true);
-	    });
-
-	    document.getElementById("controlContent").addEventListener("click", (event) => {
-	      const target = event.target;
-	      if (!(target instanceof Element)) return;
-	      const priorShow = target.closest("[data-control-prior-show]");
-	      if (priorShow && selectedControlSessionKey) {
-	        const session = selectedControlSession();
-	        const prior = controlTurnByKey(
-	          controlTurns(session, Array.isArray(session && session.transcript) ? session.transcript : []),
-	          priorShow.dataset.controlPriorShow || ""
-	        );
-	        if (prior) requestObservedTurn(session, prior);
-	        const presentation = controlTurnPresentations[controlTurnPresentationKey(selectedControlSession())];
-	        if (presentation) presentation.revealedKey = priorShow.dataset.controlPriorShow || "";
-	        renderControlModal(true);
-	        return;
-	      }
-	      const priorOpen = target.closest("[data-control-prior-open]");
-	      if (priorOpen && selectedControlSessionKey) {
-	        const priorKey = priorOpen.dataset.controlPriorOpen || "";
-	        if (!priorKey) return;
-	        selectedControlTurnKeys[selectedControlSessionKey] = priorKey;
-	        manuallySelectedControlTurnKeys[selectedControlSessionKey] = priorKey;
-	        delete controlTurnPresentations[controlTurnPresentationKey(selectedControlSession())];
-	        renderControlModal(true);
-	        return;
-	      }
-	      const turnMore = target.closest("[data-control-turn-more]");
-	      if (turnMore && selectedControlSessionKey) {
-	        const session = selectedControlSession();
-	        const turn = controlTurnByKey(
-	          controlTurns(session, Array.isArray(session && session.transcript) ? session.transcript : []),
-	          turnMore.dataset.controlTurnMore || ""
-	        );
-	        const before = Number(turnMore.dataset.controlTurnBefore);
-	        if (turn && Number.isFinite(before)) requestObservedTurn(session, turn, before);
-	        return;
-	      }
-	      const windowButton = target.closest("[data-control-window]");
-	      if (windowButton) {
-	        const direction = windowButton.dataset.controlWindow || "";
-	        const content = document.getElementById("controlContent");
-	        const previousHeight = content ? content.scrollHeight : 0;
-	        if (expandControlTranscriptWindow(direction)) {
-	          renderControlModal(true);
-	          if (direction === "above") {
-	            requestAnimationFrame(() => {
-	              const refreshed = document.getElementById("controlContent");
-	              if (refreshed) refreshed.scrollTop += Math.max(0, refreshed.scrollHeight - previousHeight);
-	            });
-	          }
-	        }
-	        return;
-	      }
-	      const candidate = target.closest("[data-resume-candidate]");
-	      if (candidate && selectedControlSessionKey) {
-	        selectedResumeCandidateIds[selectedControlSessionKey] = candidate.dataset.resumeCandidate || "";
-	        renderControlModal(true);
-	        return;
-	      }
-	      const resumeAction = target.closest("[data-resume-action]");
-	      if (resumeAction && selectedControlSessionKey) {
-	        const selectedId = selectedResumeCandidateIds[selectedControlSessionKey] || "";
-	        if (!selectedId) return;
-	        sendLaunchSession(selectedControlSessionKey, resumeAction.dataset.resumeAction || "resume-session", selectedId);
-	        return;
-	      }
-	      const button = target.closest(".control-show-more");
-	      if (!button) return;
-	      const key = button.dataset.messageKey || "";
-	      if (!key) return;
-	      expandedControlMessages[key] = !expandedControlMessages[key];
-	      renderControlModal(true);
-	    });
-
-	    document.getElementById("controlContent").addEventListener("scroll", () => {
-	      saveControlScroll();
-	      updateControlScrollBadges();
-	      finalizeControlTurnBridgeIfScrolledAway();
-	    }, { passive: true });
-
-	    document.getElementById("mobileFocusToggle").addEventListener("click", () => {
-	      setMobileDiscussionFocus(!mobileDiscussionFocused);
-	    });
-
-	    document.getElementById("mobileFocusRestore").addEventListener("click", () => {
-	      setMobileDiscussionFocus(false);
-	      mobileFocusScrollLockUntil = Date.now() + MOBILE_FOCUS_SCROLL_LOCK_MS;
-	      requestAnimationFrame(() => window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "auto" }));
-	    });
-
-	    window.addEventListener("wheel", (event) => {
-	      handleMobileBoundaryGesture(event.deltaY, event);
-	    }, { passive: false });
-
-	    window.addEventListener("touchstart", (event) => {
-	      if (!event.touches.length || mobileGestureTargetsDiscussion(event.target)) {
-	        mobileTouchStartY = null;
-	        return;
-	      }
-	      mobileTouchStartY = event.touches[0].clientY;
-	    }, { passive: true });
-
-	    window.addEventListener("touchmove", (event) => {
-	      if (mobileTouchStartY == null || !event.touches.length) return;
-	      handleMobileBoundaryGesture(mobileTouchStartY - event.touches[0].clientY, event);
-	    }, { passive: false });
-
-	    window.addEventListener("touchend", () => {
-	      mobileTouchStartY = null;
-	    }, { passive: true });
-
-	    window.addEventListener("resize", () => {
-	      mobileControlDockAnchorY = null;
-	      document.body.classList.remove("mobile-control-stuck");
-	      if (!mobileLayoutActive()) {
-	        resetMobileDiscussionFocus();
-	        resetMobileComposerFocus();
-	      }
-	      syncDiscussionPaneVisibility();
-	      updateControlDockGeometry();
-	      requestAnimationFrame(updateMobileControlStickiness);
-	    }, { passive: true });
-
-	    window.addEventListener("scroll", updateMobileControlStickiness, { passive: true });
-
-	    if (window.visualViewport) {
-	      window.visualViewport.addEventListener("resize", updateControlDockGeometry, { passive: true });
-	      window.visualViewport.addEventListener("scroll", updateControlDockGeometry, { passive: true });
-	    }
-
-	    document.getElementById("controlPrompt").addEventListener("focus", () => {
-	      setMobileComposerFocus(true);
-	    });
-
-	    document.getElementById("controlPrompt").addEventListener("blur", () => {
-	      window.setTimeout(() => {
-	        if (document.activeElement !== document.getElementById("controlPrompt")) resetMobileComposerFocus();
-	      }, 0);
-	    });
-
-	    document.getElementById("controlPrompt").addEventListener("input", () => {
-		      resetControlPromptHistory();
-	      updateControlComposeState(selectedControlSession());
-	    });
-
-	    document.getElementById("controlPrompt").addEventListener("keydown", (event) => {
-		      if (handleControlPromptHistory(event)) return;
-	      if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
-	      event.preventDefault();
-	      document.getElementById("controlCompose").requestSubmit();
-	    });
-
-	    document.getElementById("controlCompose").addEventListener("submit", (event) => {
-	      event.preventDefault();
-	      const prompt = document.getElementById("controlPrompt");
-	      const text = prompt.value.trim();
-	      if (!text || !selectedControlSessionKey) return;
-	      if (!socket || socket.readyState !== WebSocket.OPEN) {
-	        showUiMessage("Dashboard websocket is not connected.");
-	        return;
-	      }
-	      socket.send(JSON.stringify({
-	        action: "session_prompt",
-	        session_key: selectedControlSessionKey,
-	        prompt: text,
-	        token: TOKEN
-	      }));
-	      delete manuallySelectedControlTurnKeys[selectedControlSessionKey];
-	      prompt.value = "";
-		      resetControlPromptHistory();
-	      updateControlComposeState(selectedControlSession());
-	    });
-
-	    function sendSessionEscape() {
-	      if (!selectedControlSessionKey) return false;
-	      const session = selectedControlSession();
-	      if (!controlInteractionAvailable(session)) return false;
-	      if (!socket || socket.readyState !== WebSocket.OPEN) {
-	        showUiMessage("Dashboard websocket is not connected.");
-	        return true;
-	      }
-	      socket.send(JSON.stringify({
-	        action: "session_escape",
-	        session_key: selectedControlSessionKey,
-	        token: TOKEN
-	      }));
-	      return true;
-	    }
-
-	    document.addEventListener("keydown", (event) => {
-	      if (event.key !== "Escape" || event.defaultPrevented || pendingConfirmation) return;
-	      const modal = document.getElementById("controlModal");
-	      if (!modal || modal.hidden) return;
-	      const active = document.activeElement;
-	      if (active && active.id === "controlSearch") return;
-	      if (sendSessionEscape()) event.preventDefault();
-	    });
-
-	    document.getElementById("statsToggle").addEventListener("click", () => {
-	      const modal = document.getElementById("statsModal");
-		      setStatsOpen(!modal || modal.hidden);
-	    });
-
-	    document.getElementById("statsClose").addEventListener("click", () => {
-		      setStatsOpen(false);
-	    });
-
-	    document.getElementById("statsModal").addEventListener("click", (event) => {
-	      if (event.target === event.currentTarget) {
-		        setStatsOpen(false);
-	      }
-	    });
-
-	    document.getElementById("statsContent").addEventListener("change", (event) => {
-	      const target = event.target;
-	      if (!(target instanceof HTMLInputElement) || !target.classList.contains("stats-profile-check")) return;
-	      statsVisibleProfiles[target.value] = target.checked;
-	      renderStats(latestStats);
-	    });
-
-	    document.getElementById("statsContent").addEventListener("pointermove", (event) => {
-	      const target = event.target;
-	      if (!(target instanceof Element)) return;
-	      const graph = target.closest(".stats-graph");
-	      if (!graph) return;
-	      updateStatsGraphHover(graph, event);
-	    });
-
-	    document.getElementById("statsContent").addEventListener("pointerdown", (event) => {
-	      const target = event.target;
-	      if (!(target instanceof Element)) return;
-	      const graph = target.closest(".stats-graph");
-	      if (!graph) return;
-	      updateStatsGraphHover(graph, event);
-	    });
-
-	    document.getElementById("statsContent").addEventListener("pointerleave", (event) => {
-	      const target = event.target;
-	      if (!(target instanceof Element)) return;
-	      const graph = target.closest(".stats-graph");
-	      if (graph) hideStatsGraphHover(graph);
-	    }, true);
-
-	    document.getElementById("confirmCancel").addEventListener("click", () => {
-	      closeConfirmation(false);
-	    });
-
-	    document.getElementById("confirmAccept").addEventListener("click", () => {
-	      closeConfirmation(true);
-	    });
-
-	    document.getElementById("confirmModal").addEventListener("click", (event) => {
-	      if (event.target === event.currentTarget) closeConfirmation(false);
-	    });
-
-	    document.getElementById("themeToggle").addEventListener("click", () => {
-	      setTheme(effectiveTheme() === "dark" ? "light" : "dark");
-	    });
-
-	    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
-	      if (!savedTheme()) {
-	        document.documentElement.removeAttribute("data-theme");
-	        updateThemeToggle();
-	      }
-	    });
-
-	    document.addEventListener("keydown", (event) => {
-	      if (event.key === "Escape" && pendingConfirmation) {
-	        event.preventDefault();
-	        closeConfirmation(false);
-	      }
-	    });
-
-	    window.addEventListener("resize", () => {
-	      updateControlDockGeometry();
-	      renderControlModal(true);
-	    });
-
-	    document.addEventListener("selectionchange", () => {
-	      if (!controlSelectionActive()) setTimeout(flushPendingControlRender, 0);
-	    });
-
-	    document.getElementById("controlModal").addEventListener("focusout", () => {
-	      setTimeout(flushPendingControlRender, 0);
-	    });
-
-	    document.getElementById("controlModal").addEventListener("mouseup", () => {
-	      setTimeout(flushPendingControlRender, 0);
-	    });
-
-	    document.getElementById("statsToggle").innerHTML = CHART_ICON;
-	    updateThemeToggle();
-	    render(INITIAL);
-	    normalizeNativeTooltips(document);
-	    connect();
-  </script>
-</body>
-</html>
-""".replace("__TOKEN__", token_json).replace(
-            "__INITIAL_STATE__", initial_json
-        ).replace(
-            "__LOGIN_BROWSER_REMOTE_NOTE__", json.dumps(LOGIN_BROWSER_REMOTE_NOTE)
-        ).replace(
-            "__ACTIVE_PROFILE__", active_profile
-        ).replace(
-            "__CODEX_VERSION__", codex_version
-        ).replace(
-            "__BUSY__", busy
-        ).replace(
-            "__ACTIVE_REQUESTS__", str(active_requests)
-        ).replace(
-            "__ACTIVE_WEBSOCKETS__", str(active_websockets)
-        ).replace(
-            "__ROWS__", rows
+        return (
+            dashboard_template()
+            .replace("__INITIAL_STATE__", initial_json)
+            .replace("__LOGIN_BROWSER_REMOTE_NOTE__", json.dumps(LOGIN_BROWSER_REMOTE_NOTE))
+            .replace("__ACTIVE_PROFILE__", active_profile)
+            .replace("__DEFAULT_PROVIDER__", default_provider)
+            .replace("__CODEX_VERSION__", codex_version)
+            .replace("__BUSY__", busy)
+            .replace("__ACTIVE_REQUESTS__", str(active_requests))
+            .replace("__ACTIVE_WEBSOCKETS__", str(active_websockets))
+            .replace("__ROWS__", rows)
         )
 
     def send_json(self, data: dict[str, Any], *, status: int = 200) -> None:
         payload = json.dumps(data, indent=2).encode("utf-8")
-        self.send_response(status)
-        self.send_header("content-type", "application/json; charset=utf-8")
-        self.send_header("content-length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.send_response(status)
+            self.send_header("content-type", "application/json; charset=utf-8")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.write_downstream(payload)
+        except OSError:
+            self.close_connection = True
 
     def send_response_bytes(self, status: int, headers: Any, payload: bytes) -> None:
-        self.send_response(status)
-        for key, value in headers.items():
-            lower = key.lower()
-            if lower in RESPONSE_HOP_BY_HOP_HEADERS or lower in {"content-length", "content-encoding"}:
-                continue
-            self.send_header(key, value)
-        self.send_header("content-length", str(len(payload)))
-        self.end_headers()
-        self.write_downstream(payload)
+        try:
+            self.send_response(status)
+            for key, value in headers.items():
+                lower = key.lower()
+                if lower in RESPONSE_HOP_BY_HOP_HEADERS or lower in {
+                    "content-length",
+                    "content-encoding",
+                }:
+                    continue
+                self.send_header(key, value)
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.write_downstream(payload)
+        except OSError:
+            self.close_connection = True
 
     def send_logo_asset(self, name: str) -> None:
         payload = logo_asset_bytes(name)
         if payload is None:
             self.send_error(404)
             return
-        self.send_response(200)
-        self.send_header("content-type", "image/png")
-        self.send_header("cache-control", "public, max-age=3600")
-        self.send_header("content-length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.send_response(200)
+            self.send_header("content-type", "image/png")
+            self.send_header("cache-control", "public, max-age=3600")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.write_downstream(payload)
+        except OSError:
+            self.close_connection = True
+
+    def send_ui_asset(self, path: str) -> None:
+        asset = ui_asset(path)
+        if asset is None:
+            self.send_error(404)
+            return
+        payload, content_type = asset
+        try:
+            self.send_response(200)
+            self.send_header("content-type", content_type)
+            self.send_header("cache-control", "no-cache")
+            self.send_header("x-content-type-options", "nosniff")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.write_downstream(payload)
+        except OSError:
+            self.close_connection = True
 
     def send_html(self, data: str, *, status: int = 200) -> None:
         payload = data.encode("utf-8")
-        self.send_response(status)
-        self.send_header("content-type", "text/html; charset=utf-8")
-        self.send_header("content-length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.send_response(status)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.write_downstream(payload)
+        except OSError:
+            self.close_connection = True
+
+    def send_dashboard_html(self, data: str, *, status: int = 200) -> None:
+        payload = data.encode("utf-8")
+        session = getattr(self.server, "ui_session_token", "")
+        try:
+            self.send_response(status)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("cache-control", "no-store")
+            self.send_header("referrer-policy", "no-referrer")
+            self.send_header("x-content-type-options", "nosniff")
+            self.send_header("x-frame-options", "DENY")
+            if cookie_header := self.dashboard_cookie_header(session):
+                self.send_header("set-cookie", cookie_header)
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.write_downstream(payload)
+        except OSError:
+            self.close_connection = True
+
+    def dashboard_cookie_header(self, session: str | None = None) -> str:
+        value = session or getattr(self.server, "ui_session_token", "")
+        if not value:
+            return ""
+        cookie = SimpleCookie()
+        cookie[UI_SESSION_COOKIE] = value
+        cookie[UI_SESSION_COOKIE]["httponly"] = True
+        cookie[UI_SESSION_COOKIE]["samesite"] = "Strict"
+        cookie[UI_SESSION_COOKIE]["path"] = "/"
+        return cookie.output(header="").strip()
+
+    def send_ui_session(self) -> None:
+        try:
+            self.send_response(204)
+            self.send_header("cache-control", "no-store")
+            if cookie_header := self.dashboard_cookie_header():
+                self.send_header("set-cookie", cookie_header)
+            self.send_header("content-length", "0")
+            self.end_headers()
+        except OSError:
+            self.close_connection = True
 
 
 def write_state(paths: Paths, host: str, port: int) -> None:
@@ -19794,19 +15622,33 @@ def write_state(paths: Paths, host: str, port: int) -> None:
     paths.state.chmod(0o600)
 
 
-def serve(port: int | None = None, host: str | None = None) -> None:
+def serve(
+    port: int | None = None,
+    host: str | None = None,
+    *,
+    allow_non_loopback: bool = False,
+) -> None:
     paths = Paths()
     paths.ensure_base()
+    configure_daemon_log_rotation(paths)
     bind_host = normalize_daemon_host(host)
+    if not daemon_host_is_loopback(bind_host) and not allow_non_loopback:
+        raise RuntimeError(
+            f"refusing non-loopback daemon bind {bind_host!r}; "
+            "pass --allow-non-loopback only behind an authenticated, encrypted boundary"
+        )
+    if not daemon_host_is_loopback(bind_host):
+        sys.stderr.write(
+            f"warning: Provision is listening beyond loopback on {bind_host}; "
+            "protect this capability-bearing interface with authentication and encryption\n"
+        )
     requested_port = DEFAULT_DAEMON_PORT if port is None else port
     try:
         server = ProvisionServer((bind_host, requested_port), paths)
     except OSError:
         if port is not None or requested_port == 0:
             raise
-        sys.stderr.write(
-            f"default port {DEFAULT_DAEMON_PORT} unavailable; using a dynamic port\n"
-        )
+        sys.stderr.write(f"default port {DEFAULT_DAEMON_PORT} unavailable; using a dynamic port\n")
         server = ProvisionServer((bind_host, 0), paths)
     write_state(paths, bind_host, server.server_address[1])
     server.start_usage_auto_refresh()

@@ -3,7 +3,9 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import shutil
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -12,106 +14,124 @@ import urllib.parse
 from argparse import Namespace
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
+from email.message import Message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import provision.auth as auth_module
 import provision.cli as cli_module
 import provision.daemon as daemon_module
 import provision.launcher as launcher_module
-from provision.auth import codex_client_id_from_bytes, decode_jwt_claims, extract_metadata
-from provision.cli import cmd_import_default, daemon_switch_profile, main as cli_main
-from provision.connector import CONNECTOR_ABI_VERSION
-from provision.connector import ConnectorError
-from provision.connector import connector_abi_payload
-from provision.connector import connector_frame
-from provision.connector import decode_connector_frame
-from provision.connector import decode_connector_message
-from provision.connector import encode_connector_message
-from provision.daemon import analytics_completed_turn_ids
-from provision.daemon import analytics_turn_ids
-from provision.daemon import backend_proxy_prefix
-from provision.daemon import backend_upstream_path
-from provision.daemon import BillingRequiredError
-from provision.daemon import bridge_codex_history_into_app_home
-from provision.daemon import CHATGPT_ANALYTICS_EVENTS_PATH
-from provision.daemon import CODEX_API_POST_PROXY_PATHS
-from provision.daemon import codex_resume_candidates_for_cwd
-from provision.daemon import codex_history_turn_index_for_cwd
-from provision.daemon import codex_history_turn_payload_for_cwd
-from provision.daemon import DEFAULT_UPSTREAM_USER_AGENT
-from provision.daemon import error_requires_billing
-from provision.daemon import ensure_default_upstream_user_agent
-from provision.daemon import label_usage_payload
-from provision.daemon import logo_asset_bytes
-from provision.daemon import Handler
-from provision.daemon import model_pill_label
-from provision.daemon import normalize_codex_model_catalog
-from provision.daemon import ProvisionServer
-from provision.daemon import decode_project_session_sentinel
-from provision.daemon import daemon_url_host
-from provision.daemon import daemon_bind_address
-from provision.daemon import project_session_sentinel
-from provision.daemon import quota_panel_payload
-from provision.daemon import redact_proxy_token
-from provision.daemon import render_compact_quota_html
-from provision.daemon import render_quota_html
-from provision.daemon import request_body_session
-from provision.daemon import rewrite_model_body
-from provision.daemon import rewrite_model_websocket_message
-from provision.daemon import rewrite_service_tier_body
-from provision.daemon import rewrite_service_tier_websocket_message
-from provision.daemon import should_forward_incoming_header
-from provision.daemon import usage_payload_from_rate_limit_headers
-from provision.daemon import usage_payload_from_websocket_message
-from provision.daemon import usage_cache_summary
-from provision.daemon import usage_payload_reset_datetimes
-from provision.daemon import usage_refresh_due_at
-from provision.daemon import USAGE_AUTO_REFRESH_BILLING_BACKOFF_SECONDS
-from provision.daemon import UpstreamRoute
-from provision.daemon import WebSocketMessageTracker
-from provision.daemon import WEBSOCKET_SWITCH_IDLE_SECONDS
-from provision.daemon import websocket_accept_key
-from provision.daemon import websocket_chunk_has_application_data
-from provision.daemon import websocket_handshake_status
-from provision.daemon import websocket_message_has_terminal_event
-from provision.daemon import websocket_message_completion_action
-from provision.daemon import websocket_message_has_tool_output
-from provision.daemon import websocket_message_starts_response
-from provision.daemon import websocket_message_thread_id
-from provision.daemon import websocket_message_token_usage
-from provision.daemon import websocket_message_tool_entries
-from provision.daemon import websocket_message_turn_id
-from provision.daemon import websocket_terminal_event_keeps_work_pending
-from provision.launcher import chatgpt_base_url_override
-from provision.launcher import configured_daemon_host
-from provision.launcher import configured_daemon_port
-from provision.launcher import openai_base_url_override
+import provision.providers as providers_module
+from provision.auth import (
+    codex_client_id_from_bytes,
+    decode_jwt_claims,
+)
+from provision.cli import cmd_import_default, daemon_switch_profile
+from provision.cli import main as cli_main
+from provision.connector import (
+    CONNECTOR_ABI_VERSION,
+    ConnectorError,
+    LocalConnectorClient,
+    connector_abi_payload,
+    connector_frame,
+    decode_connector_frame,
+)
+from provision.daemon import (
+    CHATGPT_ANALYTICS_EVENTS_PATH,
+    CODEX_API_POST_PROXY_PATHS,
+    USAGE_AUTO_REFRESH_BILLING_BACKOFF_SECONDS,
+    WEBSOCKET_SWITCH_IDLE_SECONDS,
+    BillingRequiredError,
+    Handler,
+    ProvisionServer,
+    UpstreamRoute,
+    WebSocketMessageTracker,
+    analytics_completed_turn_ids,
+    analytics_turn_ids,
+    bridge_codex_history_into_app_home,
+    codex_history_turn_index_for_cwd,
+    codex_history_turn_payload_for_cwd,
+    codex_resume_candidates_for_cwd,
+    daemon_url_host,
+    decode_project_session_sentinel,
+    error_requires_billing,
+    label_usage_payload,
+    logo_asset_bytes,
+    model_pill_label,
+    normalize_codex_model_catalog,
+    project_session_sentinel,
+    quota_panel_payload,
+    render_compact_quota_html,
+    render_quota_html,
+    request_body_session,
+    rewrite_model_body,
+    rewrite_model_websocket_message,
+    rewrite_service_tier_body,
+    rewrite_service_tier_websocket_message,
+    usage_cache_summary,
+    usage_payload_from_rate_limit_headers,
+    usage_payload_from_websocket_message,
+    usage_payload_reset_datetimes,
+    usage_refresh_due_at,
+    websocket_accept_key,
+    websocket_chunk_has_application_data,
+    websocket_handshake_status,
+    websocket_message_completion_action,
+    websocket_message_has_terminal_event,
+    websocket_message_has_tool_output,
+    websocket_message_starts_response,
+    websocket_message_thread_id,
+    websocket_message_token_usage,
+    websocket_message_tool_entries,
+    websocket_message_turn_id,
+    websocket_terminal_event_keeps_work_pending,
+)
+from provision.daemon_host import daemon_bind_address
+from provision.daemon_logging import RotatingDaemonLog
+from provision.launcher import (
+    chatgpt_base_url_override,
+    configured_daemon_host,
+    configured_daemon_port,
+    openai_base_url_override,
+)
 from provision.paths import Paths
-from provision.remote import REMOTE_ACTION_IDEMPOTENCY_LIMIT
-from provision.remote import REMOTE_ACTION_STATE_MAX_BYTES
-from provision.remote import REMOTE_ACTION_STATE_VERSION
-from provision.remote import REMOTE_DISCUSSION_PAGE_ENTRIES
-from provision.remote import REMOTE_DISCUSSION_PAGE_MAX_BYTES
-from provision.remote import REMOTE_DELTA_BUFFER_LIMIT
-from provision.remote import REMOTE_DELTA_SYNC_MAX_BYTES
-from provision.remote import REMOTE_DISCUSSION_ENTRY_TEXT_MAX_BYTES
-from provision.remote import REMOTE_INITIAL_STATE_MAX_BYTES
-from provision.remote import REMOTE_MESSAGE_EXPAND_MAX_BYTES
-from provision.remote import RemoteAuthorizationError
-from provision.remote import RemoteActionCache
-from provision.remote import RemoteCursorCodec
-from provision.remote import RemoteCursorError
-from provision.remote import RemoteDeviceRegistry
-from provision.remote import RemoteError
-from provision.remote import RemoteStateSynchronizer
-from provision.remote import build_remote_discussion_page
-from provision.remote import build_remote_message_expand
-from provision.remote import build_remote_session_summaries
-from provision.remote import compact_json_bytes
+from provision.proxy_policy import (
+    DEFAULT_UPSTREAM_USER_AGENT,
+    backend_proxy_prefix,
+    backend_upstream_path,
+    ensure_default_upstream_user_agent,
+    redact_proxy_token,
+    should_forward_incoming_header,
+)
+from provision.remote import (
+    REMOTE_ACTION_IDEMPOTENCY_LIMIT,
+    REMOTE_ACTION_STATE_MAX_BYTES,
+    REMOTE_ACTION_STATE_VERSION,
+    REMOTE_DELTA_BUFFER_LIMIT,
+    REMOTE_DELTA_SYNC_MAX_BYTES,
+    REMOTE_DISCUSSION_ENTRY_TEXT_MAX_BYTES,
+    REMOTE_DISCUSSION_PAGE_ENTRIES,
+    REMOTE_DISCUSSION_PAGE_MAX_BYTES,
+    REMOTE_INITIAL_STATE_MAX_BYTES,
+    REMOTE_MESSAGE_EXPAND_MAX_BYTES,
+    RemoteActionCache,
+    RemoteAuthorizationError,
+    RemoteCursorCodec,
+    RemoteCursorError,
+    RemoteDeviceRegistry,
+    RemoteError,
+    RemoteStateSynchronizer,
+    build_remote_discussion_page,
+    build_remote_message_expand,
+    build_remote_session_summaries,
+    compact_json_bytes,
+)
 from provision.store import Store, StoreError
+from provision.ui_assets import ui_asset
 
 
 def fake_jwt(payload: dict) -> str:
@@ -122,7 +142,93 @@ def fake_jwt(payload: dict) -> str:
     return f"header.{encoded}.signature"
 
 
+def rendered_dashboard_source(handler: Handler) -> str:
+    """Return the HTML and packaged frontend sources for presentation assertions."""
+    sources = [handler.render_ui()]
+    for path in ("/assets/provision-ui.css", "/assets/provision-ui.js"):
+        asset = ui_asset(path)
+        if asset is not None:
+            sources.append(asset[0].decode("utf-8"))
+    return "\n".join(sources)
+
+
 class StoreTests(unittest.TestCase):
+    def test_provider_default_and_managed_profile_selection_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            store = Store(paths)
+            self.assertEqual(store.default_provider(), "codex")
+            self.assertEqual(store.set_default_provider("GrOk"), "grok")
+            root = store.ensure_provider_profile("grok", "work")
+            self.assertEqual(root, paths.providers / "grok" / "profiles" / "work")
+            self.assertEqual(store.active_provider_profile("grok"), "work")
+
+            reloaded = Store(paths)
+            self.assertEqual(reloaded.default_provider(), "grok")
+            self.assertEqual(reloaded.active_provider_profile("GROK"), "work")
+            self.assertEqual(reloaded.provider_profile_names("grok"), ["work"])
+
+            staged = reloaded.ensure_provider_profile("grok", "staged", set_active=False)
+            self.assertTrue(staged.is_dir())
+            self.assertEqual(reloaded.active_provider_profile("grok"), "work")
+
+    def test_provider_dispatch_is_case_insensitive_and_strips_wrapper_profile_flag(
+        self,
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_launch(provider: str, args: list[str], *, profile: str | None = None) -> int:
+            captured["provider"] = provider
+            captured["args"] = args
+            captured["profile"] = profile
+            return 23
+
+        with patch.object(cli_module, "launch_native_provider", side_effect=fake_launch):
+            self.assertEqual(
+                cli_main(["ClAuDe", "--provision-profile", "work", "--model", "sonnet"]),
+                23,
+            )
+        self.assertEqual(
+            captured,
+            {"provider": "claude", "args": ["--model", "sonnet"], "profile": "work"},
+        )
+
+        with patch.object(cli_module, "launch_native_provider", side_effect=fake_launch):
+            self.assertEqual(cli_main(["CODEX", "exec", "Say hello"]), 23)
+        self.assertEqual(
+            captured,
+            {"provider": "codex", "args": ["exec", "Say hello"], "profile": None},
+        )
+
+    def test_provider_profile_roots_reject_path_traversal(self) -> None:
+        with self.assertRaises(providers_module.ProviderError):
+            providers_module.provider_environment(Path("/tmp/provision-home"), "grok", "../outside")
+
+    def test_vendor_headless_options_bypass_managed_pty(self) -> None:
+        with (
+            patch.object(launcher_module.sys.stdin, "isatty", return_value=True),
+            patch.object(launcher_module.sys.stdout, "isatty", return_value=True),
+            patch.dict(os.environ, {}, clear=False),
+        ):
+            os.environ.pop("PROVISION_DISABLE_PTY", None)
+            self.assertFalse(
+                launcher_module.should_use_pty(
+                    ["--single", "hello"],
+                    bypass_options=providers_module.provider_spec("grok").pty_bypass_options,
+                )
+            )
+            self.assertFalse(
+                launcher_module.should_use_pty(
+                    ["--print", "hello"],
+                    bypass_options=providers_module.provider_spec("claude").pty_bypass_options,
+                )
+            )
+
+    def test_default_provider_dispatches_unqualified_vendor_arguments(self) -> None:
+        with patch.object(cli_module, "launch_default_provider", return_value=29) as launch:
+            self.assertEqual(cli_main(["--minimal"]), 29)
+        launch.assert_called_once_with(["--minimal"])
+
     def test_decode_jwt_claims(self) -> None:
         token = fake_jwt({"email": "user@example.test", "exp": 123})
         self.assertEqual(decode_jwt_claims(token)["email"], "user@example.test")
@@ -191,6 +297,833 @@ class StoreTests(unittest.TestCase):
             self.assertTrue(reloaded.read_metadata("default")["hidden"])
             reloaded.set_profile_hidden("default", False)
             self.assertFalse(reloaded.list_profiles()[0]["hidden"])
+
+    def test_non_codex_managed_session_keeps_its_provider_and_hides_codex_quota(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            server = ProvisionServer(("127.0.0.1", 0), Paths(Path(temp) / "home"))
+            try:
+                server.observe_session(
+                    "/tmp/grok-project",
+                    provider="grok",
+                    provider_profile="work",
+                    control_path="/tmp/grok-control.sock",
+                    pty_managed=True,
+                )
+                snapshot = server.session_snapshots()[0]
+                self.assertEqual(snapshot["provider"], "grok")
+                self.assertEqual(snapshot["provider_profile"], "work")
+                self.assertEqual(snapshot["associated_profile"], "work")
+                self.assertIn("not exposed", snapshot["quota_html"])
+                self.assertIn("Grok", snapshot["interaction"]["reason"])
+                server.store.profile_exists = lambda _name: True  # type: ignore[method-assign]
+                with self.assertRaisesRegex(StoreError, "Codex profile pins"):
+                    server.pin_session(snapshot["key"], "default")
+                with self.assertRaisesRegex(StoreError, "launcher currently supports Codex"):
+                    server.launch_ui_session(
+                        session_key=snapshot["key"],
+                        mode="new",
+                        permission="workspace-write",
+                    )
+            finally:
+                server.server_close()
+
+    def test_terminal_snapshot_is_local_plain_text_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            server = ProvisionServer(("127.0.0.1", 0), Paths(Path(temp) / "home"))
+            try:
+                session_key = server.observe_session(
+                    "/tmp/grok-project",
+                    provider="grok",
+                    control_path="/tmp/grok-control.sock",
+                    pty_managed=True,
+                )
+                raw = b"first\n\x1b[31mred\x1b[0m\x00 text\n"
+                encoded = daemon_module.base64.b64encode(raw).decode("ascii")
+                server.pty_control_request = lambda _path, _payload: {  # type: ignore[method-assign]
+                    "ok": True,
+                    "encoding": "base64",
+                    "output": encoded,
+                    "truncated": True,
+                }
+
+                snapshot = server.terminal_snapshot_for_session(session_key)
+
+                self.assertEqual(snapshot["provider"], "grok")
+                self.assertTrue(snapshot["truncated"])
+                self.assertIn("red text", snapshot["text"])
+                self.assertNotIn("\\x1b", snapshot["text"])
+                self.assertNotIn("\\x00", snapshot["text"])
+            finally:
+                server.server_close()
+
+    def test_grok_session_updates_feed_discussion_and_working_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state_root = root / "grok-home"
+            cwd = "/workspace/grok-project"
+            session_id = "018f0000-0000-7000-8000-000000000001"
+            session_dir = state_root / "sessions" / urllib.parse.quote(cwd, safe="") / session_id
+            session_dir.mkdir(parents=True)
+            (state_root / "active_sessions.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "cwd": cwd,
+                            "session_id": session_id,
+                            "pid": os.getpid(),
+                            "opened_at": "2026-08-01T14:16:12Z",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (session_dir / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "generated_title": "Grok integration test",
+                        "current_model_id": "grok-4.5",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def update(
+                event_id: str,
+                kind: str,
+                *,
+                text: str = "",
+                prompt_id: str = "",
+                extra: dict[str, Any] | None = None,
+            ) -> dict[str, Any]:
+                payload: dict[str, Any] = {"sessionUpdate": kind}
+                if text:
+                    payload["content"] = {"type": "text", "text": text}
+                if extra:
+                    payload.update(extra)
+                meta: dict[str, Any] = {"eventId": event_id}
+                if prompt_id:
+                    meta["promptId"] = prompt_id
+                return {
+                    "method": "session/update",
+                    "timestamp": 1785593781 + int(event_id.rsplit("-", 1)[-1]),
+                    "params": {
+                        "sessionId": session_id,
+                        "_meta": meta,
+                        "update": payload,
+                    },
+                }
+
+            prompt_id = "prompt-one"
+            records = [
+                update("event-1", "user_message_chunk", text="Inspect the project."),
+                update(
+                    "event-2",
+                    "agent_message_chunk",
+                    text="I’ll inspect the relevant files.",
+                    prompt_id=prompt_id,
+                ),
+                update(
+                    "event-3",
+                    "tool_call",
+                    prompt_id=prompt_id,
+                    extra={
+                        "toolCallId": "call-one",
+                        "title": "read_file",
+                        "rawInput": {"path": "README.md"},
+                    },
+                ),
+                update(
+                    "event-4",
+                    "tool_call_update",
+                    prompt_id=prompt_id,
+                    extra={
+                        "toolCallId": "call-one",
+                        "status": "completed",
+                        "content": [{"type": "text", "text": "File contents"}],
+                    },
+                ),
+                update(
+                    "event-5",
+                    "agent_message_chunk",
+                    text="The inspection is complete.",
+                    prompt_id=prompt_id,
+                ),
+                update(
+                    "event-6",
+                    "turn_completed",
+                    extra={
+                        "prompt_id": prompt_id,
+                        "stop_reason": "end_turn",
+                        "usage": {
+                            "inputTokens": 12345,
+                            "outputTokens": 678,
+                            "totalTokens": 13023,
+                            "cachedReadTokens": 4096,
+                            "reasoningTokens": 321,
+                            "modelCalls": 2,
+                            "costUsdTicks": 125000000,
+                            "numTurns": 2,
+                            "modelUsage": {"grok-4.5": {"totalTokens": 13023}},
+                        },
+                    },
+                ),
+            ]
+            updates_path = session_dir / "updates.jsonl"
+            updates_path.write_text(
+                "".join(json.dumps(item) + "\n" for item in records),
+                encoding="utf-8",
+            )
+            control_path = root / "grok-control.sock"
+            control_path.write_text("", encoding="utf-8")
+            server = ProvisionServer(("127.0.0.1", 0), Paths(root / "home"))
+            try:
+                session_key = server.observe_session(
+                    cwd,
+                    provider="grok",
+                    control_path=str(control_path),
+                    provider_pid=os.getpid(),
+                    provider_state_root=str(state_root),
+                    pty_managed=True,
+                )
+                server.refresh_provider_sessions(force=True)
+                session = server.control_plane_sessions()["sessions"][0]
+
+                self.assertEqual(session["key"], session_key)
+                self.assertEqual(session["title"], "Grok integration test")
+                self.assertEqual(session["provider_model"], "grok-4.5")
+                self.assertEqual(session["provider_session_id"], session_id)
+                self.assertEqual(session["provider_usage"]["totalTokens"], 13023)
+                self.assertEqual(session["provider_usage"]["modelCalls"], 2)
+                self.assertNotIn("modelUsage", session["provider_usage"])
+                self.assertTrue(session["active"])
+                self.assertFalse(session["working"])
+                self.assertEqual(
+                    [item["role"] for item in session["transcript"]],
+                    ["user", "assistant_progress", "tool", "assistant"],
+                )
+                self.assertEqual(session["transcript"][0]["turn_id"], prompt_id)
+                self.assertIn(
+                    "Tool: read_file (status completed)",
+                    session["transcript"][2]["text"],
+                )
+                self.assertEqual(session["transcript"][2]["status"], "completed")
+                self.assertEqual(
+                    session["transcript"][3]["text"],
+                    "The inspection is complete.",
+                )
+
+                handler = Handler.__new__(Handler)
+                handler.server = server
+                status = handler.ui_status_payload()
+                provider_profile = status["provider_profiles"][0]
+                self.assertEqual(provider_profile["provider"], "grok")
+                self.assertEqual(provider_profile["display_name"], "Native")
+                self.assertEqual(provider_profile["usage"]["totalTokens"], 13023)
+                self.assertFalse(provider_profile["quota"]["available"])
+                self.assertEqual(
+                    provider_profile["quota"]["source"],
+                    "grok_native_usage_command",
+                )
+
+                before = len(session["transcript"])
+                server.refresh_provider_sessions(force=True)
+                self.assertEqual(
+                    len(server.control_plane_sessions()["sessions"][0]["transcript"]),
+                    before,
+                )
+
+                next_prompt = update(
+                    "event-7",
+                    "user_message_chunk",
+                    text="Now check the tests.",
+                )
+                partial = json.dumps(next_prompt).encode("utf-8")
+                with updates_path.open("ab") as handle:
+                    handle.write(partial)
+                server.refresh_provider_sessions(force=True)
+                self.assertEqual(
+                    len(server.control_plane_sessions()["sessions"][0]["transcript"]),
+                    before,
+                )
+                with updates_path.open("ab") as handle:
+                    handle.write(b"\n")
+                server.refresh_provider_sessions(force=True)
+                session = server.control_plane_sessions()["sessions"][0]
+                self.assertTrue(session["working"])
+                self.assertEqual(session["transcript"][-1]["text"], "Now check the tests.")
+            finally:
+                server.server_close()
+
+    def test_claude_native_session_log_feeds_discussion_and_tool_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state_root = root / "claude-home"
+            cwd = "/workspace/claude-project"
+            session_id = "11111111-2222-4333-8444-555555555555"
+            (state_root / "sessions").mkdir(parents=True)
+            (state_root / "sessions" / f"{os.getpid()}.json").write_text(
+                json.dumps(
+                    {
+                        "pid": os.getpid(),
+                        "sessionId": session_id,
+                        "cwd": cwd,
+                        "updatedAt": 1785809531862,
+                        "status": "idle",
+                        "name": "claude-project",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            project_root = state_root / "projects" / cwd.replace("/", "-")
+            project_root.mkdir(parents=True)
+            prompt_id = "prompt-claude-one"
+            records = [
+                {
+                    "type": "user",
+                    "uuid": "user-one",
+                    "promptId": prompt_id,
+                    "timestamp": "2026-08-04T02:11:19.665Z",
+                    "message": {"role": "user", "content": "Inspect the project."},
+                    "origin": {"kind": "human"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "assistant-preface",
+                    "timestamp": "2026-08-04T02:11:22.813Z",
+                    "message": {
+                        "model": "claude-sonnet-5",
+                        "role": "assistant",
+                        "stop_reason": "tool_use",
+                        "content": [{"type": "text", "text": "I’ll take a look."}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "assistant-tool",
+                    "timestamp": "2026-08-04T02:11:23.186Z",
+                    "message": {
+                        "model": "claude-sonnet-5",
+                        "role": "assistant",
+                        "stop_reason": "tool_use",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu-one",
+                                "name": "Bash",
+                                "input": {
+                                    "command": "git status --short",
+                                    "description": "Check git status",
+                                },
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "user",
+                    "uuid": "tool-result-one",
+                    "promptId": prompt_id,
+                    "timestamp": "2026-08-04T02:11:23.291Z",
+                    "message": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu-one",
+                                "content": " M README.md",
+                                "is_error": False,
+                            }
+                        ],
+                    },
+                    "toolUseResult": {
+                        "stdout": " M README.md",
+                        "stderr": "",
+                        "interrupted": False,
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "assistant-closeout",
+                    "timestamp": "2026-08-04T02:11:28.034Z",
+                    "message": {
+                        "model": "claude-sonnet-5",
+                        "role": "assistant",
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "Inspection complete."}],
+                    },
+                },
+                {
+                    "type": "system",
+                    "subtype": "turn_duration",
+                    "uuid": "duration-one",
+                    "timestamp": "2026-08-04T02:11:28.064Z",
+                    "durationMs": 8370,
+                },
+                {
+                    "type": "ai-title",
+                    "sessionId": session_id,
+                    "aiTitle": "Claude integration test",
+                },
+            ]
+            (project_root / f"{session_id}.jsonl").write_text(
+                "".join(json.dumps(item) + "\n" for item in records),
+                encoding="utf-8",
+            )
+            control_path = root / "claude-control.sock"
+            control_path.write_text("", encoding="utf-8")
+            server = ProvisionServer(("127.0.0.1", 0), Paths(root / "home"))
+            try:
+                session_key = server.observe_session(
+                    cwd,
+                    provider="claude",
+                    control_path=str(control_path),
+                    provider_pid=os.getpid(),
+                    provider_state_root=str(state_root),
+                    pty_managed=True,
+                )
+                server.refresh_provider_sessions(force=True)
+                session = server.control_plane_sessions()["sessions"][0]
+
+                self.assertEqual(session["key"], session_key)
+                self.assertEqual(session["provider"], "claude")
+                self.assertEqual(session["title"], "Claude integration test")
+                self.assertEqual(session["provider_model"], "claude-sonnet-5")
+                self.assertEqual(session["provider_session_id"], session_id)
+                self.assertFalse(session["working"])
+                self.assertEqual(
+                    [item["role"] for item in session["transcript"]],
+                    ["user", "assistant", "tool", "assistant"],
+                )
+                tool = session["transcript"][2]
+                self.assertEqual(tool["call_id"], "toolu-one")
+                self.assertEqual(tool["status"], "completed")
+                self.assertIn("Tool: Bash (status completed)", tool["text"])
+                self.assertIn("Command: git status --short", tool["text"])
+                self.assertIn("Output:\n M README.md", tool["text"])
+                self.assertEqual(session["transcript"][-1]["text"], "Inspection complete.")
+
+                before = len(session["transcript"])
+                server.refresh_provider_sessions(force=True)
+                self.assertEqual(
+                    len(server.control_plane_sessions()["sessions"][0]["transcript"]),
+                    before,
+                )
+            finally:
+                server.server_close()
+
+    def test_grok_background_task_updates_one_command_card_to_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state_root = root / "grok-home"
+            cwd = "/workspace/grok-background"
+            session_id = "019f0000-0000-7000-8000-000000000002"
+            session_dir = state_root / "sessions" / urllib.parse.quote(cwd, safe="") / session_id
+            session_dir.mkdir(parents=True)
+            (state_root / "active_sessions.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "cwd": cwd,
+                            "session_id": session_id,
+                            "pid": os.getpid(),
+                            "opened_at": "2026-08-03T02:05:00Z",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (session_dir / "summary.json").write_text("{}", encoding="utf-8")
+
+            def event(number: int, update: dict[str, Any]) -> dict[str, Any]:
+                return {
+                    "timestamp": 1785809100 + number,
+                    "params": {
+                        "_meta": {"eventId": f"background-{number}", "promptId": "turn-bg"},
+                        "update": update,
+                    },
+                }
+
+            call_id = "call-background"
+            wait_id = "call-wait"
+            records = [
+                event(
+                    1,
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": call_id,
+                        "title": "run_terminal_command",
+                        "rawInput": {"command": "pytest -q", "description": "Run tests"},
+                        "_meta": {"x.ai/tool": {"kind": "execute", "label": "Execute"}},
+                    },
+                ),
+                event(
+                    2,
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": call_id,
+                        "status": "completed",
+                        "rawOutput": {
+                            "type": "BackgroundTaskStarted",
+                            "BackgroundTaskStarted": {"output_file": "/tmp/tests.log"},
+                        },
+                    },
+                ),
+                event(
+                    3,
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": call_id,
+                        "status": "in_progress",
+                        "content": [{"type": "text", "text": "tests running"}],
+                    },
+                ),
+                event(
+                    4,
+                    {
+                        "sessionUpdate": "task_backgrounded",
+                        "tool_call_id": call_id,
+                        "task_id": call_id,
+                        "command": "pytest -q",
+                        "cwd": cwd,
+                        "output_file": "/tmp/tests.log",
+                        "description": "Run tests",
+                    },
+                ),
+                event(
+                    5,
+                    {
+                        "sessionUpdate": "task_completed",
+                        "task_snapshot": {
+                            "task_id": call_id,
+                            "command": "pytest -q",
+                            "cwd": cwd,
+                            "output": "42 passed",
+                            "output_file": "/tmp/tests.log",
+                            "exit_code": 0,
+                            "duration_secs": 12.5,
+                            "completed": True,
+                            "explicitly_killed": False,
+                        },
+                    },
+                ),
+                event(
+                    6,
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": wait_id,
+                        "title": "get_command_or_subagent_output",
+                        "rawInput": {"task_ids": [call_id], "timeout_ms": 120000},
+                    },
+                ),
+                event(
+                    7,
+                    {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": wait_id,
+                        "status": "completed",
+                        "rawOutput": {
+                            "type": "TaskOutput",
+                            "Result": {
+                                "task_id": call_id,
+                                "command": "pytest -q",
+                                "status": "completed",
+                                "exit_code": 0,
+                                "duration_secs": 12.5,
+                                "output": "42 passed",
+                                "output_file": "/tmp/tests.log",
+                                "truncated": False,
+                            },
+                        },
+                    },
+                ),
+            ]
+            (session_dir / "updates.jsonl").write_text(
+                "".join(json.dumps(item) + "\n" for item in records), encoding="utf-8"
+            )
+            control_path = root / "grok-control.sock"
+            control_path.write_text("", encoding="utf-8")
+            server = ProvisionServer(("127.0.0.1", 0), Paths(root / "home"))
+            try:
+                server.observe_session(
+                    cwd,
+                    provider="grok",
+                    control_path=str(control_path),
+                    provider_pid=os.getpid(),
+                    provider_state_root=str(state_root),
+                    pty_managed=True,
+                )
+                server.refresh_provider_sessions(force=True)
+                tools = [
+                    item
+                    for item in server.control_plane_sessions()["sessions"][0]["transcript"]
+                    if item["role"] == "tool"
+                ]
+                self.assertEqual(len(tools), 1)
+                self.assertEqual(tools[0]["call_id"], call_id)
+                self.assertEqual(tools[0]["status"], "completed")
+                self.assertEqual(tools[0]["tool_kind"], "execute")
+                self.assertIn(
+                    "Tool: run_terminal_command (status completed, exit 0, duration 12.5s)",
+                    tools[0]["text"],
+                )
+                self.assertIn("Command: pytest -q", tools[0]["text"])
+                self.assertEqual(tools[0]["text"].count("42 passed"), 1)
+            finally:
+                server.server_close()
+
+    def test_grok_turn_usage_normalization_rejects_non_numeric_and_negative_values(
+        self,
+    ) -> None:
+        usage = daemon_module.normalize_grok_turn_usage(
+            {
+                "totalTokens": 123.9,
+                "modelCalls": True,
+                "reasoningTokens": -1,
+                "inputTokens": "456",
+                "costUsdTicks": 0,
+                "privateField": 999,
+            }
+        )
+
+        self.assertEqual(usage, {"totalTokens": 123, "costUsdTicks": 0})
+
+    def test_grok_edit_tool_uses_a_completed_patch_card_shape(self) -> None:
+        state: dict[str, Any] = {}
+        daemon_module.grok_tool_transcript_text(
+            {
+                "rawInput": {
+                    "file_path": "/workspace/README.md",
+                    "old_string": "Old line",
+                    "new_string": "New line",
+                },
+                "_meta": {"x.ai/tool": {"kind": "edit", "label": "Edit"}},
+            },
+            title="search_replace",
+            state=state,
+        )
+        text = daemon_module.grok_tool_transcript_text(
+            {
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "diff",
+                        "path": "/workspace/README.md",
+                        "oldText": "Old line",
+                        "newText": "New line",
+                    }
+                ],
+            },
+            title="search_replace",
+            state=state,
+        )
+
+        self.assertTrue(text.startswith("Tool: search_replace (status completed)"))
+        self.assertIn("Patch:\n*** Begin Patch", text)
+        self.assertIn("*** Update File: /workspace/README.md", text)
+        self.assertIn("-Old line\n+New line", text)
+        self.assertNotIn("Status:\n", text)
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["kind"], "edit")
+
+    def test_configured_grok_profiles_are_distinct_from_codex_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            store = Store(paths)
+            store.ensure_provider_profile("grok", "work")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                profiles = server.provider_profile_snapshots([])
+            finally:
+                server.server_close()
+
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0]["key"], "provider:grok:work")
+        self.assertEqual(profiles[0]["identity_label"], "Provision-managed GROK_HOME")
+        self.assertTrue(profiles[0]["selected_for_provider"])
+        self.assertEqual(profiles[0]["session_count"], 0)
+        self.assertFalse(profiles[0]["quota"]["available"])
+
+    def test_configured_claude_profiles_are_shown_with_bounded_identity_metadata(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            store = Store(paths)
+            store.ensure_provider_profile("claude", "work")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            server.provider_identity_cache["claude:work"] = {
+                "value": {
+                    "available": True,
+                    "logged_in": True,
+                    "status": "Logged in",
+                    "email": "developer@example.test",
+                    "organization": "Example Org",
+                    "subscription": "max",
+                    "auth_method": "claude.ai",
+                    "api_provider": "firstParty",
+                    "pending": False,
+                },
+                "updated_at": time.monotonic(),
+                "in_flight": False,
+            }
+            try:
+                profiles = server.provider_profile_snapshots([])
+                handler = Handler.__new__(Handler)
+                handler.server = server
+                row = handler.render_provider_profile_row(profiles[0])
+            finally:
+                server.server_close()
+
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0]["key"], "provider:claude:work")
+        self.assertEqual(profiles[0]["identity_label"], "Provision-managed CLAUDE_CONFIG_DIR")
+        self.assertEqual(profiles[0]["account_label"], "developer@example.test · Example Org")
+        self.assertEqual(profiles[0]["subscription_label"], "max")
+        self.assertTrue(profiles[0]["selected_for_provider"])
+        self.assertEqual(profiles[0]["selection_label"], "Claude default")
+        self.assertEqual(profiles[0]["quota"]["status"], "Use /usage in Claude")
+        self.assertIn("Claude", row)
+        self.assertIn("Managed provider profile", row)
+        self.assertIn("developer@example.test", row)
+        self.assertIn("Use /usage in Claude", row)
+
+    def test_observed_native_claude_profile_shows_session_and_model_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            server.provider_identity_cache["claude:native"] = {
+                "value": {
+                    "available": True,
+                    "logged_in": False,
+                    "status": "Not logged in",
+                    "pending": False,
+                },
+                "updated_at": time.monotonic(),
+                "in_flight": False,
+            }
+            try:
+                profiles = server.provider_profile_snapshots(
+                    [
+                        {
+                            "provider": "claude",
+                            "provider_profile": "",
+                            "provider_model": "claude-opus-4-1",
+                            "active": True,
+                            "working": True,
+                            "last_seen_monotonic": 10.0,
+                            "name": "example",
+                        }
+                    ]
+                )
+            finally:
+                server.server_close()
+
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0]["key"], "provider:claude:native")
+        self.assertEqual(profiles[0]["profile_kind_label"], "Provider native")
+        self.assertEqual(profiles[0]["models"], ["claude-opus-4-1"])
+        self.assertEqual(profiles[0]["session_count"], 1)
+        self.assertEqual(profiles[0]["active_session_count"], 1)
+        self.assertEqual(profiles[0]["working_session_count"], 1)
+        self.assertFalse(profiles[0]["logged_in"])
+
+    def test_claude_auth_status_normalization_ignores_unapproved_fields(self) -> None:
+        value = daemon_module.normalize_claude_auth_status(
+            {
+                "loggedIn": True,
+                "authMethod": "claude.ai\nsubscription",
+                "apiProvider": "firstParty",
+                "email": "developer@example.test",
+                "orgId": "org-secret-id",
+                "orgName": "Example Org",
+                "subscriptionType": "max",
+                "accessToken": "must-not-escape",
+            }
+        )
+
+        self.assertTrue(value["available"])
+        self.assertTrue(value["logged_in"])
+        self.assertEqual(value["auth_method"], "claude.ai subscription")
+        self.assertEqual(value["organization"], "Example Org")
+        self.assertNotIn("orgId", value)
+        self.assertNotIn("accessToken", value)
+        self.assertNotIn("must-not-escape", json.dumps(value))
+
+    def test_claude_auth_status_probe_uses_selected_config_root(self) -> None:
+        payload = json.dumps(
+            {
+                "loggedIn": True,
+                "authMethod": "claude.ai",
+                "apiProvider": "firstParty",
+                "email": "developer@example.test",
+                "orgId": "ignored",
+                "orgName": "Example Org",
+                "subscriptionType": "max",
+            }
+        )
+        completed = subprocess.CompletedProcess(
+            ["claude", "auth", "status", "--json"],
+            0,
+            stdout=payload,
+            stderr="",
+        )
+        with patch.object(daemon_module.shutil, "which", return_value="/usr/bin/claude"):
+            with patch.object(daemon_module.subprocess, "run", return_value=completed) as run:
+                value = daemon_module.claude_auth_status_probe(Path("/profiles/work"))
+
+        self.assertTrue(value["logged_in"])
+        self.assertEqual(run.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], "/profiles/work")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/bin/claude", "auth", "status", "--json"],
+        )
+
+    def test_claude_identity_refresh_is_async_and_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            store = Store(paths)
+            store.ensure_provider_profile("claude", "work")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            identity = {
+                "available": True,
+                "logged_in": True,
+                "status": "Logged in",
+                "email": "developer@example.test",
+            }
+            try:
+                with patch.object(
+                    daemon_module,
+                    "claude_auth_status_probe",
+                    return_value=identity,
+                ) as probe:
+                    first = server.provider_identity_snapshot("claude", "work")
+                    self.assertTrue(first["pending"])
+
+                    deadline = time.monotonic() + 1.0
+                    while time.monotonic() < deadline:
+                        cached = server.provider_identity_cache.get("claude:work")
+                        if cached and not cached.get("in_flight"):
+                            break
+                        time.sleep(0.01)
+
+                    second = server.provider_identity_snapshot("claude", "work")
+                    self.assertFalse(second["pending"])
+                    self.assertTrue(second["logged_in"])
+                    self.assertEqual(second["email"], "developer@example.test")
+                    probe.assert_called_once_with(store.provider_profile_root("claude", "work"))
+            finally:
+                server.server_close()
+
+    def test_terminal_capture_keeps_only_a_bounded_recent_tail(self) -> None:
+        capture = launcher_module.TerminalCapture(limit=8)
+        capture.append(b"first-")
+        capture.append(b"second-")
+
+        output, truncated = capture.snapshot(limit=5)
+
+        self.assertEqual(output, b"cond-")
+        self.assertTrue(truncated)
 
     def test_import_default_command_is_idempotent_without_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -375,7 +1308,10 @@ class StoreTests(unittest.TestCase):
         handler.send_ui_heartbeat = lambda: sent.append("heartbeat")  # type: ignore[method-assign]
 
         old_signature = server.ui_state_liveness_signature()
-        server.active_requests[1] = {"profile": "default", "session_key": "/workspace/app"}
+        server.active_requests[1] = {
+            "profile": "default",
+            "session_key": "/workspace/app",
+        }
         result = handler.send_ui_state_if_needed(
             last_sent_version=server.ui_state_revision(),
             last_liveness_signature=old_signature,
@@ -564,7 +1500,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(stack["weekly_text"], "84%")
         self.assertIn("Resets", stack["primary_reset_text"])
 
-    def test_quota_html_maps_a_single_weekly_window_to_not_enforced_five_hour_quota(self) -> None:
+    def test_quota_html_maps_a_single_weekly_window_to_not_enforced_five_hour_quota(
+        self,
+    ) -> None:
         weekly_window = {
             "used_percent": 40,
             "limit_window_seconds": 604800,
@@ -584,19 +1522,34 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(stack["primary_text"], "N/A")
                 self.assertTrue(stack["primary_not_enforced"])
                 self.assertEqual(stack["primary_reset_text"], "5h (Not enforced)")
-                self.assertIn('class="quota-horizon primary not-enforced">5h (Not enforced)</span>', markup)
-                self.assertIn('class="quota-primary-label-outside not-enforced">N/A</span>', markup)
+                self.assertIn(
+                    'class="quota-horizon primary not-enforced">5h (Not enforced)</span>',
+                    markup,
+                )
+                self.assertIn(
+                    'class="quota-primary-label-outside not-enforced">N/A</span>',
+                    markup,
+                )
                 self.assertIn('class="quota-primary-fill empty" style="width: 0.00%"', markup)
                 self.assertIn('class="quota-weekly-fill" style="width: 60.00%"', markup)
-                self.assertIn('class="control-compact-quota-primary not-enforced">N/A</span>', compact)
+                self.assertIn(
+                    'class="control-compact-quota-primary not-enforced">N/A</span>',
+                    compact,
+                )
 
     def test_compact_quota_html_selects_model_bucket(self) -> None:
         markup = render_compact_quota_html(
             {
                 "payload": {
                     "rate_limit": {
-                        "primary_window": {"used_percent": 25, "limit_window_seconds": 18000},
-                        "secondary_window": {"used_percent": 16, "limit_window_seconds": 604800},
+                        "primary_window": {
+                            "used_percent": 25,
+                            "limit_window_seconds": 18000,
+                        },
+                        "secondary_window": {
+                            "used_percent": 16,
+                            "limit_window_seconds": 604800,
+                        },
                     },
                     "additional_rate_limits": [
                         {
@@ -626,7 +1579,7 @@ class StoreTests(unittest.TestCase):
                                     "limit_window_seconds": 604800,
                                 },
                             },
-                        }
+                        },
                     ],
                 },
                 "fetched_at": datetime(2026, 5, 22, 15, 36),
@@ -661,8 +1614,14 @@ class StoreTests(unittest.TestCase):
                         "balance": "$12.34",
                     },
                     "rate_limit": {
-                        "primary_window": {"used_percent": 49, "limit_window_seconds": 18000},
-                        "secondary_window": {"used_percent": 100, "limit_window_seconds": 604800},
+                        "primary_window": {
+                            "used_percent": 49,
+                            "limit_window_seconds": 18000,
+                        },
+                        "secondary_window": {
+                            "used_percent": 100,
+                            "limit_window_seconds": 604800,
+                        },
                     },
                 },
                 "fetched_at": datetime(2026, 5, 22, 15, 36),
@@ -682,8 +1641,14 @@ class StoreTests(unittest.TestCase):
                         "balance": "$0.00",
                     },
                     "rate_limit": {
-                        "primary_window": {"used_percent": 49, "limit_window_seconds": 18000},
-                        "secondary_window": {"used_percent": 100, "limit_window_seconds": 604800},
+                        "primary_window": {
+                            "used_percent": 49,
+                            "limit_window_seconds": 18000,
+                        },
+                        "secondary_window": {
+                            "used_percent": 100,
+                            "limit_window_seconds": 604800,
+                        },
                     },
                 }
             }
@@ -702,8 +1667,14 @@ class StoreTests(unittest.TestCase):
                         "balance": None,
                     },
                     "rate_limit": {
-                        "primary_window": {"used_percent": 49, "limit_window_seconds": 18000},
-                        "secondary_window": {"used_percent": 100, "limit_window_seconds": 604800},
+                        "primary_window": {
+                            "used_percent": 49,
+                            "limit_window_seconds": 18000,
+                        },
+                        "secondary_window": {
+                            "used_percent": 100,
+                            "limit_window_seconds": 604800,
+                        },
                     },
                 }
             }
@@ -732,9 +1703,21 @@ class StoreTests(unittest.TestCase):
         markup = render_quota_html(
             {
                 "payload": {
-                    "rate_limit_reset_credits": {"available_count": 2},
+                    "rate_limit_reset_credits": {
+                        "available_count": 2,
+                        "credits": [
+                            {
+                                "id": "credit-soon",
+                                "issued_at": "2026-07-25T12:00:00Z",
+                                "expires_at": "2026-07-27T12:00:00Z",
+                            }
+                        ],
+                    },
                     "rate_limit": {
-                        "primary_window": {"used_percent": 100, "limit_window_seconds": 18000},
+                        "primary_window": {
+                            "used_percent": 100,
+                            "limit_window_seconds": 18000,
+                        },
                     },
                 }
             },
@@ -745,14 +1728,22 @@ class StoreTests(unittest.TestCase):
         self.assertIn("consume_reset_credit", markup)
         self.assertIn("Reset credits: 2", markup)
         self.assertIn("/api/consume-reset-credit", markup)
+        self.assertIn("data-reset-credits=", markup)
+        self.assertIn("credit-soon", markup)
+        self.assertIn('name="credit_id"', markup)
 
-    def test_quota_html_hides_reset_credit_control_without_available_count(self) -> None:
+    def test_quota_html_hides_reset_credit_control_without_available_count(
+        self,
+    ) -> None:
         markup = render_quota_html(
             {
                 "payload": {
                     "rate_limit_reset_credits": {"available_count": 0},
                     "rate_limit": {
-                        "primary_window": {"used_percent": 100, "limit_window_seconds": 18000},
+                        "primary_window": {
+                            "used_percent": 100,
+                            "limit_window_seconds": 18000,
+                        },
                     },
                 }
             },
@@ -769,7 +1760,10 @@ class StoreTests(unittest.TestCase):
                 "payload": {
                     "rate_limit_reset_credits": {"available_count": 2},
                     "rate_limit": {
-                        "primary_window": {"used_percent": 100, "limit_window_seconds": 18000},
+                        "primary_window": {
+                            "used_percent": 100,
+                            "limit_window_seconds": 18000,
+                        },
                     },
                 },
                 "reset_credit": {
@@ -828,7 +1822,9 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn("{&quot;detail&quot;", markup)
         self.assertNotIn("deactivated_workspace", markup)
 
-    def test_quota_html_translates_stringified_deactivated_workspace_error(self) -> None:
+    def test_quota_html_translates_stringified_deactivated_workspace_error(
+        self,
+    ) -> None:
         markup = render_quota_html(
             {
                 "error": '{"detail":{"code":"deactivated_workspace"}}',
@@ -854,7 +1850,9 @@ class StoreTests(unittest.TestCase):
 
         self.assertEqual(summary, "Updated 15:36 on 22 May; Workspace deactivated")
 
-    def test_usage_cache_summary_translates_stringified_deactivated_workspace_error(self) -> None:
+    def test_usage_cache_summary_translates_stringified_deactivated_workspace_error(
+        self,
+    ) -> None:
         self.assertEqual(
             usage_cache_summary({"error": '{"detail":{"code":"deactivated_workspace"}}'}),
             "This workspace is deactivated.",
@@ -898,6 +1896,7 @@ class StoreTests(unittest.TestCase):
                             {"id": "priority", "name": "Fast", "description": "faster"},
                         ],
                         "additional_speed_tiers": ["fast"],
+                        "input_modalities": ["text", "image", "audio"],
                         "minimal_client_version": "0.144.0",
                         "priority": 1,
                         "availability_nux": {"message": "New model\n\nDetails"},
@@ -918,6 +1917,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(catalog[0]["note"], "New model")
         self.assertEqual(catalog[0]["service_tiers"][0]["id"], "priority")
         self.assertEqual(catalog[0]["additional_speed_tiers"], ["fast"])
+        self.assertEqual(catalog[0]["input_modalities"], ["text", "image", "audio"])
         self.assertEqual(catalog[0]["minimal_client_version"], "0.144.0")
         self.assertEqual(catalog[0]["priority"], 1)
 
@@ -953,7 +1953,9 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn("ultra", fallback["gpt-5.6-luna"]["reasoning"])
         self.assertEqual(fallback["gpt-5.6-sol"]["minimal_client_version"], "0.144.0")
 
-    def test_codex_restart_requirement_detects_cli_change_after_daemon_start(self) -> None:
+    def test_codex_restart_requirement_detects_cli_change_after_daemon_start(
+        self,
+    ) -> None:
         requirement = daemon_module.codex_restart_requirement(
             {"version": "0.144.0"},
             {"version": "0.145.0"},
@@ -962,6 +1964,20 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(requirement["required"])
         self.assertEqual(requirement["startup_version"], "0.144.0")
         self.assertEqual(requirement["runtime_version"], "0.145.0")
+
+    def test_reported_codex_cli_prefers_runtime_version_without_hiding_restart_state(
+        self,
+    ) -> None:
+        compatibility = {
+            "cli": {"version": "0.145.0"},
+            "runtime_cli": {"version": "0.146.0"},
+        }
+
+        self.assertEqual(daemon_module.reported_codex_cli(compatibility)["version"], "0.146.0")
+        self.assertEqual(
+            daemon_module.reported_codex_cli({"cli": {"version": "0.145.0"}})["version"],
+            "0.145.0",
+        )
 
     def test_codex_compatibility_payload_reads_version_and_catalog(self) -> None:
         original_run = daemon_module.subprocess.run
@@ -989,7 +2005,13 @@ class StoreTests(unittest.TestCase):
                         }
                     )
                 )
-            if argv[:5] == ["codex", "app-server", "generate-json-schema", "--experimental", "--out"]:
+            if argv[:5] == [
+                "codex",
+                "app-server",
+                "generate-json-schema",
+                "--experimental",
+                "--out",
+            ]:
                 out_dir = Path(argv[5])
                 (out_dir / "v2").mkdir(parents=True, exist_ok=True)
                 (out_dir / "ClientRequest.json").write_text(
@@ -1000,10 +2022,18 @@ class StoreTests(unittest.TestCase):
                     "remoteControl/status/read remoteControl/enable remoteControl/disable remoteControl/pairing/start",
                     encoding="utf-8",
                 )
-                (out_dir / "v2" / "GetAccountRateLimitsResponse.json").write_text("{}", encoding="utf-8")
-                (out_dir / "v2" / "GetAccountTokenUsageResponse.json").write_text("{}", encoding="utf-8")
-                (out_dir / "v2" / "ConsumeAccountRateLimitResetCreditResponse.json").write_text("{}", encoding="utf-8")
-                (out_dir / "v2" / "RateLimitResetCreditsSummary.json").write_text("{}", encoding="utf-8")
+                (out_dir / "v2" / "GetAccountRateLimitsResponse.json").write_text(
+                    "{}", encoding="utf-8"
+                )
+                (out_dir / "v2" / "GetAccountTokenUsageResponse.json").write_text(
+                    "{}", encoding="utf-8"
+                )
+                (out_dir / "v2" / "ConsumeAccountRateLimitResetCreditResponse.json").write_text(
+                    "{}", encoding="utf-8"
+                )
+                (out_dir / "v2" / "RateLimitResetCreditsSummary.json").write_text(
+                    "{}", encoding="utf-8"
+                )
                 return Result("")
             raise AssertionError(argv)
 
@@ -1030,7 +2060,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(payload["app_server"]["control_plane"]["provision_interaction"], "pty")
         self.assertTrue(payload["app_server"]["control_plane"]["remote_control"])
 
-    def test_codex_app_server_schema_probe_reads_usage_and_reset_credit_methods(self) -> None:
+    def test_codex_app_server_schema_probe_reads_usage_and_reset_credit_methods(
+        self,
+    ) -> None:
         original_run = daemon_module.subprocess.run
 
         class Result:
@@ -1038,7 +2070,16 @@ class StoreTests(unittest.TestCase):
             stderr = ""
 
         def fake_run(argv: list[str], **_kwargs: Any) -> Result:
-            self.assertEqual(argv[:5], ["codex", "app-server", "generate-json-schema", "--experimental", "--out"])
+            self.assertEqual(
+                argv[:5],
+                [
+                    "codex",
+                    "app-server",
+                    "generate-json-schema",
+                    "--experimental",
+                    "--out",
+                ],
+            )
             out_dir = Path(argv[5])
             (out_dir / "v2").mkdir(parents=True, exist_ok=True)
             (out_dir / "ClientRequest.json").write_text(
@@ -1053,8 +2094,13 @@ class StoreTests(unittest.TestCase):
                         "modelProvider/capabilities/read",
                         "model/verification",
                         "thread/list",
+                        "thread/search",
+                        "thread/searchOccurrences",
                         "thread/read",
                         "thread/resume",
+                        "thread/turns/list",
+                        "thread/items/list",
+                        "thread/metadata/update",
                         "thread/settings/update",
                         "thread/settings/updated",
                         "thread/status/changed",
@@ -1077,6 +2123,7 @@ class StoreTests(unittest.TestCase):
                 "GetAccountTokenUsageResponse",
                 "ConsumeAccountRateLimitResetCreditResponse",
                 "RateLimitResetCreditsSummary",
+                "RawResponseCompletedNotification",
             ):
                 (out_dir / "v2" / f"{name}.json").write_text("{}", encoding="utf-8")
             return Result()
@@ -1097,6 +2144,7 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(payload["methods"]["turn_start"])
         self.assertTrue(payload["methods"]["remote_control_status_read"])
         self.assertTrue(payload["capability_groups"]["thread"]["available"])
+        self.assertTrue(payload["capability_groups"]["history"]["available"])
         self.assertTrue(payload["capability_groups"]["token_usage"]["available"])
         self.assertTrue(payload["capability_groups"]["turn"]["available"])
         self.assertTrue(payload["capability_groups"]["remote_control"]["available"])
@@ -1104,8 +2152,11 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(payload["control_plane"]["interactive"])
         self.assertTrue(payload["control_plane"]["remote_control"])
         self.assertTrue(payload["response_types"]["reset_credit_summary"])
+        self.assertTrue(payload["response_types"]["raw_response_completed"])
 
-    def test_app_server_control_plane_status_marks_missing_optional_layers(self) -> None:
+    def test_app_server_control_plane_status_marks_missing_optional_layers(
+        self,
+    ) -> None:
         methods = {name: False for name in daemon_module.APP_SERVER_CAPABILITY_METHODS}
         methods["thread_list"] = True
         methods["thread_read"] = True
@@ -1122,15 +2173,25 @@ class StoreTests(unittest.TestCase):
             ["thread_resume", "turn_start", "turn_interrupt", "turn_steer"],
         )
 
-    def test_usage_payload_from_app_server_rate_limits_response_reads_reset_credits(self) -> None:
+    def test_usage_payload_from_app_server_rate_limits_response_reads_reset_credits(
+        self,
+    ) -> None:
         payload = daemon_module.usage_payload_from_app_server_rate_limits_response(
             {
                 "rateLimits": {
                     "limitId": "codex",
                     "limitName": "Codex",
-                    "primary": {"usedPercent": 75.0, "windowDurationMins": 300, "resetsAt": "2026-06-20T12:00:00Z"},
+                    "primary": {
+                        "usedPercent": 75.0,
+                        "windowDurationMins": 300,
+                        "resetsAt": "2026-06-20T12:00:00Z",
+                    },
                     "secondary": {"usedPercent": 20.0},
-                    "credits": {"hasCredits": True, "unlimited": False, "balance": "$12.34"},
+                    "credits": {
+                        "hasCredits": True,
+                        "unlimited": False,
+                        "balance": "$12.34",
+                    },
                 },
                 "rateLimitsByLimitId": {
                     "gpt-5.3-codex-spark": {
@@ -1138,7 +2199,23 @@ class StoreTests(unittest.TestCase):
                         "primary": {"usedPercent": 40.0},
                     }
                 },
-                "rateLimitResetCredits": {"availableCount": "2"},
+                "rateLimitResetCredits": {
+                    "availableCount": "2",
+                    "credits": [
+                        {
+                            "id": "credit-soon",
+                            "status": "available",
+                            "grantedAt": "2026-07-20T12:00:00Z",
+                            "expiresAt": "2026-07-27T12:00:00Z",
+                        },
+                        {
+                            "id": "credit-used",
+                            "status": "used",
+                            "grantedAt": "2026-07-19T12:00:00Z",
+                            "expiresAt": "2026-07-26T12:00:00Z",
+                        },
+                    ],
+                },
             }
         )
 
@@ -1146,8 +2223,57 @@ class StoreTests(unittest.TestCase):
         assert payload is not None
         self.assertEqual(payload["rate_limit"]["primary_window"]["used_percent"], 75.0)
         self.assertEqual(payload["credits"]["balance"], "$12.34")
-        self.assertEqual(payload["additional_rate_limits"][0]["metered_feature"], "gpt_5.3_codex_spark")
+        self.assertEqual(
+            payload["additional_rate_limits"][0]["metered_feature"],
+            "gpt_5.3_codex_spark",
+        )
         self.assertEqual(payload["rate_limit_reset_credits"]["available_count"], 2)
+        self.assertEqual(
+            payload["rate_limit_reset_credits"]["credits"],
+            [
+                {
+                    "id": "credit-soon",
+                    "issued_at": "2026-07-20T12:00:00Z",
+                    "expires_at": "2026-07-27T12:00:00Z",
+                }
+            ],
+        )
+
+    def test_codex_spend_control_is_preserved_and_rendered_as_blocking(self) -> None:
+        payload = daemon_module.usage_payload_from_app_server_rate_limits_response(
+            {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "spendControlReached": True,
+                    "primary": {
+                        "usedPercent": 12,
+                        "windowDurationMins": 300,
+                    },
+                    "secondary": {
+                        "usedPercent": 24,
+                        "windowDurationMins": 10080,
+                    },
+                }
+            }
+        )
+
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertTrue(payload["rate_limit"]["spend_control_reached"])
+        entry = {"payload": payload}
+        markup = render_quota_html(entry)
+        compact = render_compact_quota_html(entry)
+        structured = quota_panel_payload(entry)
+
+        self.assertIn("quota-stack-spend-control", markup)
+        self.assertIn("Spend control reached", markup)
+        self.assertIn(">Blocked</span>", markup)
+        self.assertIn("control-compact-quota spend-control", compact)
+        self.assertIn(">Blocked</span>", compact)
+        stack = structured["buckets"][0]["stack"]
+        self.assertEqual(stack["special"], "spend-control")
+        self.assertEqual(stack["primary_text"], "Blocked")
+        self.assertIn("spend control reached", usage_cache_summary(entry))
 
     def test_codex_app_server_client_reads_account_rate_limits_and_usage(self) -> None:
         original_popen = daemon_module.subprocess.Popen
@@ -1159,9 +2285,45 @@ class StoreTests(unittest.TestCase):
                     "\n".join(
                         [
                             json.dumps({"id": 1, "result": {"serverInfo": {"name": "codex"}}}),
-                            json.dumps({"id": 2, "result": {"rateLimits": {"limitId": "codex"}}}),
-                            json.dumps({"id": 3, "result": {"summary": {"lifetimeTokens": 123}, "dailyUsageBuckets": []}}),
+                            json.dumps(
+                                {
+                                    "id": 2,
+                                    "result": {"rateLimits": {"limitId": "codex"}},
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "id": 3,
+                                    "result": {
+                                        "summary": {"lifetimeTokens": 123},
+                                        "dailyUsageBuckets": [],
+                                    },
+                                }
+                            ),
                             json.dumps({"id": 4, "result": {"data": [{"id": "gpt-test"}]}}),
+                            json.dumps({"id": 5, "result": {"outcome": "reset"}}),
+                            json.dumps({"id": 6, "result": {"data": [{"id": "thread-1"}]}}),
+                            json.dumps({"id": 7, "result": {"data": [{"id": "turn-1"}]}}),
+                            json.dumps(
+                                {
+                                    "id": 8,
+                                    "result": {
+                                        "data": [
+                                            {
+                                                "turnId": "turn-1",
+                                                "item": {"id": "item-1"},
+                                            }
+                                        ]
+                                    },
+                                }
+                            ),
+                            json.dumps({"id": 9, "result": {"data": [{"turnId": "turn-1"}]}}),
+                            json.dumps(
+                                {
+                                    "id": 10,
+                                    "result": {"thread": {"id": "thread-1", "isPinned": True}},
+                                }
+                            ),
                             "",
                         ]
                     )
@@ -1192,6 +2354,23 @@ class StoreTests(unittest.TestCase):
                 rate_limits = client.read_account_rate_limits()
                 usage = client.read_account_usage()
                 models = client.list_models()
+                reset_credit = client.consume_account_rate_limit_reset_credit(
+                    "reset-key",
+                    credit_id="credit-later",
+                )
+                threads = client.list_threads(cursor="thread-cursor", is_pinned=True)
+                turns = client.list_thread_turns("thread-1", cursor="turn-cursor")
+                items = client.list_thread_items(
+                    "thread-1",
+                    turn_id="turn-1",
+                    cursor="item-cursor",
+                )
+                occurrences = client.search_thread_occurrences(
+                    "thread-1",
+                    "closeout",
+                    cursor="search-cursor",
+                )
+                pinned = client.update_thread_pin("thread-1", is_pinned=True)
         finally:
             daemon_module.subprocess.Popen = original_popen
 
@@ -1202,9 +2381,28 @@ class StoreTests(unittest.TestCase):
         self.assertIn('"method":"account/rateLimits/read"', sent)
         self.assertIn('"method":"account/usage/read"', sent)
         self.assertIn('"method":"model/list","id":4,"params":{}', sent)
+        self.assertIn('"method":"account/rateLimitResetCredit/consume"', sent)
+        self.assertIn('"idempotencyKey":"reset-key"', sent)
+        self.assertIn('"creditId":"credit-later"', sent)
+        self.assertIn('"method":"thread/list"', sent)
+        self.assertIn('"cursor":"thread-cursor"', sent)
+        self.assertIn('"isPinned":true', sent)
+        self.assertIn('"method":"thread/turns/list"', sent)
+        self.assertIn('"itemsView":"summary"', sent)
+        self.assertIn('"method":"thread/items/list"', sent)
+        self.assertIn('"turnId":"turn-1"', sent)
+        self.assertIn('"method":"thread/searchOccurrences"', sent)
+        self.assertIn('"searchTerm":"closeout"', sent)
+        self.assertIn('"method":"thread/metadata/update"', sent)
         self.assertEqual(rate_limits["rateLimits"]["limitId"], "codex")
         self.assertEqual(usage["summary"]["lifetimeTokens"], 123)
         self.assertEqual(models["data"][0]["id"], "gpt-test")
+        self.assertEqual(reset_credit["outcome"], "reset")
+        self.assertEqual(threads["data"][0]["id"], "thread-1")
+        self.assertEqual(turns["data"][0]["id"], "turn-1")
+        self.assertEqual(items["data"][0]["item"]["id"], "item-1")
+        self.assertEqual(occurrences["data"][0]["turnId"], "turn-1")
+        self.assertTrue(pinned["thread"]["isPinned"])
 
     def test_app_server_rate_limit_refresh_failure_logs_and_backs_off(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1224,6 +2422,7 @@ class StoreTests(unittest.TestCase):
             server = ProvisionServer(("127.0.0.1", 0), paths)
             original_read = server.read_app_server_rate_limit_payload_for_profile
             try:
+
                 def fail_read(_profile: str) -> None:
                     raise RuntimeError("boom")
 
@@ -1236,7 +2435,10 @@ class StoreTests(unittest.TestCase):
                 server.server_close()
 
             self.assertIsNone(result)
-            self.assertIn("app-server rate-limit read for profile default failed: boom", output.getvalue())
+            self.assertIn(
+                "app-server rate-limit read for profile default failed: boom",
+                output.getvalue(),
+            )
             entry = server.app_server_rate_limit_cache["default"]
             self.assertFalse(entry["in_flight"])
             self.assertIn("failed_monotonic", entry)
@@ -1310,7 +2512,9 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(snapshot["catalog"][0]["id"], "gpt-profile-only")
             self.assertEqual(snapshot["catalog"][0]["reasoning"], ["minimal", "high"])
 
-    def test_reset_credit_guard_blocks_duplicate_consume_before_upstream_call(self) -> None:
+    def test_reset_credit_guard_blocks_duplicate_consume_before_upstream_call(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             auth = {
@@ -1351,7 +2555,9 @@ class StoreTests(unittest.TestCase):
 
             self.assertFalse(called)
 
-    def test_reset_credit_consume_waits_for_usage_confirmation_before_cache_update(self) -> None:
+    def test_reset_credit_consume_waits_for_usage_confirmation_before_cache_update(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             auth = {
@@ -1394,17 +2600,153 @@ class StoreTests(unittest.TestCase):
                     "rate_limits": optimistic_rate_limits,
                 }
 
-                result = server.consume_profile_rate_limit_reset_credit("default", idempotency_key="test-key")
+                result = server.consume_profile_rate_limit_reset_credit(
+                    "default", idempotency_key="test-key"
+                )
             finally:
                 server.server_close()
 
             self.assertEqual(result["outcome"], "reset")
             snapshot = server.usage_cache_snapshot("default")
             assert snapshot is not None
-            self.assertEqual(snapshot["payload"]["rate_limit"]["secondary_window"]["used_percent"], 99.0)
+            self.assertEqual(
+                snapshot["payload"]["rate_limit"]["secondary_window"]["used_percent"],
+                99.0,
+            )
             status = server.reset_credit_status("default")
             self.assertTrue(status["blocks"])
             self.assertEqual(status["status"], "verifying")
+
+    def test_reset_credit_consume_selects_soonest_expiring_complete_credit_list(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            auth = {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": fake_jwt({"email": "user@example.test"}),
+                    "access_token": fake_jwt({"exp": 9999999999}),
+                    "refresh_token": "rt_test",
+                },
+            }
+            source = root / "auth.json"
+            source.write_text(json.dumps(auth), encoding="utf-8")
+            paths = Paths(root / "home")
+            Store(paths).import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+
+            before_rate_limits = {
+                "rateLimits": {"limitId": "codex", "primary": {"usedPercent": 100.0}},
+                "rateLimitResetCredits": {
+                    "availableCount": 3,
+                    "credits": [
+                        {
+                            "id": "no-expiry",
+                            "status": "available",
+                            "grantedAt": 100,
+                            "expiresAt": None,
+                        },
+                        {
+                            "id": "later",
+                            "status": "available",
+                            "grantedAt": 90,
+                            "expiresAt": 300,
+                        },
+                        {
+                            "id": "soonest",
+                            "status": "available",
+                            "grantedAt": 110,
+                            "expiresAt": 200,
+                        },
+                    ],
+                },
+            }
+            after_rate_limits = {
+                "rateLimits": {"limitId": "codex", "primary": {"usedPercent": 0.0}},
+                "rateLimitResetCredits": {"availableCount": 2},
+            }
+
+            class FakeClient:
+                def __init__(self) -> None:
+                    self.reads = 0
+                    self.credit_id: str | None = None
+
+                def read_account_rate_limits(self) -> dict[str, Any]:
+                    self.reads += 1
+                    return before_rate_limits if self.reads == 1 else after_rate_limits
+
+                def consume_account_rate_limit_reset_credit(
+                    self,
+                    _idempotency_key: str,
+                    *,
+                    credit_id: str | None = None,
+                ) -> dict[str, str]:
+                    self.credit_id = credit_id
+                    return {"outcome": "reset"}
+
+            client = FakeClient()
+            try:
+                server.schedule_reset_credit_verification = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+                server.run_app_server_for_profile = lambda _profile, callback: callback(client)  # type: ignore[method-assign]
+
+                result = server.consume_profile_rate_limit_reset_credit(
+                    "default", idempotency_key="test-key"
+                )
+            finally:
+                server.server_close()
+
+            self.assertEqual(result["outcome"], "reset")
+            self.assertEqual(client.credit_id, "soonest")
+            self.assertEqual(client.reads, 2)
+
+    def test_reset_credit_selection_falls_back_when_credit_details_are_incomplete(
+        self,
+    ) -> None:
+        self.assertIsNone(
+            daemon_module.preferred_rate_limit_reset_credit_id(
+                {
+                    "availableCount": 2,
+                    "credits": [
+                        {
+                            "id": "visible",
+                            "status": "available",
+                            "grantedAt": 100,
+                            "expiresAt": 200,
+                        },
+                    ],
+                }
+            )
+        )
+
+    def test_reset_credit_selection_accepts_only_currently_available_explicit_credit(
+        self,
+    ) -> None:
+        reset_credits = {
+            "availableCount": 2,
+            "credits": [
+                {
+                    "id": "later",
+                    "status": "available",
+                    "grantedAt": 90,
+                    "expiresAt": 300,
+                },
+                {
+                    "id": "soonest",
+                    "status": "available",
+                    "grantedAt": 110,
+                    "expiresAt": 200,
+                },
+                {"id": "spent", "status": "used", "grantedAt": 50, "expiresAt": 100},
+            ],
+        }
+
+        self.assertEqual(
+            daemon_module.selected_rate_limit_reset_credit_id(reset_credits, "later"),
+            "later",
+        )
+        with self.assertRaisesRegex(daemon_module.StoreError, "no longer available"):
+            daemon_module.selected_rate_limit_reset_credit_id(reset_credits, "spent")
 
     def test_usage_fetch_verifies_reset_credit_and_starts_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1520,7 +2862,9 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(payload["credits"]["balance"], "$1.00")
             self.assertEqual(payload["rate_limit_reset_credits"]["available_count"], 2)
 
-    def test_fetch_usage_ignores_app_server_rate_limits_while_reset_verifies(self) -> None:
+    def test_fetch_usage_ignores_app_server_rate_limits_while_reset_verifies(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             auth = {
@@ -1614,7 +2958,10 @@ class StoreTests(unittest.TestCase):
             finally:
                 server.server_close()
 
-            self.assertIn("usage auto-refresh for profile default failed: surprise", output.getvalue())
+            self.assertIn(
+                "usage auto-refresh for profile default failed: surprise",
+                output.getvalue(),
+            )
 
     def test_server_log_message_redacts_proxy_token(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1632,6 +2979,106 @@ class StoreTests(unittest.TestCase):
 
             self.assertIn("provision-<redacted>", output.getvalue())
             self.assertNotIn(server.proxy_token, output.getvalue())
+
+    def test_rotating_daemon_log_retains_bounded_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "daemon.log"
+            sink = RotatingDaemonLog(log, max_bytes=8, backup_count=2)
+            try:
+                sink.write("12345678")
+                sink.write("ab")
+                sink.write("cdefghij")
+            finally:
+                sink.close()
+
+            self.assertEqual(log.read_text(encoding="utf-8"), "cdefghij")
+            self.assertEqual((Path(temp) / "daemon.log.1").read_text(encoding="utf-8"), "ab")
+            self.assertEqual((Path(temp) / "daemon.log.2").read_text(encoding="utf-8"), "12345678")
+            self.assertEqual(oct(log.stat().st_mode & 0o777), "0o600")
+
+    def test_proxy_final_cleanup_survives_statistics_and_log_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "auth.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "id_token": fake_jwt({"email": "user@example.test"}),
+                            "access_token": fake_jwt({"exp": 9999999999}),
+                            "refresh_token": "rt_test",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            paths = Paths(root / "home")
+            Store(paths).import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            handler.headers = Message()
+            handler.authorized_proxy_request = lambda: True  # type: ignore[method-assign]
+            handler.request_session = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+            handler._proxy_to_upstream_once = lambda *_args, **_kwargs: (200, 0)  # type: ignore[method-assign]
+
+            def fail(*_args: object, **_kwargs: object) -> None:
+                raise OSError("simulated log filesystem failure")
+
+            original_stats = server.record_http_stats
+            server.record_http_stats = fail  # type: ignore[method-assign]
+            handler.log_message = fail  # type: ignore[method-assign]
+            try:
+                with self.assertRaises(OSError):
+                    handler.proxy_to_upstream("GET", urllib.parse.urlparse("/v1/models"))
+                self.assertEqual(server.request_count(), 0)
+            finally:
+                server.record_http_stats = original_stats  # type: ignore[method-assign]
+                server.server_close()
+
+    def test_stale_upstream_request_records_expire(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            server = ProvisionServer(("127.0.0.1", 0), Paths(Path(temp) / "home"))
+            try:
+                now = time.monotonic()
+                server.active_requests = {
+                    1: {
+                        "profile": "default",
+                        "session_key": "/workspace/stale",
+                        "started_monotonic": now - daemon_module.STALE_HTTP_REQUEST_SECONDS - 1,
+                    },
+                    2: {
+                        "profile": "default",
+                        "session_key": "/workspace/live",
+                        "started_monotonic": now,
+                    },
+                }
+
+                self.assertEqual(server.request_count(), 1)
+                self.assertNotIn(1, server.active_requests)
+                self.assertIn(2, server.active_requests)
+            finally:
+                server.server_close()
+
+    def test_send_json_tolerates_disconnected_client(self) -> None:
+        class BrokenWriter:
+            def write(self, _data: bytes) -> int:
+                raise BrokenPipeError()
+
+            def flush(self) -> None:
+                return
+
+        handler = Handler.__new__(Handler)
+        handler.wfile = BrokenWriter()
+        handler.close_connection = False
+        handler.send_response = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+        handler.send_header = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+        handler.end_headers = lambda: None  # type: ignore[method-assign]
+
+        handler.send_json({"error": "network unavailable"}, status=502)
+
+        self.assertTrue(handler.close_connection)
 
     def test_cancel_profile_login_terminates_running_process(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1855,7 +3302,12 @@ class StoreTests(unittest.TestCase):
                     "payload": {
                         "type": "message",
                         "role": "user",
-                        "content": [{"type": "input_text", "text": "Find the hidden ladder reference"}],
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "Find the hidden ladder reference",
+                            }
+                        ],
                     },
                 },
                 {
@@ -1864,7 +3316,12 @@ class StoreTests(unittest.TestCase):
                     "payload": {
                         "type": "message",
                         "role": "assistant",
-                        "content": [{"type": "output_text", "text": "The ladder first appears here."}],
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "The ladder first appears here.",
+                            }
+                        ],
                     },
                 },
             ]
@@ -1878,10 +3335,13 @@ class StoreTests(unittest.TestCase):
                 codex_home=root,
             )
 
-            self.assertEqual([turn["label"] for turn in turns], [
-                "First historical prompt",
-                "Find the hidden ladder reference",
-            ])
+            self.assertEqual(
+                [turn["label"] for turn in turns],
+                [
+                    "First historical prompt",
+                    "Find the hidden ladder reference",
+                ],
+            )
             self.assertTrue(all(turn["source"] == "history" for turn in turns))
             self.assertTrue(all("transcript" not in turn for turn in turns))
             self.assertEqual(turns[0]["turn_id"], "turn-first")
@@ -1937,7 +3397,7 @@ class StoreTests(unittest.TestCase):
                         "type": "function_call",
                         "name": "local_shell",
                         "call_id": "call-history",
-                        "arguments": "{\"cmd\":\"pytest -q\"}",
+                        "arguments": '{"cmd":"pytest -q"}',
                         "status": "completed",
                     },
                 },
@@ -1976,11 +3436,111 @@ class StoreTests(unittest.TestCase):
             self.assertIn("Command: pytest -q", text)
             self.assertNotIn("Earlier answer", text)
 
+    def test_codex_history_merges_programmatic_calls_with_their_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session_dir = root / "sessions" / "2026" / "08" / "03"
+            session_dir.mkdir(parents=True)
+            session_file = session_dir / "rollout-2026-08-03T21-00-00-history-tools.jsonl"
+            call_id = "call_history_programmatic"
+            rows = [
+                {
+                    "timestamp": "2026-08-03T21:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "history-tools",
+                        "timestamp": "2026-08-03T21:00:00Z",
+                        "cwd": "/workspace/provision",
+                    },
+                },
+                {
+                    "timestamp": "2026-08-03T21:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Inspect the tool output"}],
+                    },
+                },
+                {
+                    "timestamp": "2026-08-03T21:00:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call",
+                        "name": "exec",
+                        "call_id": call_id,
+                        "status": "completed",
+                        "input": (
+                            'const r = await tools.exec_command({cmd:"rg -n AOPA docs",'
+                            'workdir:"/workspace/provision"}); text(r.output);'
+                        ),
+                    },
+                },
+                {
+                    "timestamp": "2026-08-03T21:00:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "call_id": call_id,
+                        "output": [
+                            {"type": "input_text", "text": "Script completed\n"},
+                            {
+                                "type": "input_text",
+                                "text": "Output:\nAOPA found\ncourt_lines:\n3\n",
+                            },
+                        ],
+                    },
+                },
+            ]
+            session_file.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            turns = codex_history_turn_index_for_cwd(
+                "/workspace/provision",
+                codex_home=root,
+            )
+            payload = codex_history_turn_payload_for_cwd(
+                "/workspace/provision",
+                turns[0]["key"],
+                codex_home=root,
+            )
+
+            self.assertIsNotNone(payload)
+            assert payload is not None
+            tools = [item for item in payload["transcript"] if item["role"] == "tool"]
+            self.assertEqual(len(tools), 1)
+            self.assertEqual(tools[0]["call_id"], call_id)
+            self.assertIn("Command: rg -n AOPA docs (status completed)", tools[0]["full_text"])
+            self.assertNotIn(f"Tool: {call_id}", tools[0]["full_text"])
+            header, sections = daemon_module.tool_transcript_sections(tools[0]["full_text"])
+            self.assertIn("rg -n AOPA docs", header)
+            self.assertEqual([label for label, _text in sections], ["Output"])
+            self.assertIn("Output:\nAOPA found", sections[0][1])
+            self.assertIn("court_lines:\n3", sections[0][1])
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for browser renderer tests")
+    def test_ui_markdown_and_tool_card_regression_corpus(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+
+        result = subprocess.run(
+            ["node", "tools/check_ui_markdown.mjs"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertIn("UI Markdown/tool-card checks passed:", result.stdout)
+
     def test_codex_history_turns_include_archived_rollouts(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
 
-            def write_session(directory: Path, session_id: str, timestamp: str, prompt: str) -> None:
+            def write_session(
+                directory: Path, session_id: str, timestamp: str, prompt: str
+            ) -> None:
                 directory.mkdir(parents=True, exist_ok=True)
                 rows = [
                     {
@@ -2069,13 +3629,9 @@ class StoreTests(unittest.TestCase):
     def test_websocket_activity_distinguishes_control_frames(self) -> None:
         self.assertFalse(websocket_chunk_has_application_data(b"\x89\x00"))
         self.assertFalse(websocket_chunk_has_application_data(b"\x8a\x00"))
-        self.assertFalse(
-            websocket_chunk_has_application_data(b"\x89\x80\x00\x00\x00\x00")
-        )
+        self.assertFalse(websocket_chunk_has_application_data(b"\x89\x80\x00\x00\x00\x00"))
         self.assertTrue(websocket_chunk_has_application_data(b"\x81\x05hello"))
-        self.assertTrue(
-            websocket_chunk_has_application_data(b"\x81\x85\x00\x00\x00\x00hello")
-        )
+        self.assertTrue(websocket_chunk_has_application_data(b"\x81\x85\x00\x00\x00\x00hello"))
 
     def test_websocket_message_tracker_unmasks_client_frames(self) -> None:
         tracker = WebSocketMessageTracker()
@@ -2181,9 +3737,45 @@ class StoreTests(unittest.TestCase):
             {
                 "input_tokens": 10,
                 "cached_input_tokens": 4,
+                "cache_write_input_tokens": 0,
                 "output_tokens": 7,
                 "reasoning_output_tokens": 3,
                 "total_tokens": 17,
+            },
+        )
+
+    def test_app_server_exact_usage_normalizes_camel_case_and_cache_writes(self) -> None:
+        usage = websocket_message_token_usage(
+            0x1,
+            json.dumps(
+                {
+                    "method": "rawResponse/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "responseId": "resp-1",
+                        "usage": {
+                            "inputTokens": 21,
+                            "cachedInputTokens": 8,
+                            "cacheWriteInputTokens": 5,
+                            "outputTokens": 13,
+                            "reasoningOutputTokens": 3,
+                            "totalTokens": 34,
+                        },
+                    },
+                }
+            ).encode("utf-8"),
+        )
+
+        self.assertEqual(
+            usage,
+            {
+                "input_tokens": 21,
+                "cached_input_tokens": 8,
+                "cache_write_input_tokens": 5,
+                "output_tokens": 13,
+                "reasoning_output_tokens": 3,
+                "total_tokens": 34,
             },
         )
 
@@ -2299,10 +3891,7 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(
             websocket_message_has_tool_output(
                 0x1,
-                (
-                    b'{"type":"response.output_item.done","item":'
-                    b'{"type":"custom_tool_call"}}'
-                ),
+                (b'{"type":"response.output_item.done","item":{"type":"custom_tool_call"}}'),
             )
         )
 
@@ -2311,7 +3900,11 @@ class StoreTests(unittest.TestCase):
             "type": "response.create",
             "client_metadata": {
                 "x-codex-turn-metadata": json.dumps(
-                    {"turn_id": "turn-123", "thread_id": "thread-456", "cwd": "/workspace/provision"}
+                    {
+                        "turn_id": "turn-123",
+                        "thread_id": "thread-456",
+                        "cwd": "/workspace/provision",
+                    }
                 ),
             },
             "response": {
@@ -2828,8 +4421,11 @@ class StoreTests(unittest.TestCase):
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
             try:
+
                 def post(token: str) -> tuple[int, bytes]:
-                    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
+                    conn = http.client.HTTPConnection(
+                        "127.0.0.1", server.server_address[1], timeout=2
+                    )
                     conn.request(
                         "POST",
                         "/api/profile-visibility",
@@ -2958,7 +4554,7 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(rewritten["model"], "gpt-5.4-mini")
             self.assertEqual(rewritten["reasoning"]["effort"], "high")
 
-    def test_image_api_proxy_forwards_generation_and_multipart_edit_bodies(self) -> None:
+    def test_codex_api_proxy_forwards_supported_auxiliary_request_bodies(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             auth = {
@@ -3018,6 +4614,11 @@ class StoreTests(unittest.TestCase):
                         b"--provision-boundary--\r\n",
                         "multipart/form-data; boundary=provision-boundary",
                     ),
+                    (
+                        "/v1/alpha/search",
+                        b'{"query":"Provision web search proxy"}',
+                        "application/json",
+                    ),
                 ]
                 for path, body, content_type in requests:
                     conn = http.client.HTTPConnection(
@@ -3058,7 +4659,7 @@ class StoreTests(unittest.TestCase):
                 ],
             )
 
-    def test_image_edit_proxy_preserves_multipart_body_and_content_type_upstream(self) -> None:
+    def test_codex_api_proxy_preserves_supported_request_bodies_upstream(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source = root / "auth.json"
@@ -3077,14 +4678,18 @@ class StoreTests(unittest.TestCase):
             )
             paths = Paths(root / "home")
             Store(paths).import_auth_file("default", source)
-            captured: dict[str, object] = {}
+            captured: list[dict[str, object]] = []
 
             class UpstreamHandler(BaseHTTPRequestHandler):
                 def do_POST(self) -> None:  # noqa: N802 - stdlib callback name
                     length = int(self.headers.get("content-length", "0"))
-                    captured["path"] = self.path
-                    captured["content_type"] = self.headers.get("content-type")
-                    captured["body"] = self.rfile.read(length)
+                    captured.append(
+                        {
+                            "path": self.path,
+                            "content_type": self.headers.get("content-type"),
+                            "body": self.rfile.read(length),
+                        }
+                    )
                     self.send_response(200)
                     self.send_header("content-type", "application/json")
                     self.send_header("content-length", "11")
@@ -3113,28 +4718,43 @@ class StoreTests(unittest.TestCase):
 
             Handler.upstream_url = local_upstream_url
             server_thread.start()
-            body = (
-                b"--provision-boundary\r\n"
-                b'Content-Disposition: form-data; name="image"; filename="source.png"\r\n'
-                b"Content-Type: image/png\r\n\r\n"
-                b"PNG-bytes\r\n"
-                b"--provision-boundary--\r\n"
-            )
-            content_type = "multipart/form-data; boundary=provision-boundary"
-            try:
-                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=2)
-                conn.request(
-                    "POST",
+            requests = [
+                (
                     "/v1/images/edits",
-                    body=body,
-                    headers={
-                        "authorization": f"Bearer {server.proxy_token}",
-                        "content-type": content_type,
-                    },
-                )
-                response = conn.getresponse()
-                response.read()
-                conn.close()
+                    b"--provision-boundary\r\n"
+                    b'Content-Disposition: form-data; name="image"; filename="source.png"\r\n'
+                    b"Content-Type: image/png\r\n\r\n"
+                    b"PNG-bytes\r\n"
+                    b"--provision-boundary--\r\n",
+                    "multipart/form-data; boundary=provision-boundary",
+                    "/images/edits",
+                ),
+                (
+                    "/v1/alpha/search",
+                    b'{"query":"Provision web search proxy"}',
+                    "application/json",
+                    "/alpha/search",
+                ),
+            ]
+            responses: list[http.client.HTTPResponse] = []
+            try:
+                for path, body, content_type, _upstream_path in requests:
+                    conn = http.client.HTTPConnection(
+                        "127.0.0.1", server.server_address[1], timeout=2
+                    )
+                    conn.request(
+                        "POST",
+                        path,
+                        body=body,
+                        headers={
+                            "authorization": f"Bearer {server.proxy_token}",
+                            "content-type": content_type,
+                        },
+                    )
+                    response = conn.getresponse()
+                    response.read()
+                    conn.close()
+                    responses.append(response)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -3144,18 +4764,29 @@ class StoreTests(unittest.TestCase):
                 upstream.server_close()
                 upstream_thread.join(timeout=2)
 
-            self.assertEqual(response.status, 200)
-            self.assertEqual(captured["path"], "/images/edits")
-            self.assertEqual(captured["content_type"], content_type)
-            self.assertEqual(captured["body"], body)
+            self.assertEqual([response.status for response in responses], [200, 200])
+            self.assertEqual(
+                captured,
+                [
+                    {
+                        "path": upstream_path,
+                        "content_type": content_type,
+                        "body": body,
+                    }
+                    for _path, body, content_type, upstream_path in requests
+                ],
+            )
 
-    def test_codex_api_post_proxy_allowlist_includes_supported_image_endpoints(self) -> None:
+    def test_codex_api_post_proxy_allowlist_includes_supported_auxiliary_endpoints(
+        self,
+    ) -> None:
         self.assertEqual(
             CODEX_API_POST_PROXY_PATHS,
             frozenset(
                 {
                     "/v1/responses",
                     "/v1/responses/compact",
+                    "/v1/alpha/search",
                     "/v1/images/generations",
                     "/v1/images/edits",
                 }
@@ -3196,6 +4827,7 @@ class StoreTests(unittest.TestCase):
                         "usage": {
                             "input_tokens": 10,
                             "cached_input_tokens": 3,
+                            "cache_write_input_tokens": 2,
                             "output_tokens": 5,
                             "reasoning_output_tokens": 2,
                             "total_tokens": 15,
@@ -3224,10 +4856,14 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(default["bytes_up"], 100)
             self.assertEqual(default["bytes_down"], 250)
             self.assertEqual(default["total_tokens"], 15)
+            self.assertEqual(default["cache_write_input_tokens"], 2)
             self.assertEqual(default["fast_tokens"], 15)
             self.assertEqual(default["quota_updates"], 1)
             self.assertEqual(default["last_quota"]["Codex"]["primary_delta_percent"], -5)
-            self.assertEqual([event["type"] for event in summary["recent"]], ["websocket_tunnel", "token_usage"])
+            self.assertEqual(
+                [event["type"] for event in summary["recent"]],
+                ["websocket_tunnel", "token_usage"],
+            )
             self.assertEqual([point["quota_updates"] for point in summary["series"]][-1], 1)
 
     def test_control_plane_sessions_include_active_state_and_events(self) -> None:
@@ -3325,7 +4961,9 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(session["title"], "provision")
             self.assertEqual(session["thread_id"], "thread-456")
             self.assertEqual(session["active_requests"], 1)
+            self.assertEqual(session["active_turn_requests"], 0)
             self.assertEqual(session["pending_websocket_work"], 1)
+            self.assertTrue(session["working"])
             self.assertIn("quota_html", session)
             self.assertIn("No quota cached", session["quota_html"])
             self.assertIn("quota_compact_html", session)
@@ -3346,11 +4984,36 @@ class StoreTests(unittest.TestCase):
             event_types = {event["type"] for event in session["events"]}
             self.assertIn("http_request", event_types)
             self.assertIn("token_usage", event_types)
-            self.assertTrue(
-                any("Token usage" in event["summary"] for event in session["events"])
-            )
+            self.assertTrue(any("Token usage" in event["summary"] for event in session["events"]))
 
-    def test_control_plane_snapshots_bound_transcripts_and_page_observed_turns(self) -> None:
+    def test_session_working_state_excludes_incidental_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "auth.json"
+            source.write_text(json.dumps({"OPENAI_API_KEY": "sk-test"}), encoding="utf-8")
+            paths = Paths(root / "home")
+            Store(paths).import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                session_key = server.observe_session("/workspace/provision", "default")
+                incidental_request = server.begin_request("default", session_key)
+                incidental = server.session_snapshots()[0]
+                self.assertEqual(incidental["active_requests"], 1)
+                self.assertEqual(incidental["active_turn_requests"], 0)
+                self.assertFalse(incidental["working"])
+                server.end_request(incidental_request)
+
+                turn_request = server.begin_request("default", session_key, turn_work=True)
+                working = server.session_snapshots()[0]
+                self.assertEqual(working["active_turn_requests"], 1)
+                self.assertTrue(working["working"])
+                server.end_request(turn_request)
+            finally:
+                server.server_close()
+
+    def test_control_plane_snapshots_bound_transcripts_and_page_observed_turns(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = Paths(Path(temp) / "home")
             server = ProvisionServer(("127.0.0.1", 0), paths)
@@ -3367,7 +5030,8 @@ class StoreTests(unittest.TestCase):
                     server.append_control_transcript(
                         session_key=session_key,
                         role="tool",
-                        text=f"Tool: example_{index}\n\n" + ("x" * daemon_module.CONTROL_TRANSCRIPT_TEXT_LIMIT),
+                        text=f"Tool: example_{index}\n\n"
+                        + ("x" * daemon_module.CONTROL_TRANSCRIPT_TEXT_LIMIT),
                         turn_id=turn_id,
                         call_id=f"call-{index}",
                     )
@@ -3399,6 +5063,32 @@ class StoreTests(unittest.TestCase):
                 )
             finally:
                 server.server_close()
+
+    def test_discussion_merges_live_turn_suffix_over_cached_observed_pages(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                html = rendered_dashboard_source(handler)
+            finally:
+                server.server_close()
+
+        self.assertIn("function mergeControlTranscriptItems(olderItems, newerItems)", html)
+        self.assertIn(
+            "const merged = mergeControlTranscriptItems(observed.transcript, live);",
+            html,
+        )
+        self.assertIn("observed.transcript = merged;", html)
+        self.assertIn("function observedTurnHasLiveGap(session, transcript, turn)", html)
+        self.assertIn("liveFirst > cachedLast + 1", html)
+        self.assertIn("requestObservedTurn(session, activeTurn, null, true);", html)
+        self.assertIn("mergeObservedTurnPayload(existing, incoming)", html)
+        self.assertIn("const visibleItemIds = new Set(", html)
+        self.assertIn("!visibleItemIds.has(controlTranscriptItemIdentity(item, index))", html)
 
     def test_control_plane_history_metadata_loads_on_demand(self) -> None:
         previous_codex_home = os.environ.get("CODEX_HOME")
@@ -3436,7 +5126,12 @@ class StoreTests(unittest.TestCase):
                             "payload": {
                                 "type": "message",
                                 "role": "assistant",
-                                "content": [{"type": "output_text", "text": "Historical answer body"}],
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "Historical answer body",
+                                    }
+                                ],
                             },
                         },
                     ]
@@ -3463,7 +5158,10 @@ class StoreTests(unittest.TestCase):
                     session_key,
                     history_turns[0]["key"],
                 )
-                self.assertIn("Historical answer body", history_payload["transcript"][1]["full_text"])
+                self.assertIn(
+                    "Historical answer body",
+                    history_payload["transcript"][1]["full_text"],
+                )
             finally:
                 server.server_close()
                 if previous_codex_home is None:
@@ -3651,7 +5349,7 @@ class StoreTests(unittest.TestCase):
             handler = Handler.__new__(Handler)
             handler.server = server
             try:
-                html = handler.render_ui()
+                html = rendered_dashboard_source(handler)
             finally:
                 server.server_close()
 
@@ -3673,14 +5371,16 @@ class StoreTests(unittest.TestCase):
         self.assertIn(".control-message {", html)
         self.assertIn("\t      align-self: start;", html)
 
-    def test_discussion_ui_includes_mobile_focus_turn_window_and_patch_preview_controls(self) -> None:
+    def test_discussion_ui_includes_mobile_focus_turn_window_and_patch_preview_controls(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = Paths(Path(temp) / "home")
             server = ProvisionServer(("127.0.0.1", 0), paths)
             handler = Handler.__new__(Handler)
             handler.server = server
             try:
-                html = handler.render_ui()
+                html = rendered_dashboard_source(handler)
             finally:
                 server.server_close()
 
@@ -3695,6 +5395,32 @@ class StoreTests(unittest.TestCase):
         self.assertIn("data-control-prior-show", html)
         self.assertIn("Show full patch", html)
         self.assertIn("renderPatchToolSummary", html)
+        self.assertIn('item.status || parsed.status || "observed"', html)
+        self.assertIn('name === "todo_write"', html)
+        self.assertIn(".control-tool-status.backgrounded", html)
+        self.assertIn(
+            "session.name || session.display || session.cwd || session.title",
+            html,
+        )
+
+    def test_discussion_ui_has_an_on_demand_local_terminal_tail_view(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                html = rendered_dashboard_source(handler)
+            finally:
+                server.server_close()
+
+        self.assertIn('data-control-view="terminal">Terminal</button>', html)
+        self.assertIn('action: "terminal_snapshot"', html)
+        self.assertIn("function renderControlTerminal(session)", html)
+        self.assertIn("not retained in Discussion, search, or remote state", html)
+        self.assertIn("function scheduleTerminalSnapshotRefresh()", html)
+        self.assertIn(".control-view-tabs {\n      display: flex;", html)
+        self.assertIn("flex-wrap: wrap;", html)
 
     def test_discussion_ui_compacts_context_replay_cards_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3703,7 +5429,7 @@ class StoreTests(unittest.TestCase):
             handler = Handler.__new__(Handler)
             handler.server = server
             try:
-                html = handler.render_ui()
+                html = rendered_dashboard_source(handler)
             finally:
                 server.server_close()
 
@@ -3721,14 +5447,16 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(summary["remaining_tokens"], 16000)
         self.assertEqual(summary["remaining_percent"], 6)
 
-    def test_discussion_markdown_keeps_local_file_reference_labels_visible(self) -> None:
+    def test_discussion_markdown_keeps_local_file_reference_labels_visible(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = Paths(Path(temp) / "home")
             server = ProvisionServer(("127.0.0.1", 0), paths)
             handler = Handler.__new__(Handler)
             handler.server = server
             try:
-                html = handler.render_ui()
+                html = rendered_dashboard_source(handler)
             finally:
                 server.server_close()
 
@@ -3736,14 +5464,27 @@ class StoreTests(unittest.TestCase):
         self.assertIn("/^(?:file:|\\/|~\\/|\\.{1,2}\\/)/i.test(raw)", html)
         self.assertIn("function markdownLinkLabel(label, href)", html)
         self.assertIn("function replaceMarkdownLinks(value, renderLink)", html)
-        self.assertIn('class="markdown-file-ref" title="${escapeHtml(rawHref)}">${escapeHtml(visibleLabel)}</code>', html)
+        self.assertIn(
+            'class="markdown-file-ref" title="${escapeHtml(rawHref)}">${escapeHtml(visibleLabel)}</code>',
+            html,
+        )
         self.assertLess(
             html.index("if (isLocalMarkdownFileReference(rawHref))"),
             html.index("const safeHref = safeMarkdownHref(rawHref);"),
         )
         self.assertIn("function repairStreamedMarkdownProse(value)", html)
+        self.assertIn("function renderMarkdownInlineLines(lines)", html)
+        self.assertIn('hardBreak ? "<br>" : " "', html)
         self.assertIn("if (inFence) rendered.push(line);", html)
         self.assertIn("let codeTickCount = 0;", html)
+        self.assertIn(
+            ".control-message-text.markdown code,\n    .control-message-text.markdown a {",
+            html,
+        )
+        self.assertIn(
+            "white-space: normal;\n      overflow-wrap: break-word;\n      word-break: normal;",
+            html,
+        )
 
     def test_profile_list_supports_persistent_hidden_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3752,7 +5493,7 @@ class StoreTests(unittest.TestCase):
             handler = Handler.__new__(Handler)
             handler.server = server
             try:
-                html = handler.render_ui()
+                html = rendered_dashboard_source(handler)
             finally:
                 server.server_close()
 
@@ -3762,6 +5503,11 @@ class StoreTests(unittest.TestCase):
         self.assertIn("let showHiddenProfiles = false;", html)
         self.assertIn("Show hidden profiles", html)
         self.assertIn("Hide hidden profiles", html)
+        self.assertIn("Usage / Quota", html)
+        self.assertIn("function providerProfileRow(profile)", html)
+        self.assertIn("Latest observed turn", html)
+        self.assertIn("Account quota unavailable", html)
+        self.assertIn("Managed provider profile", html)
 
     def test_mobile_discussion_is_layered_sticky_viewport_region(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3770,7 +5516,7 @@ class StoreTests(unittest.TestCase):
             handler = Handler.__new__(Handler)
             handler.server = server
             try:
-                html = handler.render_ui()
+                html = rendered_dashboard_source(handler)
             finally:
                 server.server_close()
 
@@ -3789,14 +5535,18 @@ class StoreTests(unittest.TestCase):
         self.assertIn("--mobile-control-dock-height", html)
         self.assertIn("padding-bottom: max(8px, env(safe-area-inset-bottom));", html)
         self.assertIn("overscroll-behavior: contain;", html)
-        self.assertIn("window.visualViewport.addEventListener(\"resize\", updateControlDockGeometry", html)
-        self.assertIn(".control-compose {\n\t      grid-row: 5;", html)
+        self.assertIn(
+            'window.visualViewport.addEventListener("resize", updateControlDockGeometry',
+            html,
+        )
+        self.assertIn(".control-compose {\n\t      grid-row: 6;", html)
         self.assertIn("\t      position: relative;\n\t      z-index: 2;", html)
         self.assertIn(".control-head {\n\t  grid-row: 1;", html)
         self.assertIn(".control-status-pills {\n\t      grid-row: 2;", html)
         self.assertIn(".control-toolbar {\n\t  grid-row: 3;", html)
         self.assertIn(".control-content {\n\t  grid-row: 4;", html)
-        self.assertIn(".control-compose {\n\t      grid-row: 5;", html)
+        self.assertIn(".control-working-state {\n      grid-row: 5;", html)
+        self.assertIn(".control-compose {\n\t      grid-row: 6;", html)
 
     def test_discussion_hides_profiles_while_the_composer_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3805,57 +5555,107 @@ class StoreTests(unittest.TestCase):
             handler = Handler.__new__(Handler)
             handler.server = server
             try:
-                html = handler.render_ui()
+                html = rendered_dashboard_source(handler)
             finally:
                 server.server_close()
 
         self.assertIn('id="profilesPanel" class="profiles"', html)
         self.assertIn(".discussion-active .profiles {", html)
+        self.assertIn(
+            ".discussion-active .shell {\n        min-height: calc(100dvh - 64px);",
+            html,
+        )
         self.assertIn("function discussionActive()", html)
         self.assertIn("function syncDiscussionPaneVisibility()", html)
         self.assertIn('document.body.classList.toggle("discussion-active", active);', html)
         self.assertIn("if (profiles) profiles.hidden = active;", html)
 
-    def test_mobile_composer_focus_pins_the_keyboard_viewport_and_hides_navigation_chrome(self) -> None:
+    def test_discussion_has_an_animated_active_turn_working_bar(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = Paths(Path(temp) / "home")
             server = ProvisionServer(("127.0.0.1", 0), paths)
             handler = Handler.__new__(Handler)
             handler.server = server
             try:
-                html = handler.render_ui()
+                html = rendered_dashboard_source(handler)
+            finally:
+                server.server_close()
+
+        self.assertIn('id="controlWorkingState" class="control-working-state"', html)
+        self.assertIn("Working &hellip;", html)
+        self.assertIn("@keyframes control-working-sweep", html)
+        self.assertIn(".control-working-state.active::before", html)
+        self.assertIn("@media (prefers-reduced-motion: reduce)", html)
+        self.assertIn("const sessionWorking = Boolean(session.working)", html)
+        self.assertIn("Number(session.active_turn_requests || 0) > 0", html)
+        self.assertIn("Number(session.pending_websocket_work || 0) > 0", html)
+        self.assertIn(
+            'workingState.hidden = controlView !== "discussion" || !sessionWorking;',
+            html,
+        )
+
+    def test_mobile_composer_focus_pins_the_keyboard_viewport_and_hides_navigation_chrome(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                html = rendered_dashboard_source(handler)
             finally:
                 server.server_close()
 
         self.assertIn(".mobile-composer-focus #sessionTabs,", html)
         self.assertIn(".mobile-composer-focus #mobileControlStatus,", html)
-        self.assertIn(".mobile-composer-focus .control-modal.discussion-view .control-toolbar,", html)
-        self.assertIn(".mobile-composer-focus .control-modal.discussion-view .control-head {", html)
+        self.assertIn(
+            ".mobile-composer-focus .control-modal.discussion-view .control-toolbar,",
+            html,
+        )
+        self.assertIn(
+            ".mobile-composer-focus .control-modal.discussion-view .control-head {",
+            html,
+        )
         self.assertIn("top: var(--mobile-visual-viewport-top, 0px);", html)
         self.assertIn("block-size: var(--mobile-viewport-height, 100dvh);", html)
         self.assertIn("let mobileComposerFocused = false;", html)
         self.assertIn("function setMobileComposerFocus(focused)", html)
         self.assertIn("function resetMobileComposerFocus()", html)
-        self.assertIn('root.style.setProperty("--mobile-visual-viewport-top", `${viewportTop}px`);', html)
-        self.assertIn('window.visualViewport.addEventListener("scroll", updateControlDockGeometry', html)
+        self.assertIn(
+            'root.style.setProperty("--mobile-visual-viewport-top", `${viewportTop}px`);',
+            html,
+        )
+        self.assertIn(
+            'window.visualViewport.addEventListener("scroll", updateControlDockGeometry',
+            html,
+        )
         self.assertIn('document.getElementById("controlPrompt").addEventListener("focus"', html)
         self.assertIn('document.getElementById("controlPrompt").addEventListener("blur"', html)
 
-    def test_mobile_discussion_focus_keeps_the_composer_within_the_viewport(self) -> None:
+    def test_mobile_discussion_focus_keeps_the_composer_within_the_viewport(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = Paths(Path(temp) / "home")
             server = ProvisionServer(("127.0.0.1", 0), paths)
             handler = Handler.__new__(Handler)
             handler.server = server
             try:
-                html = handler.render_ui()
+                html = rendered_dashboard_source(handler)
             finally:
                 server.server_close()
 
         self.assertIn(".mobile-discussion-focus .control-dock {", html)
         self.assertIn("top: var(--mobile-visual-viewport-top, 0px);", html)
-        self.assertIn(".mobile-discussion-focus .control-modal.discussion-view .control-toolbar,", html)
-        self.assertIn(".mobile-discussion-focus .control-modal.discussion-view .control-head {", html)
+        self.assertIn(
+            ".mobile-discussion-focus .control-modal.discussion-view .control-toolbar,",
+            html,
+        )
+        self.assertIn(
+            ".mobile-discussion-focus .control-modal.discussion-view .control-head {",
+            html,
+        )
         self.assertNotIn(
             ".mobile-discussion-focus .control-modal.discussion-view .control-head,\n"
             "\t      .mobile-discussion-focus .control-modal.discussion-view .control-compose",
@@ -3896,6 +5696,61 @@ class StoreTests(unittest.TestCase):
                 )
             finally:
                 restored.server_close()
+
+    def test_stale_observed_sessions_are_evicted_but_live_pty_sessions_remain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            paths = Paths(root / "home")
+            control_path = root / "control.sock"
+            control_path.write_text("", encoding="utf-8")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                stale_key = server.observe_session("/workspace/old", "default")
+                live_key = server.observe_session(
+                    "/workspace/live",
+                    "default",
+                    control_path=str(control_path),
+                    pty_managed=True,
+                )
+                with server.active_lock:
+                    server.observed_sessions[stale_key]["last_seen_monotonic"] = (
+                        time.monotonic() - daemon_module.OBSERVED_SESSION_RETENTION_SECONDS - 1
+                    )
+                    server.observed_sessions[live_key]["last_seen_monotonic"] = (
+                        time.monotonic() - daemon_module.OBSERVED_SESSION_RETENTION_SECONDS - 1
+                    )
+
+                snapshots = {item["key"]: item for item in server.session_snapshots()}
+
+                self.assertNotIn(stale_key, snapshots)
+                self.assertNotIn(stale_key, server.observed_sessions)
+                self.assertIn(live_key, snapshots)
+                self.assertTrue(snapshots[live_key]["active"])
+                self.assertTrue(snapshots[live_key]["pty_control_available"])
+            finally:
+                server.server_close()
+
+    @unittest.skipIf(not hasattr(socket, "AF_UNIX"), "launcher sockets require AF_UNIX")
+    def test_daemon_startup_removes_dead_launcher_socket_but_keeps_current_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            paths.ensure_base()
+            stale = paths.launchers / "provision-999999999-deadbeef.sock"
+            current = paths.launchers / f"provision-{os.getpid()}-cafebabe.sock"
+            stale_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            current_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                stale_listener.bind(str(stale))
+                current_listener.bind(str(current))
+                server = ProvisionServer(("127.0.0.1", 0), paths)
+                try:
+                    self.assertFalse(stale.exists())
+                    self.assertTrue(current.exists())
+                finally:
+                    server.server_close()
+            finally:
+                stale_listener.close()
+                current_listener.close()
 
     @unittest.skipIf(not hasattr(socket, "AF_UNIX"), "PTY control sockets require AF_UNIX")
     def test_send_session_prompt_uses_pty_control_socket(self) -> None:
@@ -4019,7 +5874,16 @@ class StoreTests(unittest.TestCase):
                     permission="read-only",
                 )
                 self.assertEqual(args[0], str(Path("bin/provision").resolve()))
-                self.assertEqual(args[1:6], ["resume", "--cd", "/workspace/provision", "--sandbox", "read-only"])
+                self.assertEqual(
+                    args[1:6],
+                    [
+                        "resume",
+                        "--cd",
+                        "/workspace/provision",
+                        "--sandbox",
+                        "read-only",
+                    ],
+                )
                 self.assertIn("--last", args)
                 selected = server.build_ui_launcher_args(
                     cwd="/workspace/provision",
@@ -4111,7 +5975,11 @@ class StoreTests(unittest.TestCase):
     def test_app_server_thread_selection_requires_matching_cli_cwd(self) -> None:
         payload = {
             "data": [
-                {"id": "app-thread", "cwd": "/workspace/provision", "source": "appServer"},
+                {
+                    "id": "app-thread",
+                    "cwd": "/workspace/provision",
+                    "source": "appServer",
+                },
                 {"id": "other-thread", "cwd": "/workspace/other", "source": "cli"},
                 {"id": "target-thread", "cwd": "/workspace/provision", "source": "cli"},
             ]
@@ -4557,8 +6425,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(entry["status"], "completed")
         self.assertEqual(
             entry["text"],
-            "Tool: Image generation (status completed)\n"
-            "Result:\nImage generated successfully.",
+            "Tool: Image generation (status completed)\nResult:\nImage generated successfully.",
         )
         self.assertNotIn(image_bytes, entry["text"])
 
@@ -4646,7 +6513,7 @@ class StoreTests(unittest.TestCase):
                     'const r = await tools.update_plan({"explanation":"Parser pass",plan:['
                     '{step:"Extract commands","status":"completed"},'
                     '{step:"Render output","status":"in_progress"}]});\n'
-                    'text(JSON.stringify(r));'
+                    "text(JSON.stringify(r));"
                 ),
             }
         )
@@ -4656,6 +6523,40 @@ class StoreTests(unittest.TestCase):
         self.assertIn('"step": "Extract commands"', plan_entry["text"])
         self.assertIn('"status": "in_progress"', plan_entry["text"])
         self.assertNotIn("const r = await", plan_entry["text"])
+
+        web_entry = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_programmatic_web",
+                "name": "exec",
+                "input": (
+                    'const r = await tools.web__run({search_query:[{q:"AOPA rules"}],'
+                    'response_length:"short"}); text(r);'
+                ),
+            }
+        )
+        self.assertIsNotNone(web_entry)
+        assert web_entry is not None
+        self.assertIn("Tool: web__run", web_entry["text"])
+        self.assertIn('Input:\n{search_query:[{q:"AOPA rules"}]', web_entry["text"])
+        self.assertNotIn("const r = await", web_entry["text"])
+
+        variable_entry = daemon_module.tool_activity_entry_from_value(
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_programmatic_view",
+                "name": "exec",
+                "input": (
+                    'const args = {path:"/tmp/page.png",detail:"original"}; '
+                    "const r = await tools.view_image(args); image(r.image_url);"
+                ),
+            }
+        )
+        self.assertIsNotNone(variable_entry)
+        assert variable_entry is not None
+        self.assertIn("Tool: view_image", variable_entry["text"])
+        self.assertIn('Input:\n{path:"/tmp/page.png",detail:"original"}', variable_entry["text"])
+        self.assertNotIn("const args", variable_entry["text"])
 
     def test_ws_prefixed_tool_calls_render_as_web_search(self) -> None:
         entry = daemon_module.tool_activity_entry_from_value(
@@ -4687,6 +6588,12 @@ class StoreTests(unittest.TestCase):
                         "id": "ws_search_2",
                         "status": "completed",
                         "action": {"query": "Provision account dashboard"},
+                        "results": [
+                            {
+                                "title": "Provision documentation",
+                                "url": "https://example.test/provision",
+                            }
+                        ],
                     },
                 }
             ).encode("utf-8"),
@@ -4694,6 +6601,8 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertIn("Tool: Web Search (status completed)", entries[0]["text"])
         self.assertIn("Query:\nProvision account dashboard", entries[0]["text"])
+        self.assertIn("Results:", entries[0]["text"])
+        self.assertIn("Provision documentation", entries[0]["text"])
 
     def test_app_server_ws_prefixed_items_render_as_web_search(self) -> None:
         entry = daemon_module.app_server_tool_entry_from_item(
@@ -4714,6 +6623,103 @@ class StoreTests(unittest.TestCase):
         self.assertIn("Query:\nCodex CLI quota reset credits", entry["text"])
         self.assertIn("Result:", entry["text"])
         self.assertNotIn("Tool: ws_search_3", entry["text"])
+
+        structured_entry = daemon_module.app_server_tool_entry_from_item(
+            {
+                "type": "webSearch",
+                "id": "search-structured",
+                "query": "Codex 0.146.0",
+                "results": [
+                    {
+                        "type": "computer_initialize_state",
+                        "title": "Codex release notes",
+                        "url": "https://example.test/codex-0146",
+                    }
+                ],
+            }
+        )
+
+        self.assertIsNotNone(structured_entry)
+        assert structured_entry is not None
+        self.assertIn("Tool: Web Search", structured_entry["text"])
+        self.assertIn("Query:\nCodex 0.146.0", structured_entry["text"])
+        self.assertIn("Results:", structured_entry["text"])
+        self.assertIn("Codex release notes", structured_entry["text"])
+
+    def test_app_server_turn_completion_repairs_and_deduplicates_final_message(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.control_transcripts = {}
+        server.active_lock = threading.RLock()
+        server.active_websockets = {
+            17: {
+                "session_key": "/workspace/provision",
+                "turn_id": "turn-146",
+                "profile": "default",
+                "pending_work": 1,
+            }
+        }
+
+        messages = [
+            {
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-146",
+                    "turnId": "turn-146",
+                    "itemId": "message-146",
+                    "delta": "Partial closeout",
+                },
+            },
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-146",
+                    "turn": {
+                        "id": "turn-146",
+                        "status": "completed",
+                        "itemsView": "summary",
+                        "items": [
+                            {
+                                "id": "message-146",
+                                "type": "agentMessage",
+                                "phase": "finalAnswer",
+                                "text": "Complete closeout from the completion summary.",
+                            }
+                        ],
+                    },
+                },
+            },
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-146",
+                    "turnId": "turn-146",
+                    "item": {
+                        "id": "message-146",
+                        "type": "agentMessage",
+                        "phase": "finalAnswer",
+                        "text": "Complete closeout from the completion summary.",
+                    },
+                },
+            },
+        ]
+        for message in messages:
+            server.record_websocket_transcript(
+                17,
+                0x1,
+                json.dumps(message).encode("utf-8"),
+                from_downstream=False,
+            )
+
+        transcript = server.control_transcripts["/workspace/provision"]
+        self.assertEqual(len(transcript), 1)
+        self.assertEqual(transcript[0]["role"], "assistant")
+        self.assertEqual(transcript[0]["turn_id"], "turn-146")
+        self.assertEqual(transcript[0]["source_item_id"], "message-146")
+        self.assertTrue(transcript[0]["authoritative"])
+        self.assertEqual(
+            transcript[0]["text"],
+            "Complete closeout from the completion summary.",
+        )
 
     def test_programmatic_tool_call_response_items_are_tool_activity(self) -> None:
         entries = websocket_message_tool_entries(
@@ -4921,7 +6927,6 @@ class StoreTests(unittest.TestCase):
 
     def test_same_turn_user_input_does_not_create_extra_control_turn(self) -> None:
         server = ProvisionServer.__new__(ProvisionServer)
-        session_key = "/workspace/provision"
         transcript = [
             {
                 "ts": "2026-06-26T00:00:00Z",
@@ -5125,7 +7130,12 @@ class StoreTests(unittest.TestCase):
                     {
                         "type": "message",
                         "role": "user",
-                        "content": [{"type": "input_text", "text": "Another prior clarification"}],
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "Another prior clarification",
+                            }
+                        ],
                     },
                     {
                         "type": "message",
@@ -5198,7 +7208,10 @@ class StoreTests(unittest.TestCase):
         self.assertIn("2 passed", tool["text"])
         assistant = next(item for item in transcript if item["role"] == "assistant")
         self.assertIn("Completed the hygiene pass.", assistant["text"])
-        self.assertIn("[workflow.yml]\n\n(/workspace/example/.github/workflows/workflow.yml)", assistant["text"])
+        self.assertIn(
+            "[workflow.yml]\n\n(/workspace/example/.github/workflows/workflow.yml)",
+            assistant["text"],
+        )
 
     def test_cli_daemon_switch_routes_through_running_daemon(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -5275,10 +7288,7 @@ class StoreTests(unittest.TestCase):
             default_payload=default_profile_payload,
         )
 
-        rows = {
-            row["metered_feature"]: row
-            for row in labeled["additional_rate_limits"]
-        }
+        rows = {row["metered_feature"]: row for row in labeled["additional_rate_limits"]}
         self.assertEqual(
             rows["codex"]["limit_name"],
             "Provision (work - updated 15:36 on 28 May)",
@@ -5380,7 +7390,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(payload["additional_rate_limits"][0]["limit_name"], "Spark")
         self.assertEqual(payload["additional_rate_limits"][0]["metered_feature"], "codex_spark")
 
-    def test_usage_payload_from_rate_limit_headers_renders_unlimited_credits(self) -> None:
+    def test_usage_payload_from_rate_limit_headers_renders_unlimited_credits(
+        self,
+    ) -> None:
         payload = usage_payload_from_rate_limit_headers(
             {
                 "x-codex-credits-has-credits": "true",
@@ -5427,7 +7439,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(bucket["rate_limit"]["primary_window"]["limit_window_seconds"], 18000)
         self.assertEqual(bucket["rate_limit"]["secondary_window"]["used_percent"], 40.0)
 
-    def test_usage_payload_from_websocket_rate_limit_event_accepts_credits_only(self) -> None:
+    def test_usage_payload_from_websocket_rate_limit_event_accepts_credits_only(
+        self,
+    ) -> None:
         payload = usage_payload_from_websocket_message(
             0x1,
             json.dumps(
@@ -5447,7 +7461,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(payload["credits"]["unlimited"], True)
         self.assertEqual(usage_payload_reset_datetimes(payload), [])
 
-    def test_usage_payload_from_websocket_token_count_reads_nested_credits(self) -> None:
+    def test_usage_payload_from_websocket_token_count_reads_nested_credits(
+        self,
+    ) -> None:
         payload = usage_payload_from_websocket_message(
             0x1,
             json.dumps(
@@ -5487,7 +7503,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(payload["rate_limit"]["primary_window"]["reset_at"], 1790000000)
         self.assertIn("Credits: $12.34", render_quota_html({"payload": payload}))
 
-    def test_render_quota_html_marks_allowed_without_percentages_as_unknown(self) -> None:
+    def test_render_quota_html_marks_allowed_without_percentages_as_unknown(
+        self,
+    ) -> None:
         html = render_quota_html({"payload": {"rate_limit": {"allowed": True}}})
 
         self.assertIn("Weekly (unknown)", html)
@@ -5602,7 +7620,10 @@ class StoreTests(unittest.TestCase):
             "fetched_at": fetched_at,
             "payload": {
                 "rate_limit": {
-                    "primary_window": {"used_percent": 90, "reset_at": reset_at.isoformat()},
+                    "primary_window": {
+                        "used_percent": 90,
+                        "reset_at": reset_at.isoformat(),
+                    },
                     "secondary_window": {"used_percent": 10},
                 }
             },
@@ -5850,7 +7871,10 @@ class StoreTests(unittest.TestCase):
             server = ProvisionServer(("127.0.0.1", 0), paths)
             try:
                 server.mark_profile_billing_required("lapsed", "HTTP Error 402: Payment Required")
-                self.assertEqual(server.profile_switch_unavailable_reason("lapsed"), "Billing required")
+                self.assertEqual(
+                    server.profile_switch_unavailable_reason("lapsed"),
+                    "Billing required",
+                )
             finally:
                 server.server_close()
 
@@ -5946,17 +7970,17 @@ class StoreTests(unittest.TestCase):
             self.assertIn("pending work", server.switch_block_reason() or "")
 
             with server.active_lock:
-                server.active_websockets[tunnel_id][
-                    "last_data_activity_monotonic"
-                ] = time.monotonic() - WEBSOCKET_SWITCH_IDLE_SECONDS - 0.1
+                server.active_websockets[tunnel_id]["last_data_activity_monotonic"] = (
+                    time.monotonic() - WEBSOCKET_SWITCH_IDLE_SECONDS - 0.1
+                )
 
             self.assertIn("pending work", server.switch_block_reason() or "")
             server.complete_websocket_response(tunnel_id)
             self.assertIn("pending work", server.switch_block_reason() or "")
             with server.active_lock:
-                server.active_websockets[tunnel_id][
-                    "completion_deadline_monotonic"
-                ] = time.monotonic() - 0.1
+                server.active_websockets[tunnel_id]["completion_deadline_monotonic"] = (
+                    time.monotonic() - 0.1
+                )
             self.assertEqual(server.pending_websocket_work_count(), 0)
             self.assertIsNone(server.switch_block_reason())
 
@@ -6090,7 +8114,37 @@ class StoreTests(unittest.TestCase):
         self.assertIn("unarchive", launcher_module.CODEX_PASSTHROUGH_COMMANDS)
         self.assertIn("exec-server", launcher_module.CODEX_PASSTHROUGH_COMMANDS)
 
-    def test_profiled_passthrough_uses_active_profile_auth_and_syncs_refresh(self) -> None:
+    def test_managed_pty_registration_identifies_non_codex_provider_and_profile(
+        self,
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_register(*args: Any, **kwargs: Any) -> None:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        with patch.object(launcher_module, "register_session", side_effect=fake_register):
+            launcher_module.register_pty_session(
+                4888,
+                "token",
+                "/tmp/project",
+                "127.0.0.1",
+                session_key="grok::/tmp/project",
+                control_path=Path("/tmp/control.sock"),
+                provider="grok",
+                provider_profile="work",
+                provider_pid=4321,
+                provider_state_root="/tmp/grok-home",
+            )
+        self.assertEqual(captured["kwargs"]["provider"], "grok")
+        self.assertEqual(captured["kwargs"]["provider_profile"], "work")
+        self.assertEqual(captured["kwargs"]["provider_pid"], 4321)
+        self.assertEqual(captured["kwargs"]["provider_state_root"], "/tmp/grok-home")
+        self.assertTrue(captured["kwargs"]["pty_managed"])
+
+    def test_profiled_passthrough_uses_active_profile_auth_and_syncs_refresh(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source = root / "auth.json"
@@ -6113,7 +8167,9 @@ class StoreTests(unittest.TestCase):
                 codex_home = Path(env["CODEX_HOME"])
                 captured["codex_home"] = codex_home
                 captured["config"] = (codex_home / "config.toml").read_text(encoding="utf-8")
-                captured["auth"] = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
+                captured["auth"] = json.loads(
+                    (codex_home / "auth.json").read_text(encoding="utf-8")
+                )
                 (codex_home / "config.toml").write_text(
                     captured["config"] + '\n[mcp_servers.test]\ncommand = "test"\n',
                     encoding="utf-8",
@@ -6144,7 +8200,10 @@ class StoreTests(unittest.TestCase):
             self.assertIn('cli_auth_credentials_store = "file"', captured["config"])
             refreshed = json.loads(store.auth_path("work").read_text(encoding="utf-8"))
             self.assertEqual(refreshed["OPENAI_API_KEY"], "sk-refreshed")
-            self.assertIn("[mcp_servers.test]", (stock_codex_home / "config.toml").read_text(encoding="utf-8"))
+            self.assertIn(
+                "[mcp_servers.test]",
+                (stock_codex_home / "config.toml").read_text(encoding="utf-8"),
+            )
 
     def test_ensure_daemon_passes_wildcard_host_without_port(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -6169,7 +8228,9 @@ class StoreTests(unittest.TestCase):
                     "provision_protocol": daemon_module.PROTOCOL_VERSION,
                 }
 
-                status = launcher_module.ensure_daemon(paths, None, "0.0.0.0")
+                status = launcher_module.ensure_daemon(
+                    paths, None, "0.0.0.0", allow_non_loopback=True
+                )
             finally:
                 launcher_module.daemon_running = original_running
                 launcher_module.subprocess.Popen = original_popen
@@ -6179,9 +8240,11 @@ class StoreTests(unittest.TestCase):
             argv = captured["argv"]
             self.assertIn("--host", argv)
             self.assertIn("0.0.0.0", argv)
+            self.assertIn("--allow-non-loopback", argv)
             self.assertNotIn("--port", argv)
             self.assertIs(captured["kwargs"]["stdout"], captured["kwargs"]["stderr"])
             self.assertTrue(captured["kwargs"]["stdout"].closed)
+            self.assertEqual(captured["kwargs"]["env"]["PROVISION_DAEMON_LOG"], str(paths.log))
 
     def test_ensure_daemon_passes_wildcard_host_with_port(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -6206,7 +8269,9 @@ class StoreTests(unittest.TestCase):
                     "provision_protocol": daemon_module.PROTOCOL_VERSION,
                 }
 
-                status = launcher_module.ensure_daemon(paths, 4999, "0.0.0.0")
+                status = launcher_module.ensure_daemon(
+                    paths, 4999, "0.0.0.0", allow_non_loopback=True
+                )
             finally:
                 launcher_module.daemon_running = original_running
                 launcher_module.subprocess.Popen = original_popen
@@ -6218,13 +8283,21 @@ class StoreTests(unittest.TestCase):
             self.assertIn("0.0.0.0", argv)
             self.assertIn("--port", argv)
             self.assertIn("4999", argv)
+            self.assertIn("--allow-non-loopback", argv)
+
+    def test_ensure_daemon_refuses_non_loopback_without_explicit_consent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            with patch.object(launcher_module, "daemon_running", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "refusing non-loopback"):
+                    launcher_module.ensure_daemon(paths, None, "0.0.0.0")
 
     def test_cmd_start_reports_wildcard_bind_separately_from_local_url(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = Paths(Path(temp) / "home")
             original = cli_module.ensure_daemon
             try:
-                cli_module.ensure_daemon = lambda _paths, _port, _host: {
+                cli_module.ensure_daemon = lambda _paths, _port, _host, **_kwargs: {
                     "pid": 123,
                     "host": "0.0.0.0",
                     "port": 4888,
@@ -6258,7 +8331,11 @@ class StoreTests(unittest.TestCase):
                         "control_plane": {"read_only": True},
                     },
                 }
-                cli_module.daemon_running = lambda _paths: {"pid": 123, "host": "127.0.0.1", "port": 4888}
+                cli_module.daemon_running = lambda _paths: {
+                    "pid": 123,
+                    "host": "127.0.0.1",
+                    "port": 4888,
+                }
                 output = StringIO()
                 with redirect_stdout(output):
                     result = cli_module.cmd_doctor(paths, store)
@@ -6269,7 +8346,47 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertIn("codex on PATH (0.141.0)", output.getvalue())
             self.assertIn("Codex model catalog readable (5 models from codex)", output.getvalue())
-            self.assertIn("Codex app-server read-only control-plane schema readable", output.getvalue())
+            self.assertIn(
+                "Codex app-server read-only control-plane schema readable",
+                output.getvalue(),
+            )
+
+    def test_cmd_doctor_treats_codex_only_checks_as_optional_for_grok_default(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            store = Store(paths)
+            store.set_default_provider("grok")
+            with (
+                patch.object(
+                    cli_module,
+                    "codex_compatibility_payload",
+                    return_value={
+                        "cli": {"available": False},
+                        "model_catalog": {"source": "missing"},
+                    },
+                ),
+                patch.object(
+                    cli_module,
+                    "daemon_running",
+                    return_value={"pid": 123, "host": "127.0.0.1", "port": 4888},
+                ),
+                patch.object(
+                    cli_module.shutil,
+                    "which",
+                    side_effect=lambda executable: (
+                        "/usr/bin/grok" if executable == "grok" else None
+                    ),
+                ),
+            ):
+                output = StringIO()
+                with redirect_stdout(output):
+                    result = cli_module.cmd_doctor(paths, store)
+
+            self.assertEqual(result, 0)
+            self.assertIn("ok   default provider grok on PATH (grok)", output.getvalue())
+            self.assertIn("warn codex on PATH", output.getvalue())
 
     def test_cmd_status_detects_legacy_daemon_codex_version_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -6303,8 +8420,9 @@ class StoreTests(unittest.TestCase):
 
     def test_codex_client_id_is_discovered_from_auth_context(self) -> None:
         payload = (
-            b"noise app_000000000000000000000000 " + (b"x" * 300) +
-            b"client_id access_token refresh_token "
+            b"noise app_000000000000000000000000 "
+            + (b"x" * 300)
+            + b"client_id access_token refresh_token "
             b"app_ABCDEFGHIJKLMNOPQRSTUVWX Content-Type"
         )
 
@@ -6345,6 +8463,7 @@ class StoreTests(unittest.TestCase):
                 {
                     "key": "/private/workspace/provision",
                     "title": "Remote redesign",
+                    "provider": "grok",
                     "associated_profile": "default",
                     "active": True,
                     "interaction": {"available": True},
@@ -6369,6 +8488,7 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn(b"/private/workspace/provision", encoded)
         self.assertNotIn(b"must never be in state", encoded)
         self.assertEqual(payload["sessions"][0]["current_turn_id"], "turn-current")
+        self.assertEqual(payload["sessions"][0]["provider"], "grok")
         self.assertTrue(payload["sessions"][0]["session_id"].startswith("rs_"))
 
         control_plane["sessions"][0]["active"] = False
@@ -6385,7 +8505,10 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn("_source_session_key", json.dumps(deltas))
 
         control_plane["sessions"] = []
-        self.assertEqual(synchronizer.refresh(build_remote_session_summaries(control_plane, secret)), 3)
+        self.assertEqual(
+            synchronizer.refresh(build_remote_session_summaries(control_plane, secret)),
+            3,
+        )
         removal = synchronizer.deltas_since(2)
         self.assertIsNotNone(removal)
         assert removal is not None
@@ -6435,14 +8558,12 @@ class StoreTests(unittest.TestCase):
                 )
             )
         second_page = pages[1]
-        session_ids = [
-            item["session_id"]
-            for page in pages
-            for item in page["sessions"]
-        ]
+        session_ids = [item["session_id"] for page in pages for item in page["sessions"]]
         self.assertEqual(len(session_ids), 300)
         self.assertEqual(len(set(session_ids)), 300)
-        self.assertTrue(all(len(compact_json_bytes(page)) <= REMOTE_INITIAL_STATE_MAX_BYTES for page in pages))
+        self.assertTrue(
+            all(len(compact_json_bytes(page)) <= REMOTE_INITIAL_STATE_MAX_BYTES for page in pages)
+        )
 
         metric_summaries = [dict(summary) for summary in summaries]
         metric_summaries[0]["quota"] = "refreshed quota"
@@ -6488,7 +8609,10 @@ class StoreTests(unittest.TestCase):
         deltas = synchronizer.deltas_since(baseline)
         self.assertIsNotNone(deltas)
         assert deltas is not None
-        self.assertEqual([delta["type"] for delta in deltas], ["message_append", "message_replace", "message_remove"])
+        self.assertEqual(
+            [delta["type"] for delta in deltas],
+            ["message_append", "message_replace", "message_remove"],
+        )
         encoded = compact_json_bytes(deltas)
         self.assertNotIn(b"search_text", encoded)
         self.assertNotIn(b"/private/workspace", encoded)
@@ -6556,7 +8680,9 @@ class StoreTests(unittest.TestCase):
         assert completed is not None
         self.assertEqual([delta["type"] for delta in completed], ["turn_completed"])
 
-    def test_remote_discussion_and_message_expansion_are_paged_and_tamper_safe(self) -> None:
+    def test_remote_discussion_and_message_expansion_are_paged_and_tamper_safe(
+        self,
+    ) -> None:
         secret = b"d" * 32
         codec = RemoteCursorCodec(secret)
         session_id = "rs_example"
@@ -6629,7 +8755,9 @@ class StoreTests(unittest.TestCase):
         )
         self.assertEqual(expanded["text"] + expanded_next["text"], long_text)
 
-    def test_remote_device_registry_defaults_to_read_only_and_redacts_audit(self) -> None:
+    def test_remote_device_registry_defaults_to_read_only_and_redacts_audit(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             registry = RemoteDeviceRegistry(root / "devices.json", root / "audit.jsonl")
@@ -6638,8 +8766,17 @@ class StoreTests(unittest.TestCase):
             registry.authorize("companion-001", "read_discussion")
             with self.assertRaises(RemoteAuthorizationError):
                 registry.authorize("companion-001", "send_prompt")
-            registry.set_capabilities("companion-001", {"read_state", "read_discussion", "send_prompt"})
+            registry.set_capabilities(
+                "companion-001", {"read_state", "read_discussion", "send_prompt"}
+            )
             registry.authorize("companion-001", "send_prompt")
+            repeated = registry.enroll("companion-001", "transport:example-fingerprint")
+            self.assertEqual(
+                set(repeated["capabilities"]),
+                {"read_state", "read_discussion", "send_prompt"},
+            )
+            with self.assertRaises(RemoteError):
+                registry.enroll("companion-001", "transport:different-fingerprint")
             registry.append_audit(
                 event="remote_action",
                 device_id="companion-001",
@@ -6654,6 +8791,8 @@ class StoreTests(unittest.TestCase):
             registry.revoke("companion-001")
             with self.assertRaises(RemoteAuthorizationError):
                 registry.authorize("companion-001", "read_state")
+            with self.assertRaises(RemoteAuthorizationError):
+                registry.enroll("companion-001", "transport:example-fingerprint")
 
     def test_remote_action_cache_persists_only_redacted_result_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -6681,7 +8820,9 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(result["_semantic_ref"], "request_opaque")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
-    def test_remote_action_journal_reserves_before_mutation_and_fails_closed(self) -> None:
+    def test_remote_action_journal_reserves_before_mutation_and_fails_closed(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "remote-actions.json"
             cache = RemoteActionCache(path)
@@ -6712,7 +8853,9 @@ class StoreTests(unittest.TestCase):
             with self.assertRaisesRegex(RemoteError, "invalid entry"):
                 malformed.get("companion-005", "remote-request-005")
 
-    def test_remote_action_journal_keeps_live_idempotency_keys_without_eviction(self) -> None:
+    def test_remote_action_journal_keeps_live_idempotency_keys_without_eviction(
+        self,
+    ) -> None:
         expiry = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
         cache = RemoteActionCache()
         for index in range(REMOTE_ACTION_IDEMPOTENCY_LIMIT):
@@ -6732,7 +8875,9 @@ class StoreTests(unittest.TestCase):
                 expiry,
             )
 
-    def test_remote_action_journal_prunes_expired_records_and_rejects_oversize_files(self) -> None:
+    def test_remote_action_journal_prunes_expired_records_and_rejects_oversize_files(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             path = root / "remote-actions.json"
@@ -6756,7 +8901,9 @@ class StoreTests(unittest.TestCase):
             with self.assertRaisesRegex(RemoteError, "invalid format"):
                 oversized.get("companion-009", "remote-request-009")
 
-    def test_server_remote_boundary_is_internal_capability_scoped_and_idempotent(self) -> None:
+    def test_server_remote_boundary_is_internal_capability_scoped_and_idempotent(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source = root / "auth.json"
@@ -6789,7 +8936,9 @@ class StoreTests(unittest.TestCase):
                     {"read_state", "read_discussion", "send_prompt"},
                 )
                 original_send = server.send_session_prompt
-                server.send_session_prompt = lambda key, prompt: sent.append((key, prompt)) or {"ok": True}  # type: ignore[method-assign]
+                server.send_session_prompt = lambda key, prompt: (
+                    sent.append((key, prompt)) or {"ok": True}
+                )  # type: ignore[method-assign]
                 expiry = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
                 result = server.perform_remote_action(
                     "companion-002",
@@ -6865,7 +9014,9 @@ class StoreTests(unittest.TestCase):
                 self.assertNotIn("/private/second", json.dumps(changed))
 
                 original_send = server.send_session_prompt
-                server.send_session_prompt = lambda key, prompt: sent.append((key, prompt)) or {"ok": True}  # type: ignore[method-assign]
+                server.send_session_prompt = lambda key, prompt: (
+                    sent.append((key, prompt)) or {"ok": True}
+                )  # type: ignore[method-assign]
                 expiry = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat()
                 server.perform_remote_action(
                     "companion-006",
@@ -6885,7 +9036,9 @@ class StoreTests(unittest.TestCase):
             finally:
                 server.server_close()
 
-    def test_server_remote_delta_overflow_resyncs_to_a_bounded_session_page(self) -> None:
+    def test_server_remote_delta_overflow_resyncs_to_a_bounded_session_page(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = Paths(Path(temp) / "home")
             server = ProvisionServer(("127.0.0.1", 0), paths)
@@ -6923,7 +9076,9 @@ class StoreTests(unittest.TestCase):
                 )
                 self.assertEqual(response["type"], "state")
                 self.assertTrue(response["resync_required"])
-                self.assertLessEqual(len(compact_json_bytes(response)), REMOTE_INITIAL_STATE_MAX_BYTES)
+                self.assertLessEqual(
+                    len(compact_json_bytes(response)), REMOTE_INITIAL_STATE_MAX_BYTES
+                )
                 self.assertNotIn("fragment 0", json.dumps(response))
                 self.assertNotIn("/private/overflow", json.dumps(response))
             finally:
@@ -6993,10 +9148,11 @@ class StoreTests(unittest.TestCase):
                 server.server_close()
             self.assertFalse(paths.remote_agent_socket.exists())
 
-    def test_connector_abi_is_bounded_and_local_hub_routes_echo_and_remote_lanes(self) -> None:
+    def test_connector_abi_is_bounded_and_local_hub_routes_echo_and_remote_lanes(
+        self,
+    ) -> None:
         if not hasattr(socket, "AF_UNIX") or not hasattr(socket, "SO_PEERCRED"):
             self.skipTest("same-user Unix-domain connector sockets are unavailable")
-        import base64
 
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -7006,23 +9162,12 @@ class StoreTests(unittest.TestCase):
             store = Store(paths)
             store.import_auth_file("default", source)
             server = ProvisionServer(("127.0.0.1", 0), paths)
-            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-
-            def receive() -> dict[str, Any]:
-                data = bytearray()
-                while b"\n" not in data:
-                    chunk = connection.recv(65536)
-                    if not chunk:
-                        self.fail("connector socket closed before a response")
-                    data.extend(chunk)
-                return decode_connector_message(bytes(data.split(b"\n", 1)[0]))
 
             try:
                 self.assertFalse(paths.connector_socket.exists())
                 self.assertFalse(paths.connector_token.exists())
                 self.assertFalse(server.connector_status()["enabled"])
                 session_key = server.observe_session("/workspace/connector", "default")
-                server.enroll_remote_device("connector-peer", "test-pairing")
                 status = server.start_connector_hub()
                 self.assertTrue(status["enabled"])
                 self.assertEqual(status["abi"], CONNECTOR_ABI_VERSION)
@@ -7030,62 +9175,87 @@ class StoreTests(unittest.TestCase):
                 self.assertTrue(paths.connector_token.exists())
                 self.assertEqual(paths.connector_socket.stat().st_mode & 0o777, 0o600)
 
-                connection.settimeout(2)
-                connection.connect(str(paths.connector_socket))
-                connection.sendall(
-                    encode_connector_message(
-                        {
-                            "type": "hello",
-                            "abi": CONNECTOR_ABI_VERSION,
-                            "token": store.connector_token(),
-                            "connector_id": "loopback-connector",
-                            "lanes": ["provision.echo/v1", "provision.remote/v1"],
-                        }
-                    )
-                )
-                hello = receive()
-                self.assertEqual(hello["type"], "hello_ack")
-                self.assertEqual(hello["lanes"], ["provision.echo/v1", "provision.remote/v1"])
-
-                connection.sendall(
-                    encode_connector_message(
-                        connector_frame(
+                with LocalConnectorClient(
+                    paths.connector_socket,
+                    store.connector_token(),
+                    connector_id="loopback-connector",
+                    lanes=[
+                        "provision.echo/v1",
+                        "provision.remote/v1",
+                        "provision.remote-admin/v1",
+                    ],
+                ) as connection:
+                    self.assertEqual(
+                        connection.request(
                             link_id="local-loopback",
                             lane="provision.echo/v1",
                             payload=b"hello connector",
                             message_id="message-001",
-                        )
+                        ),
+                        b"hello connector",
                     )
-                )
-                echo = receive()
-                self.assertEqual(echo["type"], "frame_ack")
-                self.assertEqual(
-                    base64.urlsafe_b64decode(echo["payload"] + "=" * (-len(echo["payload"]) % 4)),
-                    b"hello connector",
-                )
 
-                connection.sendall(
-                    encode_connector_message(
-                        connector_frame(
-                            link_id="local-loopback",
-                            lane="provision.remote/v1",
-                            payload=json.dumps(
-                                {"operation": "state", "device_id": "connector-peer"}
-                            ).encode("utf-8"),
-                        )
+                    enrollment = connection.request(
+                        link_id="local-loopback",
+                        lane="provision.remote/v1",
+                        payload=json.dumps(
+                            {
+                                "operation": "device_enroll",
+                                "device_id": "connector-peer",
+                                "identity_fingerprint": "test-pairing",
+                            }
+                        ).encode("utf-8"),
                     )
-                )
-                remote = receive()
-                remote_payload = json.loads(
-                    base64.urlsafe_b64decode(
-                        remote["payload"] + "=" * (-len(remote["payload"]) % 4)
-                    ).decode("utf-8")
-                )
-                self.assertTrue(remote_payload["ok"])
-                self.assertEqual(remote_payload["result"]["type"], "state")
-                self.assertNotIn(session_key, json.dumps(remote_payload))
+                    enrollment_payload = json.loads((enrollment or b"").decode("utf-8"))
+                    self.assertTrue(enrollment_payload["ok"])
+                    self.assertEqual(
+                        enrollment_payload["result"]["capabilities"],
+                        ["read_discussion", "read_state"],
+                    )
+
+                    remote = connection.request(
+                        link_id="local-loopback",
+                        lane="provision.remote/v1",
+                        payload=json.dumps(
+                            {"operation": "state", "device_id": "connector-peer"}
+                        ).encode("utf-8"),
+                    )
+                    remote_payload = json.loads((remote or b"").decode("utf-8"))
+                    self.assertTrue(remote_payload["ok"])
+                    self.assertEqual(remote_payload["result"]["type"], "state")
+                    self.assertNotIn(session_key, json.dumps(remote_payload))
+
+                    capabilities = connection.request(
+                        link_id="local-admin",
+                        lane="provision.remote-admin/v1",
+                        payload=json.dumps(
+                            {
+                                "operation": "device_set_capabilities",
+                                "device_id": "connector-peer",
+                                "capabilities": [
+                                    "read_discussion",
+                                    "read_state",
+                                    "send_prompt",
+                                ],
+                            }
+                        ).encode("utf-8"),
+                    )
+                    capabilities_payload = json.loads((capabilities or b"").decode("utf-8"))
+                    self.assertTrue(capabilities_payload["ok"])
+                    self.assertIn("send_prompt", capabilities_payload["result"]["capabilities"])
+
+                    listed = connection.request(
+                        link_id="local-admin",
+                        lane="provision.remote-admin/v1",
+                        payload=b'{"operation":"device_list"}',
+                    )
+                    listed_payload = json.loads((listed or b"").decode("utf-8"))
+                    self.assertTrue(listed_payload["ok"])
+                    self.assertEqual(
+                        listed_payload["result"]["devices"][0]["device_id"],
+                        "connector-peer",
+                    )
             finally:
-                connection.close()
                 server.stop_connector_hub()
                 server.server_close()
             self.assertFalse(paths.connector_socket.exists())
@@ -7110,7 +9280,116 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(cli_main(["connector", "abi"]), 0)
         self.assertEqual(json.loads(output.getvalue())["framing"], "jsonl")
 
-    def test_connector_admin_api_requires_proxy_token_and_controls_only_local_socket(self) -> None:
+    def test_remote_cli_manages_devices_only_through_the_local_connector(self) -> None:
+        if not hasattr(socket, "AF_UNIX") or not hasattr(socket, "SO_PEERCRED"):
+            self.skipTest("same-user Unix-domain connector sockets are unavailable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "auth.json"
+            source.write_text(json.dumps({"OPENAI_API_KEY": "sk-test"}), encoding="utf-8")
+            paths = Paths(root / "home")
+            store = Store(paths)
+            store.import_auth_file("default", source)
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                server.start_connector_hub()
+                daemon_status = {"port": 4888, "host": "127.0.0.1"}
+                connector_status = {
+                    "enabled": True,
+                    "lanes": ["provision.remote-admin/v1"],
+                }
+                with (
+                    patch.object(cli_module, "ensure_daemon", return_value=daemon_status),
+                    patch.object(
+                        cli_module,
+                        "connector_daemon_action",
+                        return_value=connector_status,
+                    ),
+                ):
+                    output = StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(
+                            cli_module.cmd_remote(
+                                paths,
+                                store,
+                                Namespace(
+                                    action="enroll",
+                                    device_id="companion-101",
+                                    fingerprint="verified-fingerprint",
+                                    capability=[],
+                                ),
+                            ),
+                            0,
+                        )
+                    enrolled = json.loads(output.getvalue())
+                    self.assertEqual(enrolled["device_id"], "companion-101")
+                    self.assertEqual(enrolled["capabilities"], ["read_discussion", "read_state"])
+
+                    output = StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(
+                            cli_module.cmd_remote(
+                                paths,
+                                store,
+                                Namespace(
+                                    action="grant",
+                                    device_id="companion-101",
+                                    fingerprint="",
+                                    capability=["send_prompt"],
+                                ),
+                            ),
+                            0,
+                        )
+                    granted = json.loads(output.getvalue())
+                    self.assertEqual(
+                        granted["capabilities"],
+                        ["read_discussion", "read_state", "send_prompt"],
+                    )
+
+                    output = StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(
+                            cli_module.cmd_remote(
+                                paths,
+                                store,
+                                Namespace(
+                                    action="revoke",
+                                    device_id="companion-101",
+                                    fingerprint="",
+                                    capability=[],
+                                ),
+                            ),
+                            0,
+                        )
+                    revoked = json.loads(output.getvalue())
+                    self.assertTrue(revoked["revoked"])
+            finally:
+                server.server_close()
+
+    def test_remote_cli_explains_when_the_running_daemon_predates_the_admin_lane(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            store = Store(paths)
+            with (
+                patch.object(
+                    cli_module,
+                    "ensure_daemon",
+                    return_value={"port": 4888, "host": "127.0.0.1"},
+                ),
+                patch.object(
+                    cli_module,
+                    "connector_daemon_action",
+                    return_value={"enabled": True, "lanes": ["provision.remote/v1"]},
+                ),
+                self.assertRaisesRegex(RuntimeError, "restart it after updating Provision"),
+            ):
+                cli_module.remote_admin_request(paths, store, {"operation": "device_list"})
+
+    def test_connector_admin_api_requires_proxy_token_and_controls_only_local_socket(
+        self,
+    ) -> None:
         if not hasattr(socket, "AF_UNIX") or not hasattr(socket, "SO_PEERCRED"):
             self.skipTest("same-user Unix-domain connector sockets are unavailable")
         with tempfile.TemporaryDirectory() as temp:

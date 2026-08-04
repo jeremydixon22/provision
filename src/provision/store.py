@@ -9,7 +9,12 @@ from typing import Any
 
 from .auth import extract_metadata, load_json, write_secret_json
 from .paths import Paths, default_codex_home
-
+from .providers import (
+    ProviderError,
+    canonical_provider,
+    provider_profile_root,
+    provider_spec,
+)
 
 PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
@@ -135,7 +140,9 @@ class Store:
             self.set_active_profile(name)
             return name
         if required:
-            raise StoreError("no Codex profiles are enrolled; run `provision import-default` or `provision login <name>`")
+            raise StoreError(
+                "no Codex profiles are enrolled; run `provision import-default` or `provision login <name>`"
+            )
         return None
 
     def set_active_profile(self, name: str) -> None:
@@ -235,3 +242,113 @@ class Store:
             shutil.rmtree(path)
         except FileNotFoundError:
             pass
+
+    # Provider selection deliberately lives beside, rather than inside, the
+    # Codex profile store.  Codex's existing profile and proxy data layout is a
+    # public compatibility surface and must remain stable while other vendor
+    # clients retain ownership of their own credential formats.
+
+    def default_provider(self) -> str:
+        try:
+            value = self.paths.default_provider.read_text(encoding="utf-8").strip()
+        except OSError:
+            value = ""
+        if value:
+            try:
+                return canonical_provider(value)
+            except ProviderError:
+                # A stale default from a future/removed adapter must never make
+                # bare `provision` unusable. Codex remains the safe default.
+                pass
+        return "codex"
+
+    def set_default_provider(self, provider: str) -> str:
+        try:
+            canonical = canonical_provider(provider)
+        except ProviderError as exc:
+            raise StoreError(str(exc)) from exc
+        self.paths.default_provider.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.default_provider.write_text(canonical + "\n", encoding="utf-8")
+        self.paths.default_provider.chmod(0o600)
+        return canonical
+
+    def provider_profile_root(self, provider: str, name: str) -> Path:
+        validate_profile_name(name)
+        try:
+            return provider_profile_root(self.paths.home, provider, name)
+        except ProviderError as exc:
+            raise StoreError(str(exc)) from exc
+
+    def provider_profile_exists(self, provider: str, name: str) -> bool:
+        try:
+            root = self.provider_profile_root(provider, name)
+        except StoreError:
+            return False
+        return root.is_dir()
+
+    def provider_profile_names(self, provider: str) -> list[str]:
+        try:
+            spec = provider_spec(provider)
+        except ProviderError as exc:
+            raise StoreError(str(exc)) from exc
+        if not spec.supports_managed_profiles:
+            return []
+        root = self.paths.providers / spec.name / "profiles"
+        try:
+            return sorted(
+                path.name
+                for path in root.iterdir()
+                if path.is_dir() and PROFILE_NAME.match(path.name)
+            )
+        except OSError:
+            return []
+
+    def provider_active_profile_path(self, provider: str) -> Path:
+        try:
+            spec = provider_spec(provider)
+        except ProviderError as exc:
+            raise StoreError(str(exc)) from exc
+        return self.paths.providers / spec.name / "active-profile"
+
+    def active_provider_profile(self, provider: str) -> str | None:
+        try:
+            spec = provider_spec(provider)
+        except ProviderError as exc:
+            raise StoreError(str(exc)) from exc
+        if not spec.supports_managed_profiles:
+            return None
+        path = self.provider_active_profile_path(spec.name)
+        try:
+            name = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return name if name and self.provider_profile_exists(spec.name, name) else None
+
+    def ensure_provider_profile(self, provider: str, name: str, *, set_active: bool = True) -> Path:
+        root = self.provider_profile_root(provider, name)
+        root.mkdir(parents=True, exist_ok=True)
+        # The provider root can contain vendor credentials after native login;
+        # do not leave intermediate directories readable merely because they
+        # were first created under a permissive umask.
+        for directory in (root.parent.parent, root.parent, root):
+            directory.chmod(0o700)
+        if set_active:
+            self.set_active_provider_profile(provider, name)
+        return root
+
+    def set_active_provider_profile(self, provider: str, name: str) -> None:
+        try:
+            spec = provider_spec(provider)
+        except ProviderError as exc:
+            raise StoreError(str(exc)) from exc
+        if not spec.supports_managed_profiles:
+            raise StoreError(
+                f"{spec.name} does not yet support Provision-managed profiles; use its native login"
+            )
+        validate_profile_name(name)
+        if not self.provider_profile_exists(spec.name, name):
+            raise StoreError(f"{spec.name} profile does not exist: {name}")
+        path = self.provider_active_profile_path(spec.name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(name + "\n", encoding="utf-8")
+        path.chmod(0o600)
