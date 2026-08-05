@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "provision"
 version = "0.7.1"
-description = "Local-first AI coding CLI control plane, profile manager, and session dashboard"
+description = "Linux-native, local-first control plane and session dashboard for Codex CLI, Claude Code, and Grok Build"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -14,9 +14,13 @@ authors = [
 ]
 keywords = [
   "account-manager",
+  "account-routing",
   "ai-coding",
+  "ai-coding-agent",
+  "ai-coding-cli",
   "anthropic",
   "chatgpt",
+  "claude",
   "claude-code",
   "cli",
   "connector",
@@ -33,15 +37,23 @@ keywords = [
   "gpt-5.6-terra",
   "grok",
   "grok-build",
+  "linux",
   "local-control-plane",
+  "local-dashboard",
   "local-first",
   "model-catalog",
+  "multi-provider",
+  "native-terminal",
   "openai",
   "profile-manager",
   "proxy",
+  "pty",
   "quota",
+  "session-dashboard",
   "session-manager",
+  "session-observability",
   "terminal",
+  "terminal-control",
   "usage-monitoring",
   "websocket",
   "xai",
