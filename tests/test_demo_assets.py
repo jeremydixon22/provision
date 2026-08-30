@@ -24,7 +24,9 @@ class DemoAssetTests(unittest.TestCase):
         self.assertIn('src="/assets/provision-ui.js"', markup)
         self.assertIn("Claude", markup)
         self.assertIn("Grok", markup)
+        self.assertIn("Discussion capture now shows the shell command", markup)
         self.assertIn("live daemon WebSocket is intentionally disabled", script)
+        self.assertIn("Array.isArray(session && session.transcript)", script)
         self.assertNotIn("\n\t    connect();", script)
 
 

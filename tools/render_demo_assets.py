@@ -375,8 +375,14 @@ class DemoServer:
         ]
 
     def control_plane_sessions(
-        self, session_rows: list[dict[str, Any]] | None = None
+        self,
+        session_rows: list[dict[str, Any]] | None = None,
+        *,
+        include_transcript: bool = True,
     ) -> dict[str, Any]:
+        # Keep the static demo self-contained: it has no live websocket from
+        # which the browser could request an individual discussion payload.
+        _ = include_transcript
         session_rows = self.sessions if session_rows is None else session_rows
         sessions: list[dict[str, Any]] = []
         for session in session_rows:

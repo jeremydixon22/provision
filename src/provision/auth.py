@@ -188,8 +188,6 @@ def codex_client_id_match_score(data: bytes, match: re.Match[bytes]) -> int:
     start = max(0, match.start() - 512)
     end = min(len(data), match.end() + 512)
     context = data[start:end].lower()
-    if any(term in context for term in CODEX_CLIENT_ID_FALSE_CONTEXT_TERMS):
-        return 0
     if all(term in strict_context for term in CODEX_CLIENT_ID_CONTEXT_TERMS):
         return 100
     login_context_matches = sum(
@@ -197,6 +195,8 @@ def codex_client_id_match_score(data: bytes, match: re.Match[bytes]) -> int:
     )
     if login_context_matches >= 2:
         return 50 + login_context_matches
+    if any(term in context for term in CODEX_CLIENT_ID_FALSE_CONTEXT_TERMS):
+        return 0
     return 0
 
 

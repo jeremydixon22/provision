@@ -1385,6 +1385,59 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(sent[0]["ui_state_version"], 8)
         self.assertEqual(sent[0]["sections"], ["base", "control_plane"])
 
+    def test_ui_websocket_acknowledges_current_bootstrap_without_full_state(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.ui_state_lock = threading.Lock()
+        server.ui_state_version = 12
+        server.ui_state_dirty_reasons = {}
+        server.ui_state_dirty_log = []
+        server.permission_state_snapshot = lambda: {"pending": [], "browser_clients": 1}  # type: ignore[method-assign]
+        server.mark_ui_dirty("permissions")
+
+        handler = Handler.__new__(Handler)
+        handler.server = server
+        sent: list[dict[str, Any]] = []
+        handler.send_websocket_json = lambda data: sent.append(data)  # type: ignore[method-assign]
+        handler.send_ui_state = lambda **_kwargs: self.fail("full state should not be rebuilt")  # type: ignore[method-assign]
+
+        self.assertEqual(handler.send_initial_ui_websocket_state(12), 13)
+        self.assertEqual(sent[0]["type"], "state_ack")
+        self.assertEqual(sent[0]["ui_state_version"], 13)
+        self.assertEqual(sent[0]["status"]["permissions"]["browser_clients"], 1)
+
+    def test_slow_ui_query_runs_outside_websocket_reader(self) -> None:
+        server = ProvisionServer.__new__(ProvisionServer)
+        server.ui_query_semaphore = threading.BoundedSemaphore(1)
+        server.log_message = lambda *_args: None  # type: ignore[method-assign]
+        handler = Handler.__new__(Handler)
+        handler.server = server
+        release = threading.Event()
+        completed = threading.Event()
+        sent: list[dict[str, Any]] = []
+
+        def loader() -> list[str]:
+            release.wait(2)
+            return ["ready"]
+
+        def send(packet: dict[str, Any]) -> None:
+            sent.append(packet)
+            completed.set()
+
+        handler.send_websocket_json = send  # type: ignore[method-assign]
+        started = time.monotonic()
+        handler.run_ui_query_async(
+            "test-query",
+            loader,
+            lambda value: {"type": "test", "value": value},
+            {"type": "test", "ok": False},
+        )
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.1)
+        self.assertEqual(sent, [])
+        release.set()
+        self.assertTrue(completed.wait(2))
+        self.assertEqual(sent, [{"type": "test", "value": ["ready"]}])
+
     def test_upstream_websocket_handshake_disables_extensions(self) -> None:
         handler = Handler.__new__(Handler)
         handler.headers = {
@@ -2342,12 +2395,6 @@ class StoreTests(unittest.TestCase):
                                 }
                             ),
                             json.dumps({"id": 9, "result": {"data": [{"turnId": "turn-1"}]}}),
-                            json.dumps(
-                                {
-                                    "id": 10,
-                                    "result": {"thread": {"id": "thread-1", "isPinned": True}},
-                                }
-                            ),
                             "",
                         ]
                     )
@@ -2382,7 +2429,7 @@ class StoreTests(unittest.TestCase):
                     "reset-key",
                     credit_id="credit-later",
                 )
-                threads = client.list_threads(cursor="thread-cursor", is_pinned=True)
+                threads = client.list_threads(cursor="thread-cursor")
                 turns = client.list_thread_turns("thread-1", cursor="turn-cursor")
                 items = client.list_thread_items(
                     "thread-1",
@@ -2394,7 +2441,6 @@ class StoreTests(unittest.TestCase):
                     "closeout",
                     cursor="search-cursor",
                 )
-                pinned = client.update_thread_pin("thread-1", is_pinned=True)
         finally:
             daemon_module.subprocess.Popen = original_popen
 
@@ -2410,14 +2456,12 @@ class StoreTests(unittest.TestCase):
         self.assertIn('"creditId":"credit-later"', sent)
         self.assertIn('"method":"thread/list"', sent)
         self.assertIn('"cursor":"thread-cursor"', sent)
-        self.assertIn('"isPinned":true', sent)
         self.assertIn('"method":"thread/turns/list"', sent)
         self.assertIn('"itemsView":"summary"', sent)
         self.assertIn('"method":"thread/items/list"', sent)
         self.assertIn('"turnId":"turn-1"', sent)
         self.assertIn('"method":"thread/searchOccurrences"', sent)
         self.assertIn('"searchTerm":"closeout"', sent)
-        self.assertIn('"method":"thread/metadata/update"', sent)
         self.assertEqual(rate_limits["rateLimits"]["limitId"], "codex")
         self.assertEqual(usage["summary"]["lifetimeTokens"], 123)
         self.assertEqual(models["data"][0]["id"], "gpt-test")
@@ -2426,7 +2470,21 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(turns["data"][0]["id"], "turn-1")
         self.assertEqual(items["data"][0]["item"]["id"], "item-1")
         self.assertEqual(occurrences["data"][0]["turnId"], "turn-1")
-        self.assertTrue(pinned["thread"]["isPinned"])
+
+    def test_codex_app_server_client_retains_structured_rpc_errors(self) -> None:
+        client = daemon_module.CodexAppServerClient()
+        error_payload = {
+            "code": -32001,
+            "message": "MCP server did not initialize",
+            "data": {"server": "browser", "kind": "startup_interrupted"},
+        }
+
+        with self.assertRaises(daemon_module.CodexAppServerError) as raised:
+            client._response_result({"id": 1, "error": error_payload})
+
+        self.assertEqual(raised.exception.details, error_payload)
+        self.assertIn("MCP server did not initialize", str(raised.exception))
+        self.assertIn("-32001", str(raised.exception))
 
     def test_app_server_rate_limit_refresh_failure_logs_and_backs_off(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -4890,6 +4948,29 @@ class StoreTests(unittest.TestCase):
             )
             self.assertEqual([point["quota_updates"] for point in summary["series"]][-1], 1)
 
+    def test_stats_events_reads_and_caches_only_the_bounded_file_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            paths.ensure_base()
+            prefix = "".join(
+                json.dumps({"type": "old", "sequence": index}) + "\n" for index in range(2500)
+            )
+            recent = "".join(
+                json.dumps({"type": "recent", "sequence": index}) + "\n" for index in range(5)
+            )
+            paths.stats.write_text(prefix + recent, encoding="utf-8")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                first = server.stats_events(3)
+                self.assertEqual([event["sequence"] for event in first], [2, 3, 4])
+                self.assertEqual(server.stats_events_cache_limit, daemon_module.STATS_MAX_EVENTS)
+
+                server.append_stats_event({"type": "new", "sequence": 5})
+                second = server.stats_events(3)
+                self.assertEqual([event["sequence"] for event in second], [3, 4, 5])
+            finally:
+                server.server_close()
+
     def test_control_plane_sessions_include_active_state_and_events(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -5088,6 +5169,68 @@ class StoreTests(unittest.TestCase):
             finally:
                 server.server_close()
 
+    def test_ui_control_plane_uses_summaries_and_loads_one_discussion_on_demand(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            try:
+                session_key = server.observe_session("/workspace/on-demand", "default")
+                server.append_control_transcript(
+                    session_key=session_key,
+                    role="user",
+                    text="Keep the initial dashboard small.",
+                    turn_id="turn-on-demand",
+                )
+                server.append_control_transcript(
+                    session_key=session_key,
+                    role="assistant",
+                    text="This discussion should be fetched only for its selected tab.",
+                    turn_id="turn-on-demand",
+                )
+                for index in range(12):
+                    heavy_key = server.observe_session(f"/workspace/heavy-{index}", "default")
+                    heavy_text = f"heavy-discussion-{index}:" + ("x" * 12_000)
+                    for item_index in range(4):
+                        server.append_control_transcript(
+                            session_key=heavy_key,
+                            role="tool",
+                            text=f"{heavy_text}:{item_index}",
+                            turn_id=f"turn-heavy-{index}",
+                            call_id=f"call-heavy-{index}-{item_index}",
+                        )
+
+                summary = server.control_plane_sessions(include_transcript=False)["sessions"][0]
+                detail = server.control_session_payload(session_key)
+                handler = Handler.__new__(Handler)
+                handler.server = server
+                status = handler.ui_status_payload()
+                rendered = handler.render_ui()
+                detailed_payload = json.dumps(
+                    server.control_plane_sessions(), separators=(",", ":")
+                ).encode("utf-8")
+                initial_payload = json.dumps(status, separators=(",", ":")).encode("utf-8")
+            finally:
+                server.server_close()
+
+            self.assertNotIn("transcript", summary)
+            self.assertNotIn("turns", summary)
+            self.assertEqual(summary["discussion"]["items"], 2)
+            self.assertEqual(detail["session_key"], session_key)
+            self.assertEqual(len(detail["transcript"]), 2)
+            self.assertEqual(detail["turns"][0]["turn_id"], "turn-on-demand")
+            control_session = status["control_plane"]["sessions"][0]
+            self.assertNotIn("transcript", control_session)
+            self.assertNotIn("turns", control_session)
+            self.assertEqual(
+                control_session["discussion"]["revision"], detail["discussion"]["revision"]
+            )
+            self.assertNotIn(
+                "This discussion should be fetched only for its selected tab.", rendered
+            )
+            self.assertNotIn(b"heavy-discussion-0:", initial_payload)
+            self.assertGreater(len(detailed_payload), 400_000)
+            self.assertLess(len(initial_payload) * 5, len(detailed_payload))
+
     def test_discussion_merges_live_turn_suffix_over_cached_observed_pages(
         self,
     ) -> None:
@@ -5111,6 +5254,15 @@ class StoreTests(unittest.TestCase):
         self.assertIn("liveFirst > cachedLast + 1", html)
         self.assertIn("requestObservedTurn(session, activeTurn, null, true);", html)
         self.assertIn("mergeObservedTurnPayload(existing, incoming)", html)
+        self.assertIn("Showing the latest discussion while earlier entries load.", html)
+        self.assertIn("!transcriptItemsForTurn(transcript, activeTurn).length", html)
+        self.assertIn("function scheduleHistoryIndex(session)", html)
+        self.assertIn('typeof window.requestIdleCallback === "function"', html)
+        self.assertLess(
+            html.index("if (activeTurnNeedsLoad) requestObservedTurn(session, activeTurn);"),
+            html.index("scheduleHistoryIndex(session);"),
+        )
+        self.assertIn("if (selectedControlSessionKey) renderControlModal(true);", html)
         self.assertIn("const visibleItemIds = new Set(", html)
         self.assertIn("!visibleItemIds.has(controlTranscriptItemIdentity(item, index))", html)
 
@@ -5319,6 +5471,8 @@ class StoreTests(unittest.TestCase):
 
             def control_plane_sessions(
                 supplied: list[dict[str, Any]] | None = None,
+                *,
+                include_transcript: bool = True,
             ) -> dict[str, Any]:
                 control_calls.append(supplied)
                 return {"sessions": supplied or []}
@@ -5506,7 +5660,7 @@ class StoreTests(unittest.TestCase):
             html,
         )
         self.assertIn(
-            "white-space: normal;\n      overflow-wrap: break-word;\n      word-break: normal;",
+            "white-space: normal;\n      overflow-wrap: normal;\n      word-break: normal;\n      hyphens: manual;",
             html,
         )
 
@@ -5559,6 +5713,18 @@ class StoreTests(unittest.TestCase):
         self.assertIn("--mobile-control-dock-height", html)
         self.assertIn("padding-bottom: max(8px, env(safe-area-inset-bottom));", html)
         self.assertIn("overscroll-behavior: contain;", html)
+        self.assertIn(
+            ".control-head {\n\t        display: grid;\n"
+            "\t        grid-template-columns: minmax(0, 1fr);",
+            html,
+        )
+        self.assertIn(
+            ".control-head h2 {\n\t        overflow: hidden;\n"
+            "\t        overflow-wrap: normal;\n\t        text-overflow: ellipsis;\n"
+            "\t        white-space: nowrap;",
+            html,
+        )
+        self.assertIn("controlTitle.title = controlTitleText;", html)
         self.assertIn(
             'window.visualViewport.addEventListener("resize", updateControlDockGeometry',
             html,
@@ -5726,7 +5892,8 @@ class StoreTests(unittest.TestCase):
             root = Path(temp)
             paths = Paths(root / "home")
             control_path = root / "control.sock"
-            control_path.write_text("", encoding="utf-8")
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(control_path))
             server = ProvisionServer(("127.0.0.1", 0), paths)
             try:
                 stale_key = server.observe_session("/workspace/old", "default")
@@ -5734,6 +5901,7 @@ class StoreTests(unittest.TestCase):
                     "/workspace/live",
                     "default",
                     control_path=str(control_path),
+                    launcher_pid=os.getpid(),
                     pty_managed=True,
                 )
                 with server.active_lock:
@@ -5753,6 +5921,34 @@ class StoreTests(unittest.TestCase):
                 self.assertTrue(snapshots[live_key]["pty_control_available"])
             finally:
                 server.server_close()
+                listener.close()
+
+    @unittest.skipIf(not hasattr(socket, "AF_UNIX"), "launcher sockets require AF_UNIX")
+    def test_dead_launcher_socket_is_not_retained_as_a_live_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            paths.ensure_base()
+            control_path = paths.launchers / "provision-999999999-deadbeef.sock"
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(control_path))
+            try:
+                session_key = server.observe_session(
+                    "/workspace/departed",
+                    "default",
+                    control_path=str(control_path),
+                    launcher_pid=999999999,
+                    pty_managed=True,
+                )
+
+                snapshots = {item["key"]: item for item in server.session_snapshots()}
+
+                self.assertNotIn(session_key, snapshots)
+                self.assertNotIn(session_key, server.observed_sessions)
+                self.assertFalse(control_path.exists())
+            finally:
+                server.server_close()
+                listener.close()
 
     @unittest.skipIf(not hasattr(socket, "AF_UNIX"), "launcher sockets require AF_UNIX")
     def test_daemon_startup_removes_dead_launcher_socket_but_keeps_current_launcher(self) -> None:
@@ -5816,7 +6012,7 @@ class StoreTests(unittest.TestCase):
                     "/workspace/provision",
                     "default",
                     control_path=str(control_path),
-                    launcher_pid=1234,
+                    launcher_pid=os.getpid(),
                     pty_managed=True,
                 )
                 snapshot = next(
@@ -5856,14 +6052,15 @@ class StoreTests(unittest.TestCase):
             root = Path(temp)
             paths = Paths(root / "home")
             control_path = root / "control.sock"
-            control_path.write_text("", encoding="utf-8")
             server = ProvisionServer(("127.0.0.1", 0), paths)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(control_path))
             try:
                 session_key = server.observe_session(
                     "/workspace/provision",
                     "default",
                     control_path=str(control_path),
-                    launcher_pid=1234,
+                    launcher_pid=os.getpid(),
                     pty_managed=True,
                 )
                 server.observe_session("/workspace/provision", "default")
@@ -5887,6 +6084,7 @@ class StoreTests(unittest.TestCase):
                 self.assertFalse(snapshot["interaction"]["available"])
             finally:
                 server.server_close()
+                listener.close()
 
     def test_ui_launcher_args_include_resume_cwd_and_permission(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -5963,13 +6161,16 @@ class StoreTests(unittest.TestCase):
             root = Path(temp)
             paths = Paths(root / "home")
             control_path = root / "control.sock"
-            control_path.write_text("", encoding="utf-8")
             server = ProvisionServer(("127.0.0.1", 0), paths)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(control_path))
+            launcher = subprocess.Popen(["sleep", "60"])
             try:
                 session_key = server.observe_session(
                     "/workspace/provision",
                     "default",
                     control_path=str(control_path),
+                    launcher_pid=launcher.pid,
                     pty_managed=True,
                 )
                 with self.assertRaises(StoreError):
@@ -5978,6 +6179,9 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(server.session_snapshots(), [])
             finally:
                 server.server_close()
+                listener.close()
+                launcher.terminate()
+                launcher.wait(timeout=1)
 
     def test_codex_history_bridge_links_sessions_without_auth(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -8465,6 +8669,23 @@ class StoreTests(unittest.TestCase):
             b"app_EMoamEEZ73f0CkXaXp7hrann"
             b"starting browser login flow"
             b"starting device code login flow"
+        )
+
+        self.assertEqual(
+            codex_client_id_from_bytes(payload),
+            "app_EMoamEEZ73f0CkXaXp7hrann",
+        )
+
+    def test_codex_client_id_login_evidence_wins_over_nearby_connector_metadata(
+        self,
+    ) -> None:
+        payload = (
+            b"Logged in using ChatGPT\n"
+            b"Logged in using access token\n"
+            b"app_EMoamEEZ73f0CkXaXp7hrann"
+            b"starting browser login flow"
+            b"starting device code login flow"
+            b" originating MCP tool connector_ marketplace plugin_id"
         )
 
         self.assertEqual(

@@ -16,6 +16,7 @@
 	    let latestControlPlane = INITIAL.status && INITIAL.status.control_plane ? INITIAL.status.control_plane : { sessions: [] };
 	    let latestCodex = INITIAL.status && INITIAL.status.codex ? INITIAL.status.codex : {};
 	    let latestPermissions = INITIAL.status && INITIAL.status.permissions ? INITIAL.status.permissions : { pending: [] };
+	    let latestUiStateVersion = Number(INITIAL.ui_state_version || 0);
 	    let pendingPermissionDecision = "";
 	    let pendingRenderPacket = null;
 	    let pendingRenderFrame = null;
@@ -43,12 +44,15 @@
 	    const controlTurnPresentations = {};
 	    const expandedControlMessages = {};
 	    const markdownRenderCache = new Map();
+	    const controlSessionDetails = {};
+	    const controlSessionDetailRequests = {};
 	    const observedTurnCache = {};
 	    const observedTurnRequests = {};
 	    const historyTurnCache = {};
 	    const historyTurnRequests = {};
 	    const historyTurnIndexes = {};
 	    const historyIndexRequests = {};
+	    const historyIndexSchedules = {};
 	    const resumeCandidateIndexes = {};
 	    const resumeCandidateRequests = {};
 	    const terminalSnapshotCache = {};
@@ -236,8 +240,13 @@
 	    function renderMarkdownInlineLines(lines) {
 	      return lines.map((rawLine, index) => {
 	        const line = String(rawLine || "");
-	        const hardBreak = /(?: {2,}|\\)$/.test(line);
-	        const content = hardBreak ? line.replace(/(?: {2,}|\\)$/, "") : line;
+	        // Agent streams frequently contain trailing whitespace at a chunk or
+	        // terminal-wrap boundary.  Two trailing spaces are technically a
+	        // Markdown hard break, but interpreting every such boundary as one
+	        // split ordinary prose, acronyms, and quoted text unexpectedly.
+	        // A backslash is an unambiguous, intentional hard-break marker.
+	        const hardBreak = /\\\s*$/.test(line);
+	        const content = hardBreak ? line.replace(/\\\s*$/, "") : line.trimEnd();
 	        const rendered = renderMarkdownInline(content.trim());
 	        if (index === lines.length - 1) return rendered;
 	        return `${rendered}${hardBreak ? "<br>" : " "}`;
@@ -290,9 +299,11 @@
 
 		    function repairStreamedMarkdownProse(value) {
 		      let source = String(value || "");
-		      source = source.replace(/\[\s*\n{2,}\s*([^\]\n]{1,160}?)\s*\]/g, (_match, label) => `[${label.trim()}]`);
-		      source = source.replace(/\[([^\]\n]{1,120}?)\s*\n+\s*([^\]\n]{1,120}?)\]/g, (_match, left, right) => {
-		        const label = repairStreamedMarkdownLabel(left, right);
+		      source = source.replace(/\[([^\]]{1,240})\]/g, (_match, rawLabel) => {
+		        if (!/\n/.test(rawLabel)) return _match;
+		        const parts = rawLabel.split(/\n+/).map((part) => part.trim()).filter(Boolean);
+		        if (!parts.length) return _match;
+		        const label = parts.reduce(repairStreamedMarkdownLabel);
 		        return label.length <= 180 ? `[${label}]` : _match;
 		      });
 		      source = source.replace(/\]\s*\n+\s*\(([^)\n]{1,500})\)/g, (_match, href) => `](${href.trim()})`);
@@ -409,17 +420,7 @@
 	        let normalized = line;
 	        if (options.markdownPassthrough) {
 	          normalized = normalized.replace(/\s*```\s*$/, "");
-	          normalized = normalized.replace(/^(#{1,4}\s+)([A-Z][A-Za-z0-9_./:+ -]*?)-\s+([A-Z0-9].*)$/, "$1$2\n\n- $3");
-	          normalized = normalized.replace(/^(#{1,4}\s+)([A-Z][A-Za-z0-9_./:+-]*?)([A-Z][a-z].*)$/, "$1$2\n\n$3");
 	        }
-	        normalized = normalized.replace(/^(#{1,4}\s+.*?)(Working directory:\s*)/i, "$1\n\n$2");
-	        normalized = normalized.replace(/(Working directory:\s+.*?)(Current status:)/i, "$1\n\n$2");
-	        normalized = normalized.replace(/([^#\n])\s*(#{1,4}\s+\S)/g, "$1\n\n$2");
-	        normalized = normalized.replace(/([^\n])\s*([-*+]\s+\[[ xX]\]\s+\S)/g, "$1\n$2");
-	        normalized = normalized.replace(/([^\n])\s*([-*+]\s+\*\*\S)/g, "$1\n$2");
-		        normalized = normalized.replace(/([.!?:])\s*([-*+]\s+\S)/g, "$1\n$2");
-		        normalized = normalized.replace(/([.!?:])\s*-(\d+)(\s+\S.*)$/g, "$1\n- $2$3");
-	        normalized = normalized.replace(/^(\s*)-(\d+)(\s+\S.*)$/g, "$1- $2$3");
 	        return normalized;
 	      };
 	      return lines.map((line) => {
@@ -489,15 +490,38 @@
 	      }).join("\n");
 	    }
 
-	    function markdownBlockStarts(lines, index) {
+	    function markdownBlockStarts(lines, index, options = {}) {
 	      const line = lines[index] || "";
 	      const next = lines[index + 1] || "";
+	      const interruptsParagraph = Boolean(options.interruptsParagraph);
+	      const previousLine = String(options.previousLine || "").trimEnd();
+	      const quoteRun = () => {
+	        let count = 0;
+	        while (
+	          index + count < lines.length
+	          && /^\s{0,3}>(?:\s|$)/.test(lines[index + count])
+	        ) {
+	          count += 1;
+	        }
+	        return count;
+	      };
+	      const quote = /^\s{0,3}>(?:\s|$)/.test(line);
+	      const list = /^\s*([-*+])\s+/.test(line) || /^\s*\d+\.\s+/.test(line);
+	      const explicitContinuationBlock = /:\s*$/.test(previousLine);
+	      if (interruptsParagraph && quote && !explicitContinuationBlock && quoteRun() < 2) {
+	        return false;
+	      }
+	      if (interruptsParagraph && list && !explicitContinuationBlock) {
+	        return false;
+	      }
+	      if (interruptsParagraph && /^\s{0,3}[-*_](?:\s*[-*_]){2,}\s*$/.test(line)) {
+	        return false;
+	      }
 	      return (
 	        /^```/.test(line.trim())
 	        || /^\s{0,3}#{1,4}\s+/.test(line)
-	        || /^\s{0,3}>\s?/.test(line)
-	        || /^\s*([-*+])\s+/.test(line)
-	        || /^\s*\d+\.\s+/.test(line)
+	        || quote
+	        || list
 	        || /^\s{0,3}[-*_](?:\s*[-*_]){2,}\s*$/.test(line)
 	        || markdownTableStarts(line, next)
 	      );
@@ -644,9 +668,9 @@
 	          index = rendered.index;
 	          continue;
 	        }
-	        if (/^\s{0,3}>\s?/.test(line)) {
+	        if (/^\s{0,3}>(?:\s|$)/.test(line)) {
 	          const quoteLines = [];
-	          while (index < lines.length && /^\s{0,3}>\s?/.test(lines[index])) {
+	          while (index < lines.length && /^\s{0,3}>(?:\s|$)/.test(lines[index])) {
 	            quoteLines.push(lines[index].replace(/^\s{0,3}>\s?/, ""));
 	            index += 1;
 	          }
@@ -690,7 +714,14 @@
 	          continue;
 	        }
 	        const paragraph = [];
-	        while (index < lines.length && lines[index].trim() && !markdownBlockStarts(lines, index)) {
+	        while (
+	          index < lines.length
+	          && lines[index].trim()
+	          && !markdownBlockStarts(lines, index, {
+	            interruptsParagraph: paragraph.length > 0,
+	            previousLine: paragraph[paragraph.length - 1] || ""
+	          })
+	        ) {
 		          paragraph.push(lines[index].trimStart());
 	          index += 1;
 	        }
@@ -810,10 +841,53 @@
 	      return Array.isArray(plane.sessions) ? plane.sessions : [];
 	    }
 
+	    function controlDiscussionRevision(session) {
+	      const discussion = session && typeof session.discussion === "object" ? session.discussion : {};
+	      return String(discussion.revision || "0");
+	    }
+
+	    function discardInactiveControlSessionDetails() {
+	      for (const key of Object.keys(controlSessionDetails)) {
+	        if (key !== selectedControlSessionKey) delete controlSessionDetails[key];
+	      }
+	      for (const key of Object.keys(controlSessionDetailRequests)) {
+	        if (key !== selectedControlSessionKey) delete controlSessionDetailRequests[key];
+	      }
+	    }
+
+	    function controlSessionDetailNeedsLoad(session) {
+	      const key = String(session && session.key || selectedControlSessionKey || "");
+	      if (!key) return false;
+	      // Static demos and compatible read-only integrations can embed one
+	      // complete discussion directly in their bootstrap state.  A live
+	      // daemon sends summaries only, so it still takes the on-demand path.
+	      if (Array.isArray(session && session.transcript) && Array.isArray(session && session.turns)) {
+	        return false;
+	      }
+	      const detail = controlSessionDetails[key];
+	      return !detail || String(detail.revision || "") !== controlDiscussionRevision(session);
+	    }
+
+	    function requestControlSessionDetail(session) {
+	      const key = String(session && session.key || selectedControlSessionKey || "");
+	      if (!key || !socket || socket.readyState !== WebSocket.OPEN) return false;
+	      const revision = controlDiscussionRevision(session);
+	      if (controlSessionDetailRequests[key] === revision) return false;
+	      if (!controlSessionDetailNeedsLoad(session)) return false;
+	      controlSessionDetailRequests[key] = revision;
+	      socket.send(JSON.stringify({ action: "load_control_session", session_key: key }));
+	      return true;
+	    }
+
 	    function sessionTitle(session) {
 	      // Tabs identify the workspace, not a provider-generated conversation
 	      // summary. Native titles remain available as session metadata.
 	      return String(session.name || session.display || session.cwd || session.title || "Session");
+	    }
+
+	    function sessionTabClassName(session, selectedSessionKey) {
+	      const key = String(session && session.key || "");
+	      return `session-tab${key && key === selectedSessionKey ? " selected" : ""}`;
 	    }
 
 	    function sessionMeta(session) {
@@ -1007,6 +1081,7 @@
 	      `;
 	      if (!sessions.length) {
 	        selectedControlSessionKey = "";
+	        discardInactiveControlSessionDetails();
 	        container.innerHTML = '<div class="session-tabs-empty">No Provision-managed CLI sessions observed yet</div>' + launchTab;
 	        resetMobileDiscussionFocus();
 	        syncDiscussionPaneVisibility();
@@ -1016,15 +1091,15 @@
 	      }
 	      if (selectedControlSessionKey && !sessions.some((session) => session.key === selectedControlSessionKey)) {
 	        selectedControlSessionKey = "";
+	        discardInactiveControlSessionDetails();
 	        resetMobileDiscussionFocus();
 	        renderMobileControlStatus(null);
 	      }
 	      container.innerHTML = sessions.map((session) => {
 	        const key = String(session.key || "");
-	        const active = session.active ? " active" : "";
-	        const selected = key && key === selectedControlSessionKey ? " selected" : "";
+	        const selected = Boolean(key && key === selectedControlSessionKey);
 	        return `
-          <button class="session-tab${active}${selected}" type="button" draggable="true" data-session-key="${escapeHtml(key)}" title="${escapeHtml(session.cwd || session.display || key)}">
+          <button class="${sessionTabClassName(session, selectedControlSessionKey)}" type="button" draggable="true" data-session-key="${escapeHtml(key)}" aria-selected="${selected ? "true" : "false"}" title="${escapeHtml(session.cwd || session.display || key)}">
             <span class="session-tab-close" data-session-close="${escapeHtml(key)}" aria-label="Close tab" title="Close tab">x</span>
             <span class="session-tab-title">${escapeHtml(sessionTitle(session))}</span>
             <span class="session-tab-meta">${escapeHtml(sessionMeta(session))}</span>
@@ -1105,6 +1180,7 @@
 		      }));
 		      if (selectedControlSessionKey === sessionKey) {
 		        selectedControlSessionKey = "";
+		        discardInactiveControlSessionDetails();
 		        const modal = document.getElementById("controlModal");
 		        if (modal) modal.hidden = true;
 		      }
@@ -1197,7 +1273,10 @@
 
 	    function selectedControlSession() {
 	      const sessions = controlSessions({ control_plane: latestControlPlane });
-	      return sessions.find((session) => session.key === selectedControlSessionKey) || null;
+	      const summary = sessions.find((session) => session.key === selectedControlSessionKey) || null;
+	      if (!summary) return null;
+	      const detail = controlSessionDetails[String(summary.key || "")];
+	      return detail ? { ...summary, ...detail, discussion: summary.discussion || detail.discussion } : summary;
 	    }
 
 	    function controlCapabilityText(session) {
@@ -1535,6 +1614,27 @@
 	        action: "load_history_index",
 	        session_key: sessionKey,
 	      }));
+	      return true;
+	    }
+
+	    function scheduleHistoryIndex(session) {
+	      const sessionKey = String(session && session.key || selectedControlSessionKey || "");
+	      if (
+	        !sessionKey
+	        || Object.prototype.hasOwnProperty.call(historyTurnIndexes, sessionKey)
+	        || historyIndexRequests[sessionKey]
+	        || historyIndexSchedules[sessionKey]
+	      ) return false;
+	      const run = () => {
+	        delete historyIndexSchedules[sessionKey];
+	        if (sessionKey !== selectedControlSessionKey || controlView !== "discussion") return;
+	        requestHistoryIndex(session);
+	      };
+	      if (typeof window.requestIdleCallback === "function") {
+	        historyIndexSchedules[sessionKey] = window.requestIdleCallback(run, { timeout: 1200 });
+	      } else {
+	        historyIndexSchedules[sessionKey] = window.setTimeout(run, 250);
+	      }
 	      return true;
 	    }
 
@@ -2434,6 +2534,13 @@
 	    }
 
 	    function renderControlTranscript(session) {
+	      if (controlSessionDetailNeedsLoad(session)) {
+	        requestControlSessionDetail(session);
+	        const key = String(session && session.key || selectedControlSessionKey || "");
+	        if (!controlSessionDetails[key]) {
+	          return '<div class="control-empty">Loading the latest observed discussion…</div>';
+	        }
+	      }
 	      const transcript = Array.isArray(session.transcript) ? session.transcript.slice() : [];
 	      const turns = controlTurns(session, transcript);
 	      if (!transcript.length && !turns.length) {
@@ -2459,14 +2566,17 @@
 	        visible = Array.isArray(payload.transcript) ? payload.transcript.slice() : [];
 	        sourceNote = '<div class="control-transcript-window-note">Loaded from Codex session history.</div>';
 	      } else {
-	        if (observedTurnNeedsLoad(session, turn)) {
-	          requestObservedTurn(session, turn);
-	          return '<div class="control-empty">Loading earlier observed discussion for this turn...</div>';
-	        }
+	        const selectedTurnNeedsLoad = observedTurnNeedsLoad(session, turn);
+	        if (selectedTurnNeedsLoad) requestObservedTurn(session, turn);
 	        const presentation = controlTurnPresentation(session, transcript, turn);
 	        const activeTurn = presentation ? presentation.active : turn;
-	        if (observedTurnNeedsLoad(session, activeTurn)) {
-	          requestObservedTurn(session, activeTurn);
+	        const activeTurnNeedsLoad = observedTurnNeedsLoad(session, activeTurn);
+	        if (activeTurnNeedsLoad) requestObservedTurn(session, activeTurn);
+	        if (
+	          activeTurnNeedsLoad
+	          && !transcriptItemsForTurn(transcript, activeTurn).length
+	          && !observedTurnPayload(session, activeTurn)
+	        ) {
 	          return '<div class="control-empty">Loading earlier observed discussion for this turn...</div>';
 	        }
 	        if (observedTurnHasLiveGap(session, transcript, activeTurn)) {
@@ -2474,7 +2584,9 @@
 	        }
 	        visible = turnTranscriptItems(session, transcript, activeTurn);
 	        const activePayload = observedTurnPayload(session, activeTurn);
-	        if (activePayload && activePayload.has_more_before) {
+	        if (activeTurnNeedsLoad && !activePayload) {
+	          sourceNote = '<div class="control-transcript-window-note">Showing the latest discussion while earlier entries load.</div>';
+	        } else if (activePayload && activePayload.has_more_before) {
 	          const before = Number(activePayload.next_before_index);
 	          sourceNote = `<div class="control-transcript-window-note">Earlier observed discussion is available.</div><button class="control-transcript-window-button" type="button" data-control-turn-more="${escapeHtml(controlTurnKey(activeTurn))}" data-control-turn-before="${escapeHtml(before)}">Show earlier discussion</button>`;
 	        }
@@ -2770,11 +2882,13 @@
 	      const provider = String(session.provider || "codex");
 	      if (provider !== "codex" && controlView === "resume") controlView = "discussion";
 	      if (controlView !== "terminal") clearTerminalSnapshotRefresh();
-	      if (provider === "codex") requestHistoryIndex(session);
 	      if (controlView === "resume" && provider === "codex") requestResumeCandidates(session);
 	      if (controlView === "terminal") requestTerminalSnapshot(session);
 	      updateControlDockGeometry();
-	      document.getElementById("controlTitle").textContent = String(session.cwd || session.display || sessionTitle(session));
+	      const controlTitle = document.getElementById("controlTitle");
+	      const controlTitleText = String(session.cwd || session.display || sessionTitle(session));
+	      controlTitle.textContent = controlTitleText;
+	      controlTitle.title = controlTitleText;
 	      const active = Number(session.active_requests || 0);
 	      const tunnels = Number(session.active_tunnels || 0);
 	      const pending = Number(session.pending_websocket_work || 0);
@@ -2868,6 +2982,7 @@
 	      requestAnimationFrame(() => {
 	        updateControlScrollBadges();
 	        finalizeControlTurnBridgeIfScrolledAway();
+	        if (provider === "codex" && controlView === "discussion") scheduleHistoryIndex(session);
 	      });
 	      preserveControlScrollOnNextRender = false;
 	      pendingControlRender = false;
@@ -4322,6 +4437,8 @@
 	    function scheduleRender(packet) {
 	      const statePacket = packet.type === "state_delta" ? mergeStateDelta(packet) : packet;
 	      if (packet.type === "state") latestStatus = packet.status || {};
+	      const revision = Number(packet.ui_state_version);
+	      if (Number.isFinite(revision) && revision >= 0) latestUiStateVersion = revision;
 	      pendingRenderPacket = statePacket;
 	      if (pendingRenderFrame) return;
 	      pendingRenderFrame = requestAnimationFrame(() => {
@@ -4366,6 +4483,31 @@
 	        observedTurnCache[cacheKey] = mergeObservedTurnPayload(existing, incoming);
 	      }
 	      if (sessionKey === selectedControlSessionKey) renderControlModal(true);
+	    }
+
+	    function handleControlSessionPacket(packet) {
+	      const sessionKey = String(packet.session_key || "");
+	      delete controlSessionDetailRequests[sessionKey];
+	      if (!packet.ok) {
+	        if (sessionKey === selectedControlSessionKey) {
+	          showUiMessage(packet.error ? `Discussion load failed: ${packet.error}` : "Discussion load failed.");
+	        }
+	        return;
+	      }
+	      if (sessionKey !== selectedControlSessionKey) return;
+	      const payload = packet.payload && typeof packet.payload === "object" ? packet.payload : null;
+	      if (!payload || !Array.isArray(payload.transcript) || !Array.isArray(payload.turns)) return;
+	      const discussion = payload.discussion && typeof payload.discussion === "object" ? payload.discussion : {};
+	      controlSessionDetails[sessionKey] = {
+	        discussion,
+	        revision: String(discussion.revision || "0"),
+	        transcript: payload.transcript,
+	        transcript_window: payload.transcript_window && typeof payload.transcript_window === "object"
+	          ? payload.transcript_window
+	          : {},
+	        turns: payload.turns,
+	      };
+	      renderControlModal(true);
 	    }
 
 	    function handleTerminalSnapshotPacket(packet) {
@@ -4421,12 +4563,16 @@
       }
       const url = new URL("/api/ui-ws", window.location.href);
       url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+	      if (Number.isFinite(latestUiStateVersion) && latestUiStateVersion >= 0) {
+	        url.searchParams.set("revision", String(latestUiStateVersion));
+	      }
       socket = new WebSocket(url.toString());
 	      socket.addEventListener("open", () => {
 	        setConnection("Live", "");
 	        renderLauncherBar({ control_plane: latestControlPlane });
 	        updateControlHeaderActions(selectedControlSession());
 	        renderPermissionModal();
+	        if (selectedControlSessionKey) renderControlModal(true);
 	        scheduleNextQuotaRefresh(250);
 	      });
       socket.addEventListener("message", (event) => {
@@ -4440,12 +4586,23 @@
 	          handleHistoryTurnPacket(packet);
 	        } else if (packet.type === "control_turn") {
 	          handleObservedTurnPacket(packet);
+	        } else if (packet.type === "control_session") {
+	          handleControlSessionPacket(packet);
 	        } else if (packet.type === "history_index") {
 	          handleHistoryIndexPacket(packet);
 	        } else if (packet.type === "resume_candidates") {
 	          handleResumeCandidatesPacket(packet);
 	        } else if (packet.type === "terminal_snapshot") {
 	          handleTerminalSnapshotPacket(packet);
+	        } else if (packet.type === "state_ack") {
+	          const revision = Number(packet.ui_state_version);
+	          if (Number.isFinite(revision) && revision >= 0) latestUiStateVersion = revision;
+	          const status = packet.status && typeof packet.status === "object" ? packet.status : {};
+	          if (status.permissions && typeof status.permissions === "object") {
+	            latestPermissions = status.permissions;
+	            latestStatus = { ...latestStatus, permissions: latestPermissions };
+	            renderPermissionModal();
+	          }
 	        } else if (packet.type === "heartbeat") {
             latestLiveBusy = Boolean(packet.live_busy);
             setConnection("Live", latestLiveBusy ? "busy" : "");
@@ -4683,8 +4840,9 @@
 	      if (launchTab) {
 	        saveControlScroll();
 			        resetControlPromptHistory();
-		        launcherPanelOpen = true;
+	        launcherPanelOpen = true;
 	        selectedControlSessionKey = "";
+	        discardInactiveControlSessionDetails();
 	        pendingControlRender = false;
 	        document.getElementById("controlModal").hidden = true;
 	        renderSessionTabs({ control_plane: latestControlPlane });
@@ -4697,6 +4855,7 @@
 		      resetControlPromptHistory();
 		      launcherPanelOpen = false;
 	      selectedControlSessionKey = tab.dataset.sessionKey || "";
+	      discardInactiveControlSessionDetails();
 	      selectedLauncherSessionKey = selectedControlSessionKey;
 	      document.getElementById("controlModal").hidden = false;
 	      renderSessionTabs({ control_plane: latestControlPlane });
@@ -4764,6 +4923,7 @@
 	    document.getElementById("controlClose").addEventListener("click", () => {
 	      document.getElementById("controlModal").hidden = true;
 	      selectedControlSessionKey = "";
+	      discardInactiveControlSessionDetails();
 	      clearTerminalSnapshotRefresh();
 	      pendingControlRender = false;
 	      renderSessionTabs({ control_plane: latestControlPlane });
@@ -4774,6 +4934,7 @@
 	      if (event.target === event.currentTarget) {
 	        event.currentTarget.hidden = true;
 	        selectedControlSessionKey = "";
+	        discardInactiveControlSessionDetails();
 	        clearTerminalSnapshotRefresh();
 	        pendingControlRender = false;
 	        renderSessionTabs({ control_plane: latestControlPlane });

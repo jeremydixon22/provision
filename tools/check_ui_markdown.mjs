@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const appSource = fs.readFileSync(path.join(root, "src/provision/ui/app.js"), "utf8");
+const styleSource = fs.readFileSync(path.join(root, "src/provision/ui/styles.css"), "utf8");
 
 function sourceRange(startMarker, endMarker) {
   const start = appSource.indexOf(startMarker);
@@ -35,6 +36,7 @@ vm.runInContext(
      repairStreamedMarkdownLabel,
      repairStreamedMarkdownProse,
      sessionTitle,
+     sessionTabClassName,
      renderCompactQuota
    };`,
   context
@@ -48,6 +50,7 @@ const {
   repairStreamedMarkdownLabel,
   repairStreamedMarkdownProse,
   sessionTitle,
+  sessionTabClassName,
   renderCompactQuota
 } = context.markdownApi;
 
@@ -80,6 +83,16 @@ equal(
   "~/worktree",
   "session tabs fall back to the workspace path before a provider-generated summary"
 );
+equal(
+  sessionTabClassName({ key: "one", active: true }, "two"),
+  "session-tab",
+  "a live but unselected session does not receive selected-tab highlighting"
+);
+equal(
+  sessionTabClassName({ key: "one", active: false }, "one"),
+  "session-tab selected",
+  "the selected session receives selected-tab highlighting regardless of liveness"
+);
 const compactQuotaMarkup = renderCompactQuota({
   state: {
     title: '<img src=x onerror="alert(1)">',
@@ -97,8 +110,8 @@ excludes(
 );
 equal(
   renderMarkdown("The API  \nremains stable."),
-  "<p>The API<br>remains stable.</p>",
-  "two trailing spaces retain an explicit hard break"
+  "<p>The API remains stable.</p>",
+  "streamed trailing whitespace remains a soft line boundary"
 );
 equal(
   renderMarkdown("The API\\\nremains stable."),
@@ -165,6 +178,11 @@ includes(
   '>daemon.py</code>',
   "local file references retain visible labels"
 );
+includes(
+  renderMarkdown("[daemon\n.py]\n(/workspace/example/src/provision/daemon.py:1)"),
+  '>daemon.py</code>',
+  "streamed local file-reference labels remain visible"
+);
 equal(
   renderMarkdownInline("[unsafe](javascript:alert(1))"),
   "[unsafe](javascript:alert(1))",
@@ -179,6 +197,58 @@ equal(
   "[Provision UI](https://example.test/ui)",
   "streamed link words retain their spacing"
 );
+equal(
+  repairStreamedMarkdownProse("[Provision\nUI\nreference]\n(https://example.test/ui)"),
+  "[Provision UI reference](https://example.test/ui)",
+  "multi-fragment streamed link labels are repaired without empty links"
+);
+equal(
+  renderMarkdown("AOPA  \nAPI and MCP remain intact."),
+  "<p>AOPA API and MCP remain intact.</p>",
+  "trailing stream whitespace cannot split acronym prose into hard lines"
+);
+equal(
+  renderMarkdown("The transcript included\n>not a Markdown quote."),
+  "<p>The transcript included &gt;not a Markdown quote.</p>",
+  "an incidental quote marker remains ordinary prose"
+);
+equal(
+  renderMarkdown(">not a Markdown quote."),
+  "<p>&gt;not a Markdown quote.</p>",
+  "a quote marker without Markdown spacing remains ordinary prose at a block boundary"
+);
+equal(
+  renderMarkdown("The transcript included:\n> A deliberate quotation."),
+  "<p>The transcript included:</p><blockquote><p>A deliberate quotation.</p></blockquote>",
+  "a quote introduced by a label remains a blockquote"
+);
+equal(
+  renderMarkdown("The transcript included\n> First quoted line.\n> Second quoted line."),
+  "<p>The transcript included</p><blockquote><p>First quoted line. Second quoted line.</p></blockquote>",
+  "a contiguous quote run remains a blockquote"
+);
+equal(
+  renderMarkdown("The transcript included\n- not a Markdown list."),
+  "<p>The transcript included - not a Markdown list.</p>",
+  "an incidental list marker remains ordinary prose"
+);
+equal(
+  renderMarkdown("The transcript included:\n- A deliberate list item."),
+  "<p>The transcript included:</p><ul><li>A deliberate list item.</li></ul>",
+  "a list introduced by a label remains a list"
+);
+equal(
+  renderMarkdown("A latency delta of -5 ms is not a list."),
+  "<p>A latency delta of -5 ms is not a list.</p>",
+  "negative values never become list items"
+);
+const inlineMarkdownStyle = styleSource.slice(
+  styleSource.indexOf(".control-message-text.markdown code,"),
+  styleSource.indexOf(":root[data-theme=\"dark\"] .control-message-text.markdown code,")
+);
+includes(inlineMarkdownStyle, "overflow-wrap: normal;", "inline Markdown text does not break inside short words");
+includes(inlineMarkdownStyle, "hyphens: manual;", "inline Markdown text does not auto-hyphenate acronyms");
+excludes(inlineMarkdownStyle, "overflow-wrap: break-word;", "inline Markdown text does not force word fragments across lines");
 equal(
   repairStreamedMarkdownLabel("daemon.", "py"),
   "daemon.py",

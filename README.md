@@ -40,7 +40,7 @@ Provision is not currently published on PyPI. Install the current release from
 the versioned GitHub source with `pipx` (recommended for an isolated CLI):
 
 ```bash
-pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.7.1"
+pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.8.0"
 provision-codex doctor
 ```
 
@@ -182,6 +182,25 @@ provision --help
 provision help
 provision login --help
 ```
+
+## What’s New In 0.8.0
+
+- Reduces initial dashboard work for multi-session installations: session
+  summaries arrive first, while the selected Discussion loads on demand and
+  retains its current view while newer detail is fetched. Dashboard HTML,
+  JavaScript, and CSS now use gzip when the browser supports it.
+- Removes departed managed terminals promptly, including their orphaned
+  control sockets, without treating a leftover filesystem path as an active
+  session.
+- Improves compatibility with newer Codex app-server responses by retaining
+  structured RPC errors and avoiding obsolete thread-pin requests.
+- Makes Discussion Markdown more conservative around streamed whitespace,
+  acronyms, quotations, list markers, negative values, and split file/link
+  labels. Explicit blockquotes, lists, code fences, and backslash line breaks
+  remain supported.
+- Restores Discussion rendering in the self-contained static demo while the
+  live dashboard continues to load transcript detail only on demand.
+- Updates the development-tool and build-system minimum versions.
 
 ## What’s New In 0.7.1
 

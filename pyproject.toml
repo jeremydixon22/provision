@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=83.0.0"]
+requires = ["setuptools>=84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "provision"
-version = "0.7.1"
+version = "0.8.0"
 description = "Linux-native, local-first control plane and session dashboard for Codex CLI, Claude Code, and Grok Build"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -74,9 +74,9 @@ provision-codex = "provision.cli:main"
 
 [project.optional-dependencies]
 dev = [
-  "coverage>=7.9",
-  "mypy>=1.16",
-  "ruff>=0.12",
+  "coverage>=7.15.4",
+  "mypy>=2.3.1",
+  "ruff>=0.16.4",
 ]
 
 [project.urls]

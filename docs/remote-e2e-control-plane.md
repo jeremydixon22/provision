@@ -39,9 +39,12 @@ or E2E transport:
   UID and a distinct connector capability; it does not use the dashboard/proxy
   token. Its `provision.remote/v1` lane adapts this bounded contract for a
   trusted local connector process, while transport, peer identity, pairing,
-  and encryption remain outside Provision. Provision does not start that
-  socket by default. This is a local daemon-to-connector boundary, not a
-  remotely reachable service.
+  and encryption remain outside Provision. A separate
+  `provision.remote-admin/v1` lane supports only host-local device enrollment,
+  capability grants, listing, and revocation; a connector must never forward
+  it from a remote peer. Provision does not start either socket path by
+  default. This is a local daemon-to-connector boundary, not a remotely
+  reachable service.
 - Device metadata, explicit capabilities, action leases, a redacted audit log,
   and a mode-`0600` idempotency journal now have daemon-side implementations.
   The journal writes a pending reservation before a PTY mutation, so a crash
@@ -52,12 +55,14 @@ or E2E transport:
   remain unavailable until a local grant is made, and only prompt/interrupt
   primitives with an existing PTY implementation are currently wired.
 
-There is no Companion, Hushwire session, pairing UI, Cloudflare Tunnel/Worker,
-or command that enables direct network access. `provision connector enable`
-starts only a same-user local Unix socket for a user-supplied connector; it
-does not create an Internet listener or expose `/ui`, `/api/status`, the
-dashboard WebSocket, or the local proxy through Cloudflare. Those remain
-separate later milestones and cannot be enabled until the gates below pass.
+There is no Companion, Hushwire session, or Cloudflare Tunnel/Worker, and no
+command enables direct network access. `provision connector enable` starts
+only a same-user local Unix socket for a user-supplied connector; `provision
+remote` manages only the daemon's host-local paired-device records through
+that socket. Neither command creates an Internet listener, completes a remote
+pairing, or exposes `/ui`, `/api/status`, the dashboard WebSocket, or the
+local proxy through Cloudflare. Those remain separate later milestones and
+cannot be enabled until the gates below pass.
 
 ## Readiness assessment (2026-07-18)
 

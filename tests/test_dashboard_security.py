@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import unittest
 from email.message import Message
 from types import SimpleNamespace
@@ -83,6 +84,41 @@ class DashboardSecurityTests(unittest.TestCase):
         self.assertIn("SameSite=Strict", headers["set-cookie"])
         self.assertNotIn("durable-proxy-capability", headers["set-cookie"])
         self.assertEqual(bytes(body), b"<p>ready</p>")
+
+    def test_dashboard_compresses_large_html_only_when_gzip_is_accepted(self) -> None:
+        handler = bare_handler()
+        handler.headers["Accept-Encoding"] = "br, gzip;q=0.8"
+        response_headers: list[tuple[str, str]] = []
+        body = bytearray()
+        handler.send_response = lambda _status: None
+        handler.send_header = lambda key, value: response_headers.append((key, value))
+        handler.end_headers = lambda: None
+        handler.write_downstream = body.extend
+
+        html = "<main>" + ("discussion " * 500) + "</main>"
+        handler.send_dashboard_html(html)
+
+        headers = {key.lower(): value for key, value in response_headers}
+        self.assertEqual(headers["content-encoding"], "gzip")
+        self.assertEqual(headers["vary"], "accept-encoding")
+        self.assertEqual(gzip.decompress(bytes(body)).decode("utf-8"), html)
+
+    def test_large_ui_assets_use_gzip_when_the_browser_accepts_it(self) -> None:
+        handler = bare_handler()
+        handler.headers["Accept-Encoding"] = "gzip"
+        response_headers: list[tuple[str, str]] = []
+        body = bytearray()
+        handler.send_response = lambda _status: None
+        handler.send_header = lambda key, value: response_headers.append((key, value))
+        handler.end_headers = lambda: None
+        handler.write_downstream = body.extend
+
+        handler.send_ui_asset("/assets/provision-ui.js")
+
+        headers = {key.lower(): value for key, value in response_headers}
+        self.assertEqual(headers["content-encoding"], "gzip")
+        self.assertEqual(headers["vary"], "accept-encoding")
+        self.assertIn("load_control_session", gzip.decompress(bytes(body)).decode("utf-8"))
 
     def test_dashboard_assets_are_packaged_separately(self) -> None:
         template = dashboard_template()

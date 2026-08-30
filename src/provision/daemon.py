@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import functools
+import gzip
 import hashlib
 import hmac
 import html
@@ -135,6 +136,7 @@ STALE_HTTP_REQUEST_SECONDS = 15 * 60
 UI_STATE_CHECK_SECONDS = 1.0
 UI_HEARTBEAT_SECONDS = 15.0
 UI_SAFETY_SNAPSHOT_SECONDS = 60.0
+UI_QUERY_MAX_CONCURRENCY = 2
 PROVIDER_SESSION_REFRESH_SECONDS = 0.5
 PROVIDER_TRANSCRIPT_SOURCE_TEXT_LIMIT = 24 * 1024
 PROVIDER_IDENTITY_CACHE_SECONDS = 60.0
@@ -209,6 +211,7 @@ FAST_SERVICE_TIER = "priority"
 STANDARD_SERVICE_TIER = "default"
 FAST_SERVICE_TIER_VALUES = {"fast", FAST_SERVICE_TIER}
 STATS_MAX_EVENTS = 2000
+STATS_TAIL_READ_CHUNK_BYTES = 64 * 1024
 CONTROL_PLANE_EVENT_LIMIT = 240
 CONTROL_PLANE_SESSION_EVENT_LIMIT = 32
 CONTROL_TRANSCRIPT_MAX_ITEMS = 600
@@ -1120,8 +1123,23 @@ def codex_app_server_schema_probe() -> dict[str, Any]:
     }
 
 
+def codex_app_server_error_text(error: Any) -> str:
+    """Produce a safe, useful message without discarding structured RPC errors."""
+    if not isinstance(error, dict):
+        return str(error)
+    message = str(error.get("message") or error.get("error") or "Codex app-server request failed")
+    code = error.get("code")
+    if isinstance(code, (str, int)) and not isinstance(code, bool):
+        return f"{message} (code {code})"
+    return message
+
+
 class CodexAppServerError(RuntimeError):
-    pass
+    """App-server failure retaining its original JSON-RPC error object."""
+
+    def __init__(self, error: Any) -> None:
+        self.details = error
+        super().__init__(codex_app_server_error_text(error))
 
 
 class CodexAppServerClient:
@@ -1250,7 +1268,7 @@ class CodexAppServerClient:
 
     def _response_result(self, message: dict[str, Any]) -> Any:
         if "error" in message:
-            raise CodexAppServerError(str(message["error"]))
+            raise CodexAppServerError(message["error"])
         return message.get("result")
 
     def read_account_rate_limits(self) -> dict[str, Any]:
@@ -1289,7 +1307,6 @@ class CodexAppServerClient:
         *,
         limit: int = 25,
         cursor: str | None = None,
-        is_pinned: bool | None = None,
     ) -> Any:
         params: dict[str, Any] = {
             "limit": limit,
@@ -1297,8 +1314,6 @@ class CodexAppServerClient:
         }
         if cursor:
             params["cursor"] = cursor
-        if isinstance(is_pinned, bool):
-            params["isPinned"] = is_pinned
         return self.request("thread/list", params)
 
     def list_thread_turns(
@@ -1356,12 +1371,6 @@ class CodexAppServerClient:
         if cursor:
             params["cursor"] = cursor
         return self.request("thread/searchOccurrences", params)
-
-    def update_thread_pin(self, thread_id: str, *, is_pinned: bool) -> Any:
-        return self.request(
-            "thread/metadata/update",
-            {"threadId": thread_id, "isPinned": is_pinned},
-        )
 
     def list_models(self) -> Any:
         return self.request("model/list", {})
@@ -2775,6 +2784,33 @@ def clean_control_user_text(value: str) -> str:
     if not text:
         return ""
     return text
+
+
+def text_file_tail_lines(path: Path, max_lines: int) -> list[str]:
+    """Read a bounded number of final UTF-8 lines without loading the file."""
+
+    limit = max(0, int(max_lines))
+    if limit == 0:
+        return []
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            chunks: list[bytes] = []
+            newline_count = 0
+            while position > 0 and newline_count <= limit:
+                size = min(STATS_TAIL_READ_CHUNK_BYTES, position)
+                position -= size
+                handle.seek(position)
+                chunk = handle.read(size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                newline_count += chunk.count(b"\n")
+    except OSError:
+        return []
+    lines = b"".join(reversed(chunks)).splitlines()
+    return [line.decode("utf-8", errors="replace") for line in lines[-limit:]]
 
 
 def transcript_identity_text(value: str) -> str:
@@ -7021,6 +7057,7 @@ class ProvisionServer(ThreadingHTTPServer):
         self.next_websocket_id = 0
         self.observed_sessions: dict[str, dict[str, Any]] = {}
         self.control_transcripts: dict[str, list[dict[str, Any]]] = {}
+        self.control_transcript_revisions: dict[str, int] = {}
         self.provider_session_readers: dict[str, ClaudeSessionReader | GrokSessionReader] = {}
         self.provider_session_readers_lock = threading.Lock()
         self.provider_session_last_refresh_monotonic = 0.0
@@ -7053,12 +7090,16 @@ class ProvisionServer(ThreadingHTTPServer):
         self.app_server_model_catalog_cache: dict[str, dict[str, Any]] = {}
         self.app_server_model_catalog_lock = threading.Lock()
         self.stats_lock = threading.Lock()
+        self.stats_events_cache_signature: tuple[int, int, int, int] | None = None
+        self.stats_events_cache_limit = 0
+        self.stats_events_cache: list[dict[str, Any]] = []
         self.ui_launchers: dict[int, dict[str, Any]] = {}
         self.ui_launchers_lock = threading.Lock()
         self.ui_state_lock = threading.Lock()
         self.ui_state_version = 0
         self.ui_state_dirty_reasons: dict[str, int] = {}
         self.ui_state_dirty_log: list[tuple[int, str]] = []
+        self.ui_query_semaphore = threading.BoundedSemaphore(UI_QUERY_MAX_CONCURRENCY)
         self.resume_candidates_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
         self.resume_candidates_lock = threading.Lock()
         self.resume_candidates_inflight: dict[str, threading.Event] = {}
@@ -7110,6 +7151,25 @@ class ProvisionServer(ThreadingHTTPServer):
             except OSError:
                 continue
 
+    @staticmethod
+    def managed_control_available(record: dict[str, Any]) -> bool:
+        """Return whether a managed PTY control socket still has its launcher.
+
+        A Unix-domain socket pathname survives an abrupt terminal or launcher
+        exit.  Treating the pathname itself as liveness made stale sessions
+        appear interactive indefinitely.  Managed launchers register their
+        PID with the daemon, so require both the expected socket type and its
+        owning launcher process before exposing terminal control.
+        """
+        control_path = str(record.get("control_path") or "")
+        launcher_pid = record.get("launcher_pid")
+        if not control_path or not isinstance(launcher_pid, int) or launcher_pid <= 0:
+            return False
+        try:
+            return Path(control_path).is_socket() and process_is_running(launcher_pid)
+        except OSError:
+            return False
+
     def prune_stale_observed_sessions_locked(
         self,
         *,
@@ -7125,10 +7185,26 @@ class ProvisionServer(ThreadingHTTPServer):
         stale_keys: list[str] = []
         for key, record in self.observed_sessions.items():
             last_seen = float(record.get("last_seen_monotonic") or 0.0)
-            if now - last_seen < OBSERVED_SESSION_RETENTION_SECONDS:
+            control_available = self.managed_control_available(record)
+            # A managed launcher gives us positive proof when its terminal has
+            # departed: its registered process is gone and its socket is no
+            # longer usable.  Do not leave that dead terminal as a ghost card
+            # for the ordinary observation-retention interval.  Older or
+            # unmanaged observations still receive that grace period because
+            # the daemon cannot distinguish an idle session from a departed
+            # one as confidently.
+            managed_terminal_departed = (
+                bool(record.get("pty_managed"))
+                and bool(str(record.get("control_path") or ""))
+                and isinstance(record.get("launcher_pid"), int)
+                and int(record["launcher_pid"]) > 0
+                and not control_available
+            )
+            if (
+                not managed_terminal_departed
+                and now - last_seen < OBSERVED_SESSION_RETENTION_SECONDS
+            ):
                 continue
-            control_path = str(record.get("control_path") or "")
-            control_available = bool(control_path and Path(control_path).exists())
             ui_launcher_pid = record.get("ui_launcher_pid")
             ui_launcher_running = (
                 isinstance(ui_launcher_pid, int) and ui_launcher_pid in live_ui_launcher_pids
@@ -7156,6 +7232,7 @@ class ProvisionServer(ThreadingHTTPServer):
         for key in stale_keys:
             self.observed_sessions.pop(key, None)
             self.control_transcripts.pop(key, None)
+            self.control_transcript_revisions.pop(key, None)
             self.session_tab_order.pop(key, None)
         if stale_keys:
             self.save_session_tab_order_locked()
@@ -7338,10 +7415,7 @@ class ProvisionServer(ThreadingHTTPServer):
 
     @classmethod
     def permission_bridge_available(cls, record: dict[str, Any]) -> bool:
-        control_path = str(record.get("control_path") or "")
-        return bool(
-            cls.permission_bridge_supported(record) and control_path and Path(control_path).exists()
-        )
+        return cls.permission_bridge_supported(record) and cls.managed_control_available(record)
 
     def permission_bridge_state(self, session_key: str) -> tuple[bool, bool, str]:
         key = normalize_session_key(session_key)
@@ -7992,10 +8066,14 @@ class ProvisionServer(ThreadingHTTPServer):
                 tunnel.get("session_key") == key for tunnel in self.active_websockets.values()
             )
             control_path = str(record.get("control_path") or "")
-            control_live = bool(control_path and Path(control_path).exists())
+            control_live = self.managed_control_available(record)
             ui_pid = record.get("ui_launcher_pid")
             ui_live = isinstance(ui_pid, int) and ui_pid in live_ui_launcher_pids
-            live = has_request or has_tunnel or control_live or ui_live
+            provider_pid = record.get("provider_pid")
+            provider_live = process_is_running(
+                provider_pid if isinstance(provider_pid, int) else None
+            )
+            live = has_request or has_tunnel or control_live or ui_live or provider_live
             if live and not force_live:
                 raise StoreError("session still appears active; close it before forgetting")
             if live:
@@ -8021,6 +8099,7 @@ class ProvisionServer(ThreadingHTTPServer):
                             sockets.append(value)
             self.observed_sessions.pop(key, None)
             self.control_transcripts.pop(key, None)
+            self.control_transcript_revisions.pop(key, None)
             changed_pin = self.pinned_sessions.pop(key, None) is not None
             changed_tab_order = self.session_tab_order.pop(key, None) is not None
             if changed_pin:
@@ -9675,6 +9754,11 @@ class ProvisionServer(ThreadingHTTPServer):
         transcript = self.control_transcripts.setdefault(session_key, [])
 
         def notify_remote(item: dict[str, Any], *, replace: bool) -> None:
+            revisions = getattr(self, "control_transcript_revisions", None)
+            if not isinstance(revisions, dict):
+                revisions = {}
+                self.control_transcript_revisions = revisions
+            revisions[session_key] = int(revisions.get(session_key, 0)) + 1
             self.record_remote_transcript_change(
                 session_key,
                 transcript,
@@ -10236,6 +10320,21 @@ class ProvisionServer(ThreadingHTTPServer):
         rows, _window = self.control_transcript_snapshot_window(session_key)
         return rows
 
+    def control_transcript_summary(self, session_key: str) -> dict[str, Any]:
+        """Return a tiny revision marker for a session's observed Discussion."""
+        transcript = self.control_transcripts.get(session_key, [])[-CONTROL_TRANSCRIPT_MAX_ITEMS:]
+        revisions = getattr(self, "control_transcript_revisions", {})
+        revision = int(revisions.get(session_key, 0)) if isinstance(revisions, dict) else 0
+        if not transcript:
+            return {"items": 0, "updated_at": "", "revision": f"{revision}:0"}
+        latest = transcript[-1]
+        updated_at = str(latest.get("updated_at") or latest.get("ts") or "")
+        return {
+            "items": len(transcript),
+            "updated_at": updated_at,
+            "revision": f"{revision}:{len(transcript)}",
+        }
+
     def control_turns_from_transcript(
         self, transcript: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
@@ -10672,7 +10771,6 @@ class ProvisionServer(ThreadingHTTPServer):
                         str(record.get("provider_profile") or ""),
                         str(record.get("provider_state_root") or ""),
                         record.get("provider_pid"),
-                        str(record.get("control_path") or ""),
                     )
                     for key, record in self.observed_sessions.items()
                     if str(record.get("provider") or "codex") in {"grok", "claude"}
@@ -10684,7 +10782,6 @@ class ProvisionServer(ThreadingHTTPServer):
                 profile,
                 state_root_text,
                 provider_pid,
-                control_path,
             ) in candidates:
                 if not state_root_text:
                     if profile:
@@ -10710,7 +10807,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 )
                 provider_running = process_is_running(
                     provider_pid if isinstance(provider_pid, int) else None
-                ) or bool(control_path and Path(control_path).exists())
+                )
                 state_changed = False
                 with self.active_lock:
                     record = self.observed_sessions.get(session_key)
@@ -10755,6 +10852,10 @@ class ProvisionServer(ThreadingHTTPServer):
                     self.mark_ui_dirty("provider_session")
 
     def session_snapshots(self) -> list[dict[str, Any]]:
+        # A daemon can outlive terminals whose launcher sockets were left on
+        # disk.  Reap those paths during ordinary state refresh rather than
+        # only on daemon startup.
+        self.prune_orphaned_launcher_sockets()
         self.refresh_provider_sessions()
         self.expire_stale_requests()
         with self.ui_launchers_lock:
@@ -10804,8 +10905,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 thread_id = str(
                     record.get("thread_id") or (active_thread_ids[0] if active_thread_ids else "")
                 )
-                control_path = str(record.get("control_path") or "")
-                control_available = bool(control_path and Path(control_path).exists())
+                control_available = self.managed_control_available(record)
                 pty_managed = bool(record.get("pty_managed"))
                 provider = str(record.get("provider") or "codex")
                 permission_supported = self.permission_bridge_available(record)
@@ -11176,7 +11276,10 @@ class ProvisionServer(ThreadingHTTPServer):
         self.mark_ui_dirty("profiles")
 
     def control_plane_sessions(
-        self, sessions: list[dict[str, Any]] | None = None
+        self,
+        sessions: list[dict[str, Any]] | None = None,
+        *,
+        include_transcript: bool = True,
     ) -> dict[str, Any]:
         self.expire_stale_requests()
         if sessions is None:
@@ -11239,14 +11342,16 @@ class ProvisionServer(ThreadingHTTPServer):
                     "requests": request_rows,
                     "tunnels": tunnel_rows,
                 }
-                full_transcript = self.control_transcript_snapshot(key)
-                transcript, transcript_window = self.control_transcript_snapshot_window(
-                    key,
-                    max_bytes=CONTROL_TRANSCRIPT_SNAPSHOT_MAX_BYTES,
-                )
-                session["transcript"] = transcript
-                session["transcript_window"] = transcript_window
-                session["turns"] = self.control_turns_from_transcript(full_transcript)
+                session["discussion"] = self.control_transcript_summary(key)
+                if include_transcript:
+                    full_transcript = self.control_transcript_snapshot(key)
+                    transcript, transcript_window = self.control_transcript_snapshot_window(
+                        key,
+                        max_bytes=CONTROL_TRANSCRIPT_SNAPSHOT_MAX_BYTES,
+                    )
+                    session["transcript"] = transcript
+                    session["transcript_window"] = transcript_window
+                    session["turns"] = self.control_turns_from_transcript(full_transcript)
 
         for event in self.stats_events(CONTROL_PLANE_EVENT_LIMIT):
             session_key = event.get("session_key")
@@ -11286,10 +11391,36 @@ class ProvisionServer(ThreadingHTTPServer):
             },
         }
 
-    # Remote control intentionally uses a narrow source rather than
-    # control_plane_sessions().  The latter includes every retained
-    # transcript item for the local dashboard; constructing it for remote
-    # state would recreate the oversized snapshot problem this design solves.
+    def control_session_payload(self, session_key: str) -> dict[str, Any]:
+        """Return bounded Discussion detail for one explicitly selected session.
+
+        Dashboard state carries only session summaries.  This avoids parsing
+        and transferring every retained transcript before the user chooses a
+        tab, while keeping the existing page/turn controls unchanged once a
+        discussion is open.
+        """
+        key = normalize_session_key(session_key)
+        with self.active_lock:
+            if key not in self.observed_sessions:
+                raise StoreError("unknown session")
+            full_transcript = self.control_transcript_snapshot(key)
+            transcript, transcript_window = self.control_transcript_snapshot_window(
+                key,
+                max_bytes=CONTROL_TRANSCRIPT_SNAPSHOT_MAX_BYTES,
+            )
+            discussion = self.control_transcript_summary(key)
+        return {
+            "session_key": key,
+            "discussion": discussion,
+            "transcript": transcript,
+            "transcript_window": transcript_window,
+            "turns": self.control_turns_from_transcript(full_transcript),
+        }
+
+    # Remote control intentionally uses a narrow source rather than the local
+    # dashboard summary.  It must not grow with dashboard-only active details
+    # or Discussion state; remote transcript delivery remains its own bounded
+    # delta protocol.
     def remote_session_summaries(self) -> list[dict[str, Any]]:
         secret, _cursor_codec, _devices, _state, _actions = self.remote_runtime()
         sessions = self.session_snapshots()
@@ -12010,7 +12141,8 @@ class ProvisionServer(ThreadingHTTPServer):
             if not isinstance(record, dict):
                 return ""
             control_path = record.get("control_path")
-        return control_path if isinstance(control_path, str) else ""
+            available = self.managed_control_available(record)
+        return control_path if available and isinstance(control_path, str) else ""
 
     def pty_control_request(self, control_path: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not control_path:
@@ -12019,7 +12151,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 "Restart it with `provision` before using UI input."
             )
         path = Path(control_path)
-        if not path.exists():
+        if not path.is_socket():
             raise StoreError(
                 "Provision's PTY control socket for this session is no longer available. "
                 "Restart the CLI session with Provision."
@@ -12077,6 +12209,8 @@ class ProvisionServer(ThreadingHTTPServer):
             control_path = (
                 record.get("control_path") if isinstance(record.get("control_path"), str) else ""
             )
+            if not self.managed_control_available(record):
+                control_path = ""
             provider = str(record.get("provider") or "codex")
         response = self.pty_control_request(
             str(control_path or ""), {"action": "terminal_snapshot"}
@@ -12108,6 +12242,8 @@ class ProvisionServer(ThreadingHTTPServer):
             control_path = (
                 record.get("control_path") if isinstance(record.get("control_path"), str) else ""
             )
+            if not self.managed_control_available(record):
+                control_path = ""
             provider = str(record.get("provider") or "codex")
             provider_profile = str(record.get("provider_profile") or "")
         profile = (
@@ -12155,6 +12291,8 @@ class ProvisionServer(ThreadingHTTPServer):
             control_path = (
                 record.get("control_path") if isinstance(record.get("control_path"), str) else ""
             )
+            if not self.managed_control_available(record):
+                control_path = ""
         self.send_escape_to_pty_control(str(control_path or ""))
         return {
             "ok": True,
@@ -12366,6 +12504,9 @@ class ProvisionServer(ThreadingHTTPServer):
                 paths.stats.chmod(0o600)
             except OSError:
                 return
+            self.stats_events_cache_signature = None
+            self.stats_events_cache_limit = 0
+            self.stats_events_cache = []
         self.mark_ui_dirty("stats")
 
     def record_http_stats(
@@ -12453,19 +12594,49 @@ class ProvisionServer(ThreadingHTTPServer):
         paths = getattr(self, "paths", None)
         if paths is None:
             return []
-        try:
-            lines = paths.stats.read_text(encoding="utf-8").splitlines()
-        except OSError:
+        limit = max(0, int(max_events))
+        if limit == 0:
             return []
-        events = []
-        for line in lines[-max_events:]:
+        cache_limit = max(STATS_MAX_EVENTS, limit)
+        lock = getattr(self, "stats_lock", None)
+
+        def read_events() -> list[dict[str, Any]]:
             try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(event, dict):
-                events.append(event)
-        return events
+                details = paths.stats.stat()
+            except OSError:
+                return []
+            signature = (
+                int(details.st_dev),
+                int(details.st_ino),
+                int(details.st_size),
+                int(details.st_mtime_ns),
+            )
+            cached_signature = getattr(self, "stats_events_cache_signature", None)
+            cached_limit = int(getattr(self, "stats_events_cache_limit", 0) or 0)
+            cached_events = getattr(self, "stats_events_cache", None)
+            if (
+                signature == cached_signature
+                and cached_limit >= cache_limit
+                and isinstance(cached_events, list)
+            ):
+                return [dict(event) for event in cached_events[-limit:]]
+            events: list[dict[str, Any]] = []
+            for line in text_file_tail_lines(paths.stats, cache_limit):
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict):
+                    events.append(event)
+            self.stats_events_cache_signature = signature
+            self.stats_events_cache_limit = cache_limit
+            self.stats_events_cache = events
+            return [dict(event) for event in events[-limit:]]
+
+        if lock is None:
+            return read_events()
+        with lock:
+            return read_events()
 
     def stats_summary(self) -> dict[str, Any]:
         events = self.stats_events()
@@ -13453,12 +13624,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "missing websocket key"}, status=400)
             return
 
+        query = urllib.parse.parse_qs(parsed.query)
+        revision_text = query.get("revision", [""])[0]
+        try:
+            bootstrap_revision = int(revision_text) if revision_text else None
+        except ValueError:
+            bootstrap_revision = None
+        if bootstrap_revision is not None and bootstrap_revision < 0:
+            bootstrap_revision = None
+
+        self.websocket_send_lock = threading.Lock()
         self.accept_websocket(key)
         self.close_connection = True
         self.connection.settimeout(UI_STATE_CHECK_SECONDS)
         self.server.ui_client_connected()
         try:
-            last_sent_version = self.send_ui_state()
+            last_sent_version = self.send_initial_ui_websocket_state(bootstrap_revision)
             last_liveness_signature = self.server.ui_state_liveness_signature()
             last_safety_snapshot = time.monotonic()
             last_heartbeat = last_safety_snapshot
@@ -13502,6 +13683,28 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message("ui websocket closed: %s", exc)
         finally:
             self.server.ui_client_disconnected()
+
+    def send_initial_ui_websocket_state(self, bootstrap_revision: int | None) -> int:
+        current = self.server.ui_state_revision()
+        if bootstrap_revision is None or bootstrap_revision > current:
+            return self.send_ui_state()
+        reasons = self.server.ui_state_dirty_reasons_since(bootstrap_revision)
+        if not reasons or reasons <= {"permissions"}:
+            permission_snapshot = getattr(self.server, "permission_state_snapshot", None)
+            permissions = (
+                permission_snapshot()
+                if callable(permission_snapshot)
+                else {"pending": [], "browser_clients": 0}
+            )
+            self.send_websocket_json(
+                {
+                    "type": "state_ack",
+                    "ui_state_version": current,
+                    "status": {"permissions": permissions},
+                }
+            )
+            return current
+        return self.send_ui_delta(reasons=reasons)
 
     def accept_websocket(self, key: str) -> None:
         self.send_response(101)
@@ -13741,6 +13944,24 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_ui_state()
             return
+        if action == "load_control_session":
+            session_key = str(message.get("session_key") or "")
+            self.run_ui_query_async(
+                "control-session",
+                lambda: self.server.control_session_payload(session_key),
+                lambda payload: {
+                    "type": "control_session",
+                    "ok": True,
+                    "session_key": session_key,
+                    "payload": payload,
+                },
+                {
+                    "type": "control_session",
+                    "ok": False,
+                    "session_key": session_key,
+                },
+            )
+            return
         if action == "load_control_turn":
             session_key = str(message.get("session_key") or "")
             turn_key = str(message.get("turn_key") or "")
@@ -13798,76 +14019,92 @@ class Handler(BaseHTTPRequestHandler):
         if action == "load_history_turn":
             session_key = str(message.get("session_key") or "")
             turn_key = str(message.get("turn_key") or "")
-            try:
-                payload = self.server.history_turn_payload_for_session(session_key, turn_key)
-            except StoreError as exc:
-                self.send_websocket_json(
-                    {
-                        "type": "history_turn",
-                        "ok": False,
-                        "session_key": session_key,
-                        "turn_key": turn_key,
-                        "error": str(exc),
-                    }
-                )
-                return
-            self.send_websocket_json(
-                {
+            self.run_ui_query_async(
+                "history-turn",
+                lambda: self.server.history_turn_payload_for_session(session_key, turn_key),
+                lambda payload: {
                     "type": "history_turn",
                     "ok": True,
                     "session_key": session_key,
                     "turn_key": turn_key,
                     "payload": payload,
-                }
+                },
+                {
+                    "type": "history_turn",
+                    "ok": False,
+                    "session_key": session_key,
+                    "turn_key": turn_key,
+                },
             )
             return
         if action == "load_history_index":
             session_key = str(message.get("session_key") or "")
-            try:
-                turns = self.server.history_turn_index_for_session(session_key)
-            except StoreError as exc:
-                self.send_websocket_json(
-                    {
-                        "type": "history_index",
-                        "ok": False,
-                        "session_key": session_key,
-                        "error": str(exc),
-                    }
-                )
-                return
-            self.send_websocket_json(
-                {
+            self.run_ui_query_async(
+                "history-index",
+                lambda: self.server.history_turn_index_for_session(session_key),
+                lambda turns: {
                     "type": "history_index",
                     "ok": True,
                     "session_key": session_key,
                     "turns": turns,
-                }
+                },
+                {
+                    "type": "history_index",
+                    "ok": False,
+                    "session_key": session_key,
+                },
             )
             return
         if action == "load_resume_candidates":
             session_key = str(message.get("session_key") or "")
-            try:
-                candidates = self.server.resume_candidates_for_session(session_key)
-            except StoreError as exc:
-                self.send_websocket_json(
-                    {
-                        "type": "resume_candidates",
-                        "ok": False,
-                        "session_key": session_key,
-                        "error": str(exc),
-                    }
-                )
-                return
-            self.send_websocket_json(
-                {
+            self.run_ui_query_async(
+                "resume-candidates",
+                lambda: self.server.resume_candidates_for_session(session_key),
+                lambda candidates: {
                     "type": "resume_candidates",
                     "ok": True,
                     "session_key": session_key,
                     "candidates": candidates,
-                }
+                },
+                {
+                    "type": "resume_candidates",
+                    "ok": False,
+                    "session_key": session_key,
+                },
             )
             return
         self.send_ui_state(message=f"Unknown action: {action}")
+
+    def run_ui_query_async(
+        self,
+        name: str,
+        loader: Callable[[], Any],
+        success_packet: Callable[[Any], dict[str, Any]],
+        error_packet: dict[str, Any],
+    ) -> None:
+        def worker() -> None:
+            semaphore = getattr(self.server, "ui_query_semaphore", None)
+            try:
+                if semaphore is None:
+                    result = loader()
+                else:
+                    with semaphore:
+                        result = loader()
+                packet = success_packet(result)
+            except Exception as exc:
+                self.server.log_message("UI %s query failed: %s", name, exc)
+                packet = dict(error_packet, error=str(exc))
+            try:
+                self.send_websocket_json(packet)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
+        thread = threading.Thread(
+            target=worker,
+            daemon=True,
+            name=f"provision-ui-{name}",
+        )
+        thread.start()
 
     def send_ui_state(
         self,
@@ -13989,7 +14226,7 @@ class Handler(BaseHTTPRequestHandler):
             status["control_plane"] = (
                 full_status.get("control_plane", {})
                 if full_status is not None
-                else self.server.control_plane_sessions()
+                else self.server.control_plane_sessions(include_transcript=False)
             )
         if "stats" in sections:
             status["stats"] = self.server.stats_summary()
@@ -14134,7 +14371,12 @@ class Handler(BaseHTTPRequestHandler):
             header = struct.pack("!BBH", 0x80 | opcode, 126, length)
         else:
             header = struct.pack("!BBQ", 0x80 | opcode, 127, length)
-        self.connection.sendall(header + payload)
+        lock = getattr(self, "websocket_send_lock", None)
+        if lock is None:
+            self.connection.sendall(header + payload)
+            return
+        with lock:
+            self.connection.sendall(header + payload)
 
     def proxy_to_upstream(
         self,
@@ -14964,7 +15206,10 @@ class Handler(BaseHTTPRequestHandler):
             sessions = self.server.session_snapshots()
             payload["sessions"] = sessions
             if include_control_plane:
-                payload["control_plane"] = self.server.control_plane_sessions(sessions)
+                payload["control_plane"] = self.server.control_plane_sessions(
+                    sessions,
+                    include_transcript=False,
+                )
             payload["provider_profiles"] = self.server.provider_profile_snapshots(sessions)
             profiles = []
             for profile in self.server.store.list_profiles():
@@ -15496,6 +15741,8 @@ class Handler(BaseHTTPRequestHandler):
         """
 
     def render_ui(self) -> str:
+        revision_reader = getattr(self.server, "ui_state_revision", None)
+        initial_revision = int(revision_reader()) if callable(revision_reader) else 0
         status = self.ui_status_payload(include_html=True)
         rows = self.render_profile_rows(status)
         active_profile = html.escape(str(status.get("active_profile") or "none"))
@@ -15507,7 +15754,12 @@ class Handler(BaseHTTPRequestHandler):
         codex_cli = reported_codex_cli(codex)
         codex_version = html.escape(str(codex_cli.get("version") or "unknown"))
         initial_json = json.dumps(
-            {"type": "state", "status": status, "message": None},
+            {
+                "type": "state",
+                "status": status,
+                "message": None,
+                "ui_state_version": initial_revision,
+            },
             separators=(",", ":"),
         ).replace("</", "<\\/")
         return (
@@ -15566,17 +15818,50 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             self.close_connection = True
 
+    def client_accepts_gzip(self) -> bool:
+        accept_encoding = str(getattr(self, "headers", {}).get("accept-encoding", ""))
+        for token in accept_encoding.split(","):
+            parts = [part.strip() for part in token.split(";") if part.strip()]
+            if not parts or parts[0].lower() != "gzip":
+                continue
+            quality = 1.0
+            for parameter in parts[1:]:
+                name, separator, value = parameter.partition("=")
+                if separator and name.strip().lower() == "q":
+                    try:
+                        quality = float(value.strip())
+                    except ValueError:
+                        quality = 0.0
+            return quality > 0
+        return False
+
+    def compressed_browser_payload(self, payload: bytes) -> tuple[bytes, bool]:
+        if len(payload) < 1024 or not self.client_accepts_gzip():
+            return payload, False
+        return gzip.compress(payload, mtime=0), True
+
     def send_ui_asset(self, path: str) -> None:
         asset = ui_asset(path)
         if asset is None:
             self.send_error(404)
             return
         payload, content_type = asset
+        compressible = content_type.startswith("text/") or content_type.startswith(
+            "application/javascript"
+        )
+        if compressible:
+            payload, compressed = self.compressed_browser_payload(payload)
+        else:
+            compressed = False
         try:
             self.send_response(200)
             self.send_header("content-type", content_type)
             self.send_header("cache-control", "no-cache")
             self.send_header("x-content-type-options", "nosniff")
+            if compressible:
+                self.send_header("vary", "accept-encoding")
+            if compressed:
+                self.send_header("content-encoding", "gzip")
             self.send_header("content-length", str(len(payload)))
             self.end_headers()
             self.write_downstream(payload)
@@ -15597,15 +15882,19 @@ class Handler(BaseHTTPRequestHandler):
     def send_dashboard_html(self, data: str, *, status: int = 200) -> None:
         payload = data.encode("utf-8")
         session = getattr(self.server, "ui_session_token", "")
+        payload, compressed = self.compressed_browser_payload(payload)
         try:
             self.send_response(status)
             self.send_header("content-type", "text/html; charset=utf-8")
             self.send_header("cache-control", "no-store")
+            self.send_header("vary", "accept-encoding")
             self.send_header("referrer-policy", "no-referrer")
             self.send_header("x-content-type-options", "nosniff")
             self.send_header("x-frame-options", "DENY")
             if cookie_header := self.dashboard_cookie_header(session):
                 self.send_header("set-cookie", cookie_header)
+            if compressed:
+                self.send_header("content-encoding", "gzip")
             self.send_header("content-length", str(len(payload)))
             self.end_headers()
             self.write_downstream(payload)

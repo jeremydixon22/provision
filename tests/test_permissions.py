@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import socket
 import tempfile
 import threading
@@ -155,7 +156,10 @@ class PermissionBrokerTests(unittest.TestCase):
         server = ProvisionServer.__new__(ProvisionServer)
         key = str(workspace.resolve())
         control_path = workspace.parent / "control.sock"
-        control_path.touch()
+        control_path.parent.mkdir(parents=True, exist_ok=True)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(control_path))
+        self.addCleanup(listener.close)
         server.active_lock = threading.Lock()
         server.observed_sessions = {
             key: {
@@ -165,6 +169,7 @@ class PermissionBrokerTests(unittest.TestCase):
                 "provider": "claude",
                 "permission_bridge": "claude-permission-hook-v1",
                 "control_path": str(control_path),
+                "launcher_pid": os.getpid(),
             }
         }
         server.permission_condition = threading.Condition()
