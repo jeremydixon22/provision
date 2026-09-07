@@ -76,7 +76,7 @@ provision-codex = "provision.cli:main"
 dev = [
   "coverage>=7.16.0",
   "mypy>=2.3.1",
-  "ruff>=0.16.4",
+  "ruff>=0.16.5",
 ]
 
 [project.urls]
