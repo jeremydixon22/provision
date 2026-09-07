@@ -1,3 +1,6 @@
-__all__ = ["__version__"]
+__all__ = ["__version__", "SUPPORTED_CODEX_CLI_VERSION"]
 
-__version__ = "0.8.0"
+# Provision's release series follows the most recently reviewed Codex CLI
+# version. See CONTRIBUTING.md for the patch and prerelease convention.
+SUPPORTED_CODEX_CLI_VERSION = "0.153.4"
+__version__ = SUPPORTED_CODEX_CLI_VERSION

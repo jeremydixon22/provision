@@ -95,7 +95,9 @@
 
 	    function normalizeControlMessageTextForDisplay(value, role) {
 	      let text = String(value || "").replace(/\r\n?/g, "\n");
-	      if (["user", "user_pending", "resume", "context_compaction"].includes(String(role || ""))) {
+	      if (
+	        ["user", "user_pending", "resume", "context_compaction", "recap"].includes(String(role || ""))
+	      ) {
 	        text = text.replace(/^[\s\uFEFF\u200B\u200C\u200D]+|[\s\uFEFF\u200B\u200C\u200D]+$/g, "");
 	      }
 	      return text;
@@ -2479,6 +2481,7 @@
 	    function controlMessageRoleLabel(role) {
 	      if (role === "resume") return "resumed context";
 	      if (role === "context_compaction") return "context compaction";
+	      if (role === "recap") return "session recap";
 	      if (role === "assistant_progress") return "assistant activity";
 	      if (role === "tool") return "tool / command";
 	      if (role === "user_pending") return "user";
@@ -3931,6 +3934,7 @@
 	    function modelCatalog(profile) {
 	      const profileCatalog = profile && Array.isArray(profile.model_catalog) ? profile.model_catalog : [];
 	      return profileCatalog.length ? profileCatalog : (latestModelCatalog.length ? latestModelCatalog : [
+	        { id: "gpt-6-astra", display: "GPT-6-Astra", reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"] },
 	        { id: "gpt-5.6-sol", display: "GPT-5.6-Sol", reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"] },
 		        { id: "gpt-5.6-terra", display: "GPT-5.6-Terra", reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"] },
 		        { id: "gpt-5.6-luna", display: "GPT-5.6-Luna", reasoning: ["low", "medium", "high", "xhigh", "max"] },
@@ -4112,8 +4116,8 @@
 
 	    function renderModelMenu(profile, name) {
 		      const setting = profile.model_setting && typeof profile.model_setting === "object" ? profile.model_setting : {};
-		      const currentModel = String(setting.model || "gpt-5.6-sol");
-		      const currentReasoning = String(setting.reasoning_effort || (currentModel === "gpt-5.6-sol" ? "low" : "medium"));
+		      const currentModel = String(setting.model || "gpt-6-astra");
+		      const currentReasoning = String(setting.reasoning_effort || (["gpt-6-astra", "gpt-5.6-sol"].includes(currentModel) ? "low" : "medium"));
 			      const label = `${currentModel.toLowerCase()} ${reasoningDisplay(currentReasoning)}`;
 	      const items = modelCatalog(profile).map((item) => {
 	        const model = String(item.id || "");

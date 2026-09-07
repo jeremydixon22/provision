@@ -5,6 +5,7 @@ import unittest
 from email.message import Message
 from types import SimpleNamespace
 
+from provision import __version__
 from provision.daemon import UI_SESSION_COOKIE, Handler
 from provision.ui_assets import dashboard_template, ui_asset
 
@@ -64,6 +65,8 @@ class DashboardSecurityTests(unittest.TestCase):
 
         self.assertNotIn("durable-proxy-capability", rendered)
         self.assertNotIn("__TOKEN__", rendered)
+        self.assertNotIn("__PROVISION_VERSION__", rendered)
+        self.assertIn(f"Provision <strong>{__version__}</strong>", rendered)
         self.assertNotIn('name="token"', rendered)
 
     def test_dashboard_response_issues_hardened_ephemeral_cookie(self) -> None:

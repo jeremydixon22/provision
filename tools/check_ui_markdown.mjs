@@ -28,8 +28,13 @@ vm.runInContext(
    ${sourceRange("function sessionTitle", "function sessionMeta")}
    ${sourceRange("function splitToolStatusSuffix", "function isControlToolName")}
    ${sourceRange("function compactQuotaPercent", "function renderQuotaBucket")}
+   ${sourceRange("function controlMessageRoleLabel", "function controlTurnMarkup")}
+   ${sourceRange("function reasoningDisplay", "function renderAuthHealth")}
+   ${sourceRange("function modelCatalog", "function stableRenderHash")}
+   ${sourceRange("function renderModelMenu", "function profileRow")}
    globalThis.markdownApi = {
      normalizeMarkdownSource,
+     isContextCompactionPacket,
      parseToolActivityText,
      renderMarkdown,
      renderMarkdownInline,
@@ -37,13 +42,16 @@ vm.runInContext(
      repairStreamedMarkdownProse,
      sessionTitle,
      sessionTabClassName,
-     renderCompactQuota
+     renderCompactQuota,
+     controlMessageRoleLabel,
+     renderModelMenu
    };`,
   context
 );
 
 const {
   normalizeMarkdownSource,
+  isContextCompactionPacket,
   parseToolActivityText,
   renderMarkdown,
   renderMarkdownInline,
@@ -51,7 +59,9 @@ const {
   repairStreamedMarkdownProse,
   sessionTitle,
   sessionTabClassName,
-  renderCompactQuota
+  renderCompactQuota,
+  controlMessageRoleLabel,
+  renderModelMenu
 } = context.markdownApi;
 
 let checks = 0;
@@ -93,6 +103,33 @@ equal(
   "session-tab selected",
   "the selected session receives selected-tab highlighting regardless of liveness"
 );
+equal(
+  controlMessageRoleLabel("recap"),
+  "session recap",
+  "recaps have a dedicated Discussion label"
+);
+equal(
+  isContextCompactionPacket({ role: "recap", text: "A visible recap" }),
+  false,
+  "recaps are never hidden as post-compaction packets"
+);
+includes(
+  styleSource,
+  ".control-message.recap {",
+  "recaps have a distinct Discussion card treatment"
+);
+for (const [model, reasoning, expected] of [
+  ["gpt-6-astra", undefined, "low"],
+  ["gpt-5.6-sol", undefined, "low"],
+  ["gpt-5.6-terra", undefined, "medium"],
+  ["gpt-6-astra", "high", "high"]
+]) {
+  const markup = renderModelMenu({
+    model_setting: { model, reasoning_effort: reasoning },
+    model_catalog: [{ id: model, reasoning: ["low", "medium", "high"] }]
+  }, "demo");
+  includes(markup, `<span>${model} ${expected}</span>`, `${model} preserves its reasoning selection or default`);
+}
 const compactQuotaMarkup = renderCompactQuota({
   state: {
     title: '<img src=x onerror="alert(1)">',

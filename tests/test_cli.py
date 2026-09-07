@@ -1,19 +1,34 @@
 from __future__ import annotations
 
+import re
 import tempfile
+import tomllib
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from provision import cli
+from provision import SUPPORTED_CODEX_CLI_VERSION, __version__, cli
 from provision.auth import AuthError
 from provision.paths import Paths
 from provision.store import Store
 
 
 class CliUsabilityTests(unittest.TestCase):
+    def test_release_version_matches_the_reviewed_codex_target(self) -> None:
+        release_base = re.sub(r"(?:\.post\d+|\.dev\d+|rc\d+)$", "", __version__)
+        self.assertEqual(release_base, SUPPORTED_CODEX_CLI_VERSION)
+        self.assertEqual(SUPPORTED_CODEX_CLI_VERSION, "0.153.4")
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        self.assertEqual(metadata["project"]["version"], __version__)
+
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(cli.main(["--version"]), 0)
+        self.assertEqual(output.getvalue().strip(), __version__)
+
     def test_ui_open_prints_and_opens_the_same_url(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             paths = Paths(Path(temp) / "home")

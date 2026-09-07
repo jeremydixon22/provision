@@ -470,6 +470,16 @@ class StoreTests(unittest.TestCase):
                         },
                     },
                 ),
+                update(
+                    "event-7",
+                    "session_recap",
+                    prompt_id=prompt_id,
+                    extra={
+                        "summary": (
+                            "### Session recap\n\n- Inspection completed\n- Tests remain to review"
+                        ),
+                    },
+                ),
             ]
             updates_path = session_dir / "updates.jsonl"
             updates_path.write_text(
@@ -502,7 +512,7 @@ class StoreTests(unittest.TestCase):
                 self.assertFalse(session["working"])
                 self.assertEqual(
                     [item["role"] for item in session["transcript"]],
-                    ["user", "assistant_progress", "tool", "assistant"],
+                    ["user", "assistant_progress", "tool", "assistant", "recap"],
                 )
                 self.assertEqual(session["transcript"][0]["turn_id"], prompt_id)
                 self.assertIn(
@@ -513,6 +523,13 @@ class StoreTests(unittest.TestCase):
                 self.assertEqual(
                     session["transcript"][3]["text"],
                     "The inspection is complete.",
+                )
+                recap = session["transcript"][4]
+                self.assertEqual(recap["role"], "recap")
+                self.assertIn("Inspection completed", recap["text"])
+                self.assertNotIn(
+                    "context_compaction",
+                    [item["role"] for item in session["transcript"]],
                 )
 
                 handler = Handler.__new__(Handler)
@@ -536,7 +553,7 @@ class StoreTests(unittest.TestCase):
                 )
 
                 next_prompt = update(
-                    "event-7",
+                    "event-8",
                     "user_message_chunk",
                     text="Now check the tests.",
                 )
@@ -1998,6 +2015,51 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(catalog[0]["minimal_client_version"], "0.144.0")
         self.assertEqual(catalog[0]["priority"], 1)
 
+    def test_codex_model_catalog_normalizes_astra_bundled_shape(self) -> None:
+        catalog = normalize_codex_model_catalog(
+            {
+                "models": [
+                    {
+                        "slug": "gpt-6-astra",
+                        "display_name": "GPT-6-Astra",
+                        "visibility": "list",
+                        "default_reasoning_level": "low",
+                        "supported_reasoning_levels": [
+                            {"effort": "low", "description": "Fast responses"},
+                            {"effort": "ultra", "description": "Automatic delegation"},
+                        ],
+                        "service_tiers": [
+                            {
+                                "id": "priority",
+                                "name": "Fast",
+                                "description": "2x speed, increased usage",
+                            },
+                        ],
+                        "additional_speed_tiers": ["fast"],
+                        "priority": 1,
+                    },
+                    {
+                        "slug": "hidden-review-model",
+                        "visibility": "hide",
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(len(catalog), 1)
+        self.assertEqual(catalog[0]["id"], "gpt-6-astra")
+        self.assertEqual(catalog[0]["display"], "GPT-6-Astra")
+        self.assertEqual(catalog[0]["default_reasoning"], "low")
+        self.assertEqual(catalog[0]["reasoning"], ["low", "ultra"])
+        self.assertEqual(catalog[0]["service_tiers"][0]["id"], "priority")
+        self.assertEqual(
+            catalog[0]["service_tiers"][0]["description"],
+            "2x speed, increased usage",
+        )
+        self.assertEqual(catalog[0]["additional_speed_tiers"], ["fast"])
+        self.assertEqual(catalog[0]["minimal_client_version"], "")
+        self.assertEqual(catalog[0]["priority"], 1)
+
     def test_codex_model_catalog_accepts_effort_shape_and_future_values(self) -> None:
         catalog = normalize_codex_model_catalog(
             {
@@ -2018,10 +2080,17 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(catalog[0]["default_reasoning"], "future")
         self.assertEqual(catalog[0]["reasoning"], ["future", "max"])
 
-    def test_default_model_catalog_tracks_codex_cli_0144_models(self) -> None:
+    def test_default_model_catalog_tracks_codex_cli_01534_models(self) -> None:
         fallback = {item["id"]: item for item in daemon_module.DEFAULT_MODEL_CATALOG}
 
-        self.assertEqual(daemon_module.DEFAULT_MODEL_ID, "gpt-5.6-sol")
+        self.assertEqual(daemon_module.DEFAULT_MODEL_ID, "gpt-6-astra")
+        self.assertEqual(fallback["gpt-6-astra"]["default_reasoning"], "low")
+        self.assertIn("ultra", fallback["gpt-6-astra"]["reasoning"])
+        self.assertEqual(fallback["gpt-6-astra"]["minimal_client_version"], "0.153.1")
+        self.assertEqual(
+            fallback["gpt-6-astra"]["service_tiers"][0]["description"],
+            "2x speed, increased usage",
+        )
         self.assertEqual(fallback["gpt-5.6-sol"]["default_reasoning"], "low")
         self.assertIn("max", fallback["gpt-5.6-sol"]["reasoning"])
         self.assertIn("ultra", fallback["gpt-5.6-sol"]["reasoning"])
@@ -5618,6 +5687,22 @@ class StoreTests(unittest.TestCase):
         self.assertIn("control-compaction-packet", html)
         self.assertIn("The post-compaction packet is hidden by default.", html)
 
+    def test_discussion_ui_renders_recaps_as_visible_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            paths = Paths(Path(temp) / "home")
+            server = ProvisionServer(("127.0.0.1", 0), paths)
+            handler = Handler.__new__(Handler)
+            handler.server = server
+            try:
+                html = rendered_dashboard_source(handler)
+            finally:
+                server.server_close()
+
+        self.assertIn('if (role === "recap") return "session recap";', html)
+        self.assertIn(".control-message.recap {", html)
+        self.assertIn('"context_compaction", "recap"', html)
+        self.assertNotIn('role === "recap") return "context compaction"', html)
+
     def test_context_summary_uses_the_current_gpt_5_6_context_window(self) -> None:
         summary = daemon_module.context_summary_from_usage({"input_tokens": 256000})
 
@@ -6948,6 +7033,72 @@ class StoreTests(unittest.TestCase):
             transcript[0]["text"],
             "Complete closeout from the completion summary.",
         )
+
+    def test_app_server_recap_items_and_notifications_use_visible_recap_cards(self) -> None:
+        item_entries = daemon_module.app_server_transcript_entries_from_message(
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-recap",
+                    "item": {
+                        "id": "recap-item",
+                        "type": "sessionRecap",
+                        "summary": "### Session recap\n\n- Keep the native terminal authoritative",
+                    },
+                },
+            }
+        )
+        notification_entries = daemon_module.app_server_transcript_entries_from_message(
+            {
+                "method": "thread/recap",
+                "params": {
+                    "turnId": "turn-recap",
+                    "item": {
+                        "type": "text",
+                        "text": "Review the pending implementation work.",
+                    },
+                },
+            }
+        )
+        raw_entry = daemon_module.websocket_message_assistant_entry(
+            0x1,
+            json.dumps(
+                {
+                    "type": "response.recap.completed",
+                    "recap": {"summary": "Keep the dashboard and terminal in sync."},
+                }
+            ).encode("utf-8"),
+        )
+
+        self.assertEqual(item_entries[0]["role"], "recap")
+        self.assertEqual(item_entries[0]["turn_id"], "turn-recap")
+        self.assertEqual(item_entries[0]["source_item_id"], "recap-item")
+        self.assertIn("Keep the native terminal authoritative", item_entries[0]["text"])
+        self.assertEqual(notification_entries[0]["role"], "recap")
+        self.assertIn("Review the pending implementation work", notification_entries[0]["text"])
+        self.assertEqual(raw_entry["role"], "recap")
+        self.assertIn("Keep the dashboard and terminal in sync", raw_entry["text"])
+
+    def test_app_server_recaps_preserve_nested_summary_text(self) -> None:
+        summary = "### Session recap\n\n- Keep the native terminal authoritative."
+        envelopes = [
+            {"recap": {"summary": summary}},
+            {"item": {"type": "sessionRecap", "summary": summary}},
+            {"update": {"recap": {"content": [{"type": "text", "text": summary}]}}},
+            {"summary": [{"summary": summary}]},
+        ]
+        for envelope in envelopes:
+            with self.subTest(envelope=envelope):
+                entries = daemon_module.app_server_transcript_entries_from_message(
+                    {
+                        "method": "thread/recap",
+                        "params": {"turnId": "turn-recap", **envelope},
+                    }
+                )
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0]["role"], "recap")
+                self.assertEqual(entries[0]["text"], summary)
+                self.assertEqual(entries[0]["turn_id"], "turn-recap")
 
     def test_programmatic_tool_call_response_items_are_tool_activity(self) -> None:
         entries = websocket_message_tool_entries(

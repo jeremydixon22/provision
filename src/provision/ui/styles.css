@@ -1416,6 +1416,10 @@
       border-left: 3px solid var(--blue);
       background: linear-gradient(180deg, rgba(59, 130, 214, 0.08), var(--subtle));
     }
+    .control-message.recap {
+      border-left: 3px solid var(--green);
+      background: linear-gradient(180deg, rgba(53, 183, 121, 0.08), var(--subtle));
+    }
     .control-compaction-summary {
       color: var(--muted);
       font-size: 12px;

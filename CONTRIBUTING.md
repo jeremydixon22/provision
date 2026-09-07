@@ -62,6 +62,19 @@ python tools/render_demo_assets.py
 Do not use real account names, paths, tokens, usage, or discussion content in
 fixtures or screenshots.
 
+## Release versioning
+
+Provision's release version mirrors the most recently reviewed Codex CLI
+version. Set the same base version in `pyproject.toml` and
+`src/provision/__init__.py` before building a release. Use the exact reviewed
+Codex version for the first release in that series; use a PEP 440 `.postN`
+suffix only for Provision-only maintenance releases on that same target.
+Use the same base with `.devN` or `rcN` for development and release-candidate
+builds.
+
+Do not change the installed-Codex minimum merely to match the release number:
+the compatibility report and documented fallback paths remain authoritative.
+
 ## Security-sensitive changes
 
 Add targeted tests for token validation, same-origin behavior, header stripping,

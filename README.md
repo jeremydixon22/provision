@@ -40,7 +40,7 @@ Provision is not currently published on PyPI. Install the current release from
 the versioned GitHub source with `pipx` (recommended for an isolated CLI):
 
 ```bash
-pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.8.0"
+pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.153.4"
 provision-codex doctor
 ```
 
@@ -88,16 +88,35 @@ its command, exit status, duration, and output:
 ## Requirements
 
 - Codex CLI `0.144.0` or newer is required for Codex's full dashboard,
-  GPT-5.6 model picker, quota, and compatibility-reporting path.
+  model picker, quota, and compatibility-reporting path.
+- Provision `0.153.4` has been reviewed against Codex CLI
+  `0.153.4`. Older Codex CLI versions remain supported through the documented
+  fallback paths where their capability surface is smaller.
 - Claude Code and Grok Build are optional local clients. Provision detects
   them on `PATH`; they retain their vendor-native login and network behavior.
-- The current bundled catalog includes GPT-5.6-Sol, GPT-5.6-Terra, and
-  GPT-5.6-Luna.
+- With Codex CLI `0.153.4`, the bundled catalog includes GPT-6-Astra alongside
+  GPT-5.6-Sol, GPT-5.6-Terra, and GPT-5.6-Luna.
 - Python 3.11+ is recommended.
 - The richest quota display depends on Codex CLI and the ChatGPT backend
   reporting multi-bucket usage data. Older Codex CLI versions may still route
   model traffic through Provision through fallback behavior, but model metadata,
   status labeling, or extra quota buckets may be incomplete.
+
+## Codex Version Alignment
+
+Provision release versions identify the most recently reviewed Codex CLI
+version. The first Provision release for a reviewed Codex version uses that
+exact version, making the compatibility target clear in `provision --version`,
+package metadata, and the dashboard header.
+
+If a Provision-only maintenance release is needed for the same Codex target,
+it uses a PEP 440 post-release suffix such as `0.153.4.post1`. A newly reviewed
+Codex release advances the base Provision version. This convention identifies
+the reviewed target; it does not require every user to upgrade their local
+Codex CLI immediately.
+
+Development and release-candidate builds use the same base with `.devN` or
+`rcN` suffixes, respectively.
 
 ## Quick Start
 
@@ -182,6 +201,18 @@ provision --help
 provision help
 provision login --help
 ```
+
+## What’s New In 0.153.4
+
+- Recognizes structured and raw session-recap events, including provider recap
+  records, and renders them as a dedicated Discussion card rather than ordinary
+  assistant text or a context-compaction packet.
+- Adds GPT-6-Astra to Provision's degraded-mode model catalog with its low
+  default reasoning level and Fast-tier metadata, while live catalog discovery
+  remains authoritative for availability.
+- Shows Provision's release version beside the detected Codex CLI version in
+  the dashboard header.
+- Updates the development-tool minimums to Coverage `7.16.0` and Ruff `0.16.5`.
 
 ## What’s New In 0.8.0
 

@@ -35,6 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
+from . import __version__
 from .auth import (
     AuthError,
     ensure_fresh_chatgpt_auth,
@@ -373,10 +374,10 @@ TOOL_TRANSCRIPT_SECTION_LABELS = frozenset(
 PROFILE_MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
 REASONING_LEVEL_PATTERN = re.compile(r"^[a-z0-9_-]{1,32}$")
 REASONING_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
-GPT_56_REASONING_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
+FRONTIER_REASONING_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
 GPT_56_LUNA_REASONING_LEVELS = ("low", "medium", "high", "xhigh", "max")
 LEGACY_REASONING_LEVELS = ("low", "medium", "high", "xhigh")
-DEFAULT_MODEL_ID = "gpt-5.6-sol"
+DEFAULT_MODEL_ID = "gpt-6-astra"
 DEFAULT_REASONING_EFFORT = "medium"
 CODEX_MODEL_CATALOG_TIMEOUT_SECONDS = 2.0
 CODEX_VERSION_TIMEOUT_SECONDS = 2.0
@@ -387,9 +388,26 @@ APP_SERVER_RATE_LIMIT_CACHE_SECONDS = 300.0
 APP_SERVER_RATE_LIMIT_FAILURE_BACKOFF_SECONDS = 900.0
 DEFAULT_MODEL_CATALOG = [
     {
+        "id": "gpt-6-astra",
+        "display": "GPT-6-Astra",
+        "reasoning": list(FRONTIER_REASONING_LEVELS),
+        "default_reasoning": "low",
+        "note": "Latest frontier agentic coding model. Requires Codex CLI 0.153.1 or newer.",
+        "minimal_client_version": "0.153.1",
+        "priority": 1,
+        "service_tiers": [
+            {
+                "id": "priority",
+                "name": "Fast",
+                "description": "2x speed, increased usage",
+            },
+        ],
+        "additional_speed_tiers": ["fast"],
+    },
+    {
         "id": "gpt-5.6-sol",
         "display": "GPT-5.6-Sol",
-        "reasoning": list(GPT_56_REASONING_LEVELS),
+        "reasoning": list(FRONTIER_REASONING_LEVELS),
         "default_reasoning": "low",
         "note": "Latest frontier agentic coding model. Requires Codex CLI 0.144.0 or newer.",
         "minimal_client_version": "0.144.0",
@@ -405,7 +423,7 @@ DEFAULT_MODEL_CATALOG = [
     {
         "id": "gpt-5.6-terra",
         "display": "GPT-5.6-Terra",
-        "reasoning": list(GPT_56_REASONING_LEVELS),
+        "reasoning": list(FRONTIER_REASONING_LEVELS),
         "default_reasoning": "medium",
         "note": "Balanced agentic coding model for everyday work. Requires Codex CLI 0.144.0 or newer.",
         "minimal_client_version": "0.144.0",
@@ -3102,6 +3120,10 @@ def websocket_message_assistant_entry(opcode: int, payload: bytes) -> dict[str, 
     if not isinstance(value, dict):
         return None
     event = json_value_event_type(value) or ""
+    if "recap" in event.lower():
+        text = recap_text_from_value(value.get("recap") or value)
+        if text:
+            return {"role": "recap", "text": text, "append": False}
     delta = value.get("delta")
     if isinstance(delta, str) and "output_text" in event:
         text = clean_transcript_text(delta, preserve_edges=True)
@@ -3173,6 +3195,33 @@ def compact_tool_detail(value: Any) -> str:
     except (TypeError, ValueError):
         encoded = str(value)
     return clean_transcript_text(encoded)
+
+
+def recap_text_from_value(value: Any) -> str:
+    """Extract human-readable recap text without treating it as a tool payload."""
+    if isinstance(value, str):
+        return clean_transcript_text(value)
+    if isinstance(value, list):
+        pieces = [recap_text_from_value(item) for item in value]
+        return "\n".join(piece for piece in pieces if piece) or compact_tool_detail(value)
+    if not isinstance(value, dict):
+        return ""
+    for key in (
+        "summary",
+        "recap",
+        "text",
+        "content",
+        "message",
+        "details",
+        "item",
+        "update",
+        "result",
+    ):
+        candidate = value.get(key)
+        text = transcript_text_from_content(candidate) or recap_text_from_value(candidate)
+        if text:
+            return text
+    return ""
 
 
 def provider_update_timestamp(value: Any) -> str:
@@ -4261,6 +4310,58 @@ def app_server_agent_message_entry(
     return entry
 
 
+def app_server_recap_entry_from_item(
+    item: Any,
+    *,
+    turn_id: str,
+) -> dict[str, Any] | None:
+    """Normalize recap-specific app-server items into visible Discussion cards."""
+    if not isinstance(item, dict):
+        return None
+    markers = (
+        str(item.get("type") or ""),
+        str(item.get("kind") or ""),
+        str(item.get("phase") or ""),
+    )
+    if not any("recap" in marker.lower() for marker in markers):
+        return None
+    text = recap_text_from_value(item)
+    if not text:
+        return None
+    entry: dict[str, Any] = {
+        "role": "recap",
+        "text": text,
+        "append": False,
+        "turn_id": turn_id,
+        "authoritative": True,
+    }
+    source_item_id = first_string_value(item, ("id", "itemId", "item_id"))
+    if source_item_id:
+        entry["source_item_id"] = source_item_id
+    return entry
+
+
+def app_server_recap_entry_from_message(
+    method: str,
+    params: dict[str, Any],
+    *,
+    turn_id: str,
+) -> dict[str, Any] | None:
+    """Accept provider-neutral recap notifications in addition to recap items."""
+    if "recap" not in method.lower():
+        return None
+    text = recap_text_from_value(params)
+    if not text:
+        return None
+    return {
+        "role": "recap",
+        "text": text,
+        "append": False,
+        "turn_id": turn_id,
+        "authoritative": True,
+    }
+
+
 def app_server_tool_entry_from_item(item: dict[str, Any]) -> dict[str, Any] | None:
     item_type = str(item.get("type") or "")
     item_type_key = re.sub(r"[_-]", "", item_type).lower()
@@ -4469,6 +4570,9 @@ def app_server_transcript_entries_from_message(
     method = app_server_message_method(message)
     params = app_server_message_params(message)
     turn_id = app_server_message_turn_id(message)
+    recap_entry = app_server_recap_entry_from_message(method, params, turn_id=turn_id)
+    if recap_entry:
+        return [recap_entry]
     if method == "item/agentMessage/delta":
         delta = params.get("delta")
         text = clean_transcript_text(delta, preserve_edges=True) if isinstance(delta, str) else ""
@@ -4488,6 +4592,9 @@ def app_server_transcript_entries_from_message(
         item = params.get("item")
         if not isinstance(item, dict):
             return []
+        recap_entry = app_server_recap_entry_from_item(item, turn_id=turn_id)
+        if recap_entry:
+            return [recap_entry]
         item_type = str(item.get("type") or "")
         if item_type == "agentMessage":
             completed_entry = app_server_agent_message_entry(
@@ -4503,6 +4610,9 @@ def app_server_transcript_entries_from_message(
     if method == "item/started":
         item = params.get("item")
         if isinstance(item, dict):
+            recap_entry = app_server_recap_entry_from_item(item, turn_id=turn_id)
+            if recap_entry:
+                return [recap_entry]
             tool_entry = app_server_tool_entry_from_item(item)
             if tool_entry:
                 tool_entry["turn_id"] = turn_id
@@ -9537,7 +9647,7 @@ class ProvisionServer(ThreadingHTTPServer):
 
     @classmethod
     def set_transcript_item_text(cls, item: dict[str, Any], role: str, full_text: str) -> None:
-        if role in {"user", "user_pending", "resume", "context_compaction"}:
+        if role in {"user", "user_pending", "resume", "context_compaction", "recap"}:
             full_text = clean_control_user_text(full_text)
         display = cls.transcript_display_text(full_text)
         item["text"] = display
@@ -9601,7 +9711,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 existing, str(existing.get("role") or "user_pending"), text
             )
             replay_after_pending = any(
-                item.get("role") in {"resume", "context_compaction"}
+                item.get("role") in {"resume", "context_compaction", "recap"}
                 for item in transcript[index + 1 :]
             )
             if replay_after_pending:
@@ -9723,7 +9833,7 @@ class ProvisionServer(ThreadingHTTPServer):
             later_turn = str(later.get("turn_id") or "")
             if turn_id and later_turn and later_turn != turn_id:
                 continue
-            if later.get("role") in {"resume", "user", "context_compaction"}:
+            if later.get("role") in {"resume", "user", "context_compaction", "recap"}:
                 continue
             return True
         return False
@@ -9745,7 +9855,7 @@ class ProvisionServer(ThreadingHTTPServer):
         authoritative: bool = False,
         timestamp: str = "",
     ) -> None:
-        if role in {"user", "user_pending", "resume", "context_compaction"}:
+        if role in {"user", "user_pending", "resume", "context_compaction", "recap"}:
             text = clean_control_user_text(text)
         if not session_key or not text:
             return
@@ -9774,7 +9884,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 if not self.transcript_text_matches(existing, text):
                     continue
                 replay_marker_seen = any(
-                    item.get("role") in {"resume", "context_compaction"}
+                    item.get("role") in {"resume", "context_compaction", "recap"}
                     for item in transcript[index + 1 :]
                 )
                 if replay_marker_seen:
@@ -9782,7 +9892,10 @@ class ProvisionServer(ThreadingHTTPServer):
                     notify_remote(existing, replace=True)
                     return
                 break
-        if role not in {"user", "user_pending", "resume", "context_compaction"} and turn_id:
+        if (
+            role not in {"user", "user_pending", "resume", "context_compaction", "recap"}
+            and turn_id
+        ):
             self.assign_recent_user_turn_id_in_transcript(
                 transcript,
                 turn_id=turn_id,
@@ -10555,11 +10668,11 @@ class ProvisionServer(ThreadingHTTPServer):
             )
             return
         if kind == "session_recap":
-            text = compact_tool_detail(update.get("summary"))
+            text = recap_text_from_value(update)
             if text:
                 self.append_control_transcript(
                     session_key=session_key,
-                    role="context_compaction",
+                    role="recap",
                     text=text,
                     turn_id=turn_id,
                     profile=profile,
@@ -15750,6 +15863,7 @@ class Handler(BaseHTTPRequestHandler):
         active_requests = int(status.get("active_requests") or 0)
         active_websockets = int(status.get("active_websockets") or 0)
         busy = "busy" if status.get("live_busy") else "idle"
+        provision_version = html.escape(__version__)
         codex = status.get("codex") if isinstance(status.get("codex"), dict) else {}
         codex_cli = reported_codex_cli(codex)
         codex_version = html.escape(str(codex_cli.get("version") or "unknown"))
@@ -15768,6 +15882,7 @@ class Handler(BaseHTTPRequestHandler):
             .replace("__LOGIN_BROWSER_REMOTE_NOTE__", json.dumps(LOGIN_BROWSER_REMOTE_NOTE))
             .replace("__ACTIVE_PROFILE__", active_profile)
             .replace("__DEFAULT_PROVIDER__", default_provider)
+            .replace("__PROVISION_VERSION__", provision_version)
             .replace("__CODEX_VERSION__", codex_version)
             .replace("__BUSY__", busy)
             .replace("__ACTIVE_REQUESTS__", str(active_requests))
