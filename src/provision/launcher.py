@@ -68,7 +68,6 @@ CODEX_PASSTHROUGH_COMMANDS = {
     "login",
     "logout",
     "mcp",
-    "mcp-server",
     "plugin",
     "remote-control",
     "sandbox",

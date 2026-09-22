@@ -21,6 +21,7 @@ function sourceRange(startMarker, endMarker) {
 
 const context = vm.createContext({
   URL,
+  latestModelCatalog: [],
   window: { location: { href: "https://provision.test/ui" } }
 });
 vm.runInContext(
@@ -129,6 +130,16 @@ for (const [model, reasoning, expected] of [
     model_catalog: [{ id: model, reasoning: ["low", "medium", "high"] }]
   }, "demo");
   includes(markup, `<span>${model} ${expected}</span>`, `${model} preserves its reasoning selection or default`);
+}
+const unavailableModel = renderModelMenu({
+  model_setting: { model: "gpt-5.2", reasoning_effort: "high" },
+  model_catalog: [{ id: "gpt-6-astra", reasoning: ["low"] }]
+}, "demo");
+includes(unavailableModel, "The saved model is absent", "missing selections have migration guidance");
+includes(unavailableModel, "gpt-5.2 high", "missing selections remain explicit");
+const fallbackModels = renderModelMenu({}, "demo");
+for (const retired of ["gpt-5.2", "gpt-5.4", "gpt-5.4-mini"]) {
+  excludes(fallbackModels, `data-model="${retired}"`, "retired models are absent from the fallback picker");
 }
 const compactQuotaMarkup = renderCompactQuota({
   state: {

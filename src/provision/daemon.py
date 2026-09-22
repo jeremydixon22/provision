@@ -44,6 +44,12 @@ from .auth import (
     upstream_base_url,
     upstream_chatgpt_backend_base_url,
 )
+from .codex_compat import (
+    AccountScopedCache,
+    ModelRewriteContext,
+    auth_payload_revision,
+    auth_revision,
+)
 from .connector import (
     CONNECTOR_ABI_VERSION,
     ConnectorError,
@@ -467,38 +473,6 @@ DEFAULT_MODEL_CATALOG = [
             },
         ],
         "additional_speed_tiers": ["fast"],
-    },
-    {
-        "id": "gpt-5.4",
-        "display": "GPT-5.4",
-        "reasoning": list(LEGACY_REASONING_LEVELS),
-        "default_reasoning": "medium",
-        "note": "Strong model for everyday coding.",
-        "minimal_client_version": "0.98.0",
-        "service_tiers": [
-            {
-                "id": "priority",
-                "name": "Fast",
-                "description": "1.5x speed, increased usage",
-            },
-        ],
-        "additional_speed_tiers": ["fast"],
-    },
-    {
-        "id": "gpt-5.4-mini",
-        "display": "GPT-5.4-Mini",
-        "reasoning": list(LEGACY_REASONING_LEVELS),
-        "default_reasoning": "medium",
-        "note": "Small, fast, and cost-efficient model for simpler coding tasks.",
-        "minimal_client_version": "0.98.0",
-    },
-    {
-        "id": "gpt-5.2",
-        "display": "GPT-5.2",
-        "reasoning": list(LEGACY_REASONING_LEVELS),
-        "default_reasoning": "medium",
-        "note": "Optimized for professional work and long-running agents.",
-        "minimal_client_version": "0.0.1",
     },
 ]
 LOGIN_REQUIRED_MARKERS = (
@@ -2743,6 +2717,9 @@ def response_create_payload_metadata(value: Any) -> dict[str, Any] | None:
         return None
     client_metadata = value.get("client_metadata")
     if not isinstance(client_metadata, dict):
+        nested = value.get("response")
+        if isinstance(nested, dict):
+            return response_create_payload_metadata({**nested, "type": "response.create"})
         return None
     raw_metadata = client_metadata.get(X_CODEX_TURN_METADATA_HEADER)
     if not isinstance(raw_metadata, str):
@@ -4654,7 +4631,22 @@ def request_body_session(body: bytes | None) -> dict[str, str] | None:
         value = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
+    if isinstance(value, dict) and "type" not in value:
+        value = {**value, "type": "response.create"}
     return response_create_payload_session(value)
+
+
+def request_thread_id(body: bytes | None, metadata_header: str = "") -> str | None:
+    try:
+        value = json.loads(body) if body else {}
+    except (UnicodeDecodeError, ValueError):
+        value = {}
+    if not isinstance(value, dict):
+        value = {}
+    value = {**value, "type": "response.create"}
+    if metadata_header:
+        value["client_metadata"] = {X_CODEX_TURN_METADATA_HEADER: metadata_header}
+    return response_create_payload_thread_id(value)
 
 
 def rewrite_service_tier_value(value: Any, *, fast_enabled: bool) -> tuple[Any, str | None, bool]:
@@ -4733,20 +4725,12 @@ def apply_model_setting(
     *,
     model: str | None,
     reasoning_effort: str | None,
+    context: ModelRewriteContext | None = None,
+    compact: bool = False,
 ) -> tuple[dict[str, Any], bool]:
-    rewritten = dict(value)
-    changed = False
-    if model and rewritten.get("model") != model:
-        rewritten["model"] = model
-        changed = True
-    if reasoning_effort:
-        reasoning = rewritten.get("reasoning")
-        next_reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
-        if next_reasoning.get("effort") != reasoning_effort:
-            next_reasoning["effort"] = reasoning_effort
-            rewritten["reasoning"] = next_reasoning
-            changed = True
-    return rewritten, changed
+    return (context or ModelRewriteContext()).rewrite(
+        value, model=model, reasoning_effort=reasoning_effort, compact=compact
+    )
 
 
 def rewrite_model_body(
@@ -4754,6 +4738,8 @@ def rewrite_model_body(
     *,
     model: str | None,
     reasoning_effort: str | None,
+    context: ModelRewriteContext | None = None,
+    compact: bool = False,
 ) -> tuple[bytes | None, str | None, str | None, bool]:
     if not body or not model:
         return body, model, reasoning_effort, False
@@ -4767,6 +4753,8 @@ def rewrite_model_body(
         value,
         model=model,
         reasoning_effort=reasoning_effort,
+        context=context,
+        compact=compact,
     )
     if not changed:
         return body, model, reasoning_effort, False
@@ -4780,6 +4768,7 @@ def rewrite_model_websocket_message(
     *,
     model: str | None,
     reasoning_effort: str | None,
+    context: ModelRewriteContext | None = None,
 ) -> tuple[bytes, str | None, str | None, bool]:
     if opcode != 0x1 or not model:
         return payload, model, reasoning_effort, False
@@ -4798,6 +4787,7 @@ def rewrite_model_websocket_message(
             target,
             model=model,
             reasoning_effort=reasoning_effort,
+            context=context,
         )
         rewritten_value["response"] = rewritten_target
     else:
@@ -4805,6 +4795,7 @@ def rewrite_model_websocket_message(
             rewritten_value,
             model=model,
             reasoning_effort=reasoning_effort,
+            context=context,
         )
     if not changed:
         return payload, model, reasoning_effort, False
@@ -5478,6 +5469,10 @@ def usage_payload_from_rate_limit_snapshot(snapshot: Any) -> dict[str, Any] | No
                 "rate_limit": rate_limit,
             }
         ]
+        if "normal_model_slug" in snapshot or "normalModelSlug" in snapshot:
+            payload["additional_rate_limits"][0]["normal_model_slug"] = sanitize_model_id(
+                snapshot.get("normal_model_slug", snapshot.get("normalModelSlug"))
+            )
     return payload
 
 
@@ -5487,6 +5482,9 @@ def usage_payload_from_app_server_rate_limits_response(
     if not isinstance(value, dict):
         return None
     payload = usage_payload_from_rate_limit_snapshot(value.get("rateLimits")) or {}
+    if "ordinaryUsageAllowed" in value:
+        allowed = value["ordinaryUsageAllowed"]
+        payload["ordinary_usage_allowed"] = allowed if isinstance(allowed, bool) else None
     by_limit_id = value.get("rateLimitsByLimitId")
     if isinstance(by_limit_id, dict):
         for limit_id, snapshot in by_limit_id.items():
@@ -5556,6 +5554,9 @@ def merge_rate_limit(existing: Any, update: Any) -> dict[str, Any]:
 
 def merge_usage_payload(existing: Any, update: dict[str, Any]) -> dict[str, Any]:
     merged = dict(existing) if isinstance(existing, dict) else {}
+    if "ordinary_usage_allowed" in update:
+        allowed = update["ordinary_usage_allowed"]
+        merged["ordinary_usage_allowed"] = allowed if isinstance(allowed, bool) else None
     if isinstance(update.get("rate_limit"), dict):
         merged["rate_limit"] = merge_rate_limit(merged.get("rate_limit"), update["rate_limit"])
     if isinstance(update.get("credits"), dict):
@@ -5594,6 +5595,8 @@ def merge_usage_payload(existing: Any, update: dict[str, Any]) -> dict[str, Any]
             )
             if row.get("limit_name"):
                 existing_row["limit_name"] = row["limit_name"]
+            if "normal_model_slug" in row:
+                existing_row["normal_model_slug"] = row["normal_model_slug"]
             additional[index] = existing_row
             replaced = True
             break
@@ -5837,6 +5840,11 @@ def usage_cache_summary(entry: dict[str, Any] | None) -> str:
         if quota_payload_unlimited(payload)
         else usage_rate_limit_summary(payload.get("rate_limit"))
     )
+    if "ordinary_usage_allowed" in payload:
+        status, _ = quota_bucket_state(
+            {"ordinary_usage_allowed": payload["ordinary_usage_allowed"]}
+        )
+        summary = f"{status}; {summary}"
     additional = payload.get("additional_rate_limits")
     extra = ""
     if isinstance(additional, list) and additional:
@@ -5857,8 +5865,11 @@ def quota_bucket_rows(payload: Any) -> list[dict[str, Any]]:
     buckets: list[dict[str, Any]] = []
     credits = payload.get("credits")
     credits = credits if isinstance(credits, dict) else None
-    if isinstance(payload.get("rate_limit"), dict):
-        rate_limit = dict(payload["rate_limit"])
+    if isinstance(payload.get("rate_limit"), dict) or "ordinary_usage_allowed" in payload:
+        raw_limit = payload.get("rate_limit")
+        rate_limit = dict(raw_limit) if isinstance(raw_limit, dict) else {}
+        if "ordinary_usage_allowed" in payload:
+            rate_limit["ordinary_usage_allowed"] = payload["ordinary_usage_allowed"]
         if credits:
             rate_limit["credits"] = credits
         buckets.append(
@@ -5890,6 +5901,7 @@ def quota_bucket_rows(payload: Any) -> list[dict[str, Any]]:
                 {
                     "name": str(name),
                     "metered_feature": str(row.get("metered_feature") or ""),
+                    "normal_model_slug": row.get("normal_model_slug"),
                     "rate_limit": row["rate_limit"],
                 }
             )
@@ -6268,6 +6280,13 @@ def quota_window_has_count(window: Any) -> bool:
 def quota_bucket_state(rate_limit: dict[str, Any]) -> tuple[str, str]:
     if rate_limit.get("spend_control_reached") is True:
         return "Spend control", "exhausted"
+    if "ordinary_usage_allowed" in rate_limit:
+        allowed = rate_limit["ordinary_usage_allowed"]
+        if allowed is False:
+            return "Included usage blocked", "exhausted"
+        if allowed is not True:
+            return "Availability unknown", "unknown"
+        return "Available", "ok"
     if quota_rate_limit_unlimited(rate_limit):
         return "Unlimited", "unlimited"
     remaining_values = [
@@ -6420,6 +6439,25 @@ def quota_stack_context(rate_limit: dict[str, Any]) -> dict[str, Any]:
     primary_label = "5h" if primary_not_enforced else quota_window_label(primary, "5h")
     weekly_label = quota_window_label(secondary, "Weekly")
     unbounded_kind = "unlimited" if quota_rate_limit_unlimited(rate_limit) else ""
+
+    if (
+        "ordinary_usage_allowed" in rate_limit
+        and rate_limit["ordinary_usage_allowed"] is not True
+        and rate_limit.get("spend_control_reached") is not True
+    ):
+        blocked = rate_limit["ordinary_usage_allowed"] is False
+        status = "Included usage blocked" if blocked else "Availability unknown"
+        return {
+            "special": "spend-control" if blocked else "unknown",
+            "primary_reset_text": status,
+            "weekly_status": quota_status_text(weekly_label, secondary),
+            "primary_style": primary_percent or 0.0,
+            "weekly_style": weekly_percent or 0.0,
+            "primary_text": "Blocked" if blocked else "Unknown",
+            "weekly_text": quota_percent_text(weekly_percent),
+            "primary_empty": "",
+            "aria": f"{status}. Percentages and reset times do not confirm availability.",
+        }
 
     if rate_limit.get("spend_control_reached") is True:
         primary_style = primary_percent if primary_percent is not None else 0.0
@@ -6578,12 +6616,11 @@ def render_quota_stack(context: dict[str, Any]) -> str:
 
 def render_quota_bucket(bucket: dict[str, Any]) -> str:
     name = str(bucket.get("name") or "Quota bucket")
-    feature = str(bucket.get("metered_feature") or "")
     rate_limit = bucket.get("rate_limit")
     if not isinstance(rate_limit, dict):
         return ""
 
-    title = f"Metered feature: {feature}" if feature and feature != "codex" else ""
+    title = quota_bucket_title(bucket)
     context = quota_stack_context(rate_limit)
     stack_html = render_quota_stack(context)
     horizons_html = render_quota_horizons(context, name, title)
@@ -6603,6 +6640,9 @@ def quota_bucket_matches_model(bucket: dict[str, Any], model: str) -> bool:
     name = str(bucket.get("name") or "").lower()
     if feature == "codex":
         return model_text == "codex"
+    if bucket.get("normal_model_slug"):
+        # Reserve aliases describe a model but do not own its ordinary quota.
+        return feature == model_text
     if feature and (feature == model_text or feature in model_text or model_text in feature):
         return True
     if "spark" in model_text and ("spark" in feature or "spark" in name):
@@ -6940,6 +6980,15 @@ def quota_stack_payload(rate_limit: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def quota_bucket_title(bucket: dict[str, Any]) -> str:
+    feature = str(bucket.get("metered_feature") or "")
+    title = f"Metered feature: {feature}" if feature and feature != "codex" else ""
+    normal_model = sanitize_model_id(bucket.get("normal_model_slug"))
+    if normal_model:
+        title += f"; model: {normal_model} (separate quota bucket)"
+    return title
+
+
 def quota_bucket_payload(bucket: dict[str, Any]) -> dict[str, Any] | None:
     rate_limit = bucket.get("rate_limit")
     if not isinstance(rate_limit, dict):
@@ -6949,7 +6998,8 @@ def quota_bucket_payload(bucket: dict[str, Any]) -> dict[str, Any] | None:
     return {
         "name": name,
         "metered_feature": feature,
-        "title": f"Metered feature: {feature}" if feature and feature != "codex" else "",
+        "title": quota_bucket_title(bucket),
+        "normal_model_slug": bucket.get("normal_model_slug"),
         "stack": quota_stack_payload(rate_limit),
     }
 
@@ -7158,6 +7208,7 @@ class ProvisionServer(ThreadingHTTPServer):
         self.active_requests: dict[int, dict[str, Any]] = {}
         self.active_websockets: dict[int, dict[str, Any]] = {}
         self.active_lock = threading.Lock()
+        self.model_rewrite_contexts: dict[tuple[str, str, str, str], ModelRewriteContext] = {}
         self.permission_condition = threading.Condition()
         self.pending_permissions: dict[str, dict[str, Any]] = {}
         self.resolved_permissions: dict[str, float] = {}
@@ -7186,7 +7237,7 @@ class ProvisionServer(ThreadingHTTPServer):
         self.reset_credit_state: dict[str, dict[str, Any]] = self.load_reset_credit_state()
         self.reset_credit_state_lock = threading.Lock()
         self.reset_credit_verify_threads: dict[str, threading.Thread] = {}
-        self.usage_cache: dict[str, dict[str, Any]] = {}
+        self.usage_cache = AccountScopedCache(self.profile_auth_revision)
         self.usage_cache_lock = threading.Lock()
         self.usage_refresh_lock = threading.Lock()
         self.last_usage_refresh_monotonic = 0.0
@@ -7195,9 +7246,9 @@ class ProvisionServer(ThreadingHTTPServer):
         self.login_jobs: dict[str, dict[str, Any]] = {}
         self.login_processes: dict[str, subprocess.Popen[str]] = {}
         self.login_jobs_lock = threading.Lock()
-        self.app_server_rate_limit_cache: dict[str, dict[str, Any]] = {}
+        self.app_server_rate_limit_cache = AccountScopedCache(self.profile_auth_revision)
         self.app_server_rate_limit_lock = threading.Lock()
-        self.app_server_model_catalog_cache: dict[str, dict[str, Any]] = {}
+        self.app_server_model_catalog_cache = AccountScopedCache(self.profile_auth_revision)
         self.app_server_model_catalog_lock = threading.Lock()
         self.stats_lock = threading.Lock()
         self.stats_events_cache_signature: tuple[int, int, int, int] | None = None
@@ -8324,8 +8375,16 @@ class ProvisionServer(ThreadingHTTPServer):
                 raise StoreError("unknown session")
             if str(record.get("provider") or "codex") != "codex":
                 return []
-            cwd = str(record.get("cwd") or session_key)
-        return self.resume_candidates_for_cwd(cwd)
+            cwds = list(
+                dict.fromkeys(
+                    [str(record.get("cwd") or session_key), *record.get("history_cwds", [])]
+                )
+            )
+        candidates: dict[str, dict[str, str]] = {}
+        for cwd in cwds:
+            for candidate in self.resume_candidates_for_cwd(cwd):
+                candidates.setdefault(candidate["id"], candidate)
+        return list(candidates.values())[:RESUME_CANDIDATE_LIMIT]
 
     def history_turns_for_cwd(self, cwd: str) -> list[dict[str, Any]]:
         key = normalized_path_text(cwd)
@@ -8376,11 +8435,20 @@ class ProvisionServer(ThreadingHTTPServer):
                 raise StoreError("unknown session")
             if str(record.get("provider") or "codex") != "codex":
                 return []
-            cwd = str(record.get("cwd") or session_key)
+            cwds = list(
+                dict.fromkeys(
+                    [str(record.get("cwd") or session_key), *record.get("history_cwds", [])]
+                )
+            )
             observed_turns = self.control_turns_from_transcript(
                 self.control_transcript_snapshot(session_key)
             )
-        history_turns = self.history_turns_for_cwd(cwd)
+        by_key = {
+            turn["key"]: turn for cwd in reversed(cwds) for turn in self.history_turns_for_cwd(cwd)
+        }
+        history_turns = sorted(by_key.values(), key=lambda turn: str(turn.get("timestamp") or ""))[
+            -CONTROL_HISTORY_TURN_LIMIT:
+        ]
         return [
             turn
             for turn in history_turns
@@ -8396,8 +8464,16 @@ class ProvisionServer(ThreadingHTTPServer):
                 raise StoreError("unknown session")
             if str(record.get("provider") or "codex") != "codex":
                 raise StoreError("native history is not available for this provider")
-            cwd = str(record.get("cwd") or session_key)
-        payload = codex_history_turn_payload_for_cwd(cwd, turn_key)
+            cwds = list(
+                dict.fromkeys(
+                    [str(record.get("cwd") or session_key), *record.get("history_cwds", [])]
+                )
+            )
+        payload = None
+        for cwd in cwds:
+            payload = codex_history_turn_payload_for_cwd(cwd, turn_key)
+            if payload:
+                break
         if not payload:
             raise StoreError("historical turn was not found for this session")
         payload["session_key"] = session_key
@@ -9256,6 +9332,7 @@ class ProvisionServer(ThreadingHTTPServer):
         permission_bridge: str | None = None,
         pty_managed: bool = False,
         clear_control_path: bool = False,
+        runtime_cwd: bool = False,
     ) -> None:
         now = time.monotonic()
         self.ensure_session_tab_order_state()
@@ -9282,6 +9359,19 @@ class ProvisionServer(ThreadingHTTPServer):
         previous_provider_pid = record.get("provider_pid")
         previous_provider_state_root = str(record.get("provider_state_root") or "")
         previous_permission_bridge = str(record.get("permission_bridge") or "")
+        if launcher_pid is not None and launcher_pid != previous_launcher_pid:
+            record.pop("runtime_cwd", None)
+            record.pop("history_cwds", None)
+        if runtime_cwd:
+            if previous_cwd and previous_cwd != cwd:
+                prior = list(record.get("history_cwds") or [])
+                record["history_cwds"] = [
+                    previous_cwd,
+                    *[item for item in prior if item != previous_cwd],
+                ][:16]
+            record["runtime_cwd"] = cwd
+        elif record.get("runtime_cwd"):
+            cwd = str(record["runtime_cwd"])
         record["tab_order"] = self.session_tab_order_for_key_locked(key)
         record["cwd"] = cwd
         record["display"] = compact_session_path(cwd)
@@ -9531,9 +9621,10 @@ class ProvisionServer(ThreadingHTTPServer):
         with self.active_lock:
             tunnel = self.active_websockets.get(tunnel_id)
             if tunnel is not None:
+                session_key = str(tunnel.get("session_key") or session_key)
                 tunnel["session_key"] = session_key
                 profile = profile or str(tunnel.get("profile") or "")
-            self.observe_session_locked(session_key, cwd, profile)
+            self.observe_session_locked(session_key, cwd, profile, runtime_cwd=True)
         self.mark_ui_dirty("websocket_session")
 
     def attach_websocket_upstream(self, tunnel_id: int, upstream: socket.socket) -> None:
@@ -11931,6 +12022,7 @@ class ProvisionServer(ThreadingHTTPServer):
         *,
         force: bool = False,
     ) -> tuple[dict[str, Any], datetime | None, str]:
+        revision = self.profile_auth_revision(profile)
         now = time.monotonic()
         should_fetch = False
         fetch_event: threading.Event | None = None
@@ -11957,6 +12049,10 @@ class ProvisionServer(ThreadingHTTPServer):
             assert fetch_event is not None
             fetch_event.wait(USAGE_CACHE_WAIT_SECONDS)
             with self.usage_cache_lock:
+                if self.profile_auth_revision(profile) != revision:
+                    if fetch_event is not None:
+                        fetch_event.set()
+                    raise StoreError("profile credentials changed during usage refresh; retry")
                 entry = self.usage_cache.get(profile, {})
                 payload = entry.get("payload")
                 if isinstance(payload, dict):
@@ -11972,12 +12068,19 @@ class ProvisionServer(ThreadingHTTPServer):
                 raise AuthError("usage response was not a JSON object")
             fetched_at = datetime.now().astimezone()
         except Exception as exc:
+            if self.profile_auth_revision(profile) != revision:
+                fetch_event.set()
+                raise StoreError("profile credentials changed during usage refresh; retry") from exc
             if auth_error_requires_login(exc):
                 self.mark_profile_login_required(profile, exc)
             if error_requires_billing(exc):
                 self.mark_profile_billing_required(profile, exc)
             error_at = datetime.now().astimezone()
             with self.usage_cache_lock:
+                if self.profile_auth_revision(profile) != revision:
+                    if fetch_event is not None:
+                        fetch_event.set()
+                    raise StoreError("profile credentials changed during usage refresh; retry")
                 entry = self.usage_cache.setdefault(profile, {})
                 entry["error"] = str(exc)
                 entry["error_at"] = error_at
@@ -11992,8 +12095,20 @@ class ProvisionServer(ThreadingHTTPServer):
             raise
 
         with self.usage_cache_lock:
+            if self.profile_auth_revision(profile) != revision:
+                fetch_event.set()
+                raise StoreError("profile credentials changed during usage refresh; retry")
             entry = self.usage_cache.setdefault(profile, {})
             previous_payload = entry.get("payload")
+            if (
+                isinstance(previous_payload, dict)
+                and "ordinary_usage_allowed" in previous_payload
+                and "ordinary_usage_allowed" not in payload
+            ):
+                payload = {
+                    **payload,
+                    "ordinary_usage_allowed": previous_payload["ordinary_usage_allowed"],
+                }
             entry["payload"] = payload
             entry["fetched_at"] = fetched_at
             entry["fetched_monotonic"] = time.monotonic()
@@ -12025,11 +12140,14 @@ class ProvisionServer(ThreadingHTTPServer):
         *,
         source: str,
         service_tier: str | None = None,
+        auth_owner: str | None = None,
     ) -> bool:
         if not profile or not isinstance(payload_update, dict):
             return False
         fetched_at = datetime.now().astimezone()
         with self.usage_cache_lock:
+            if auth_owner is not None and self.profile_auth_revision(profile) != auth_owner:
+                return False
             entry = self.usage_cache.setdefault(profile, {})
             previous_payload = entry.get("payload")
             entry["payload"] = merge_usage_payload(entry.get("payload"), payload_update)
@@ -12058,11 +12176,14 @@ class ProvisionServer(ThreadingHTTPServer):
             self.reconcile_reset_credit_verification(profile, current_payload, source=source)
         return True
 
-    def update_usage_cache_from_rate_limit_headers(self, profile: str, headers: Any) -> bool:
+    def update_usage_cache_from_rate_limit_headers(
+        self, profile: str, headers: Any, *, auth_owner: str | None = None
+    ) -> bool:
         return self.update_usage_cache_from_observation(
             profile,
             usage_payload_from_rate_limit_headers(headers),
             source="response_headers",
+            auth_owner=auth_owner,
         )
 
     def update_usage_cache_from_websocket_message(
@@ -12072,13 +12193,31 @@ class ProvisionServer(ThreadingHTTPServer):
         payload: bytes,
         *,
         service_tier: str | None = None,
+        auth_owner: str | None = None,
     ) -> bool:
         return self.update_usage_cache_from_observation(
             profile,
             usage_payload_from_websocket_message(opcode, payload),
             source="websocket_event",
+            auth_owner=auth_owner,
             service_tier=service_tier,
         )
+
+    def profile_auth_revision(self, profile: str) -> str:
+        return auth_revision(self.store.auth_path(profile))
+
+    def model_rewrite_context(
+        self, profile: str, session_key: str | None, thread_id: str | None = None
+    ) -> ModelRewriteContext:
+        if not session_key:
+            return ModelRewriteContext()
+        key = (profile, self.profile_auth_revision(profile), session_key, thread_id or "")
+        with self.active_lock:
+            context = self.model_rewrite_contexts.pop(key, None) or ModelRewriteContext()
+            self.model_rewrite_contexts[key] = context
+            while len(self.model_rewrite_contexts) > 1024:
+                self.model_rewrite_contexts.pop(next(iter(self.model_rewrite_contexts)))
+            return context
 
     def usage_cache_snapshot(self, profile: str) -> dict[str, Any] | None:
         with self.usage_cache_lock:
@@ -12107,6 +12246,7 @@ class ProvisionServer(ThreadingHTTPServer):
         if not self.store.profile_exists(profile):
             raise StoreError(f"unknown profile: {profile}")
         auth_source = self.store.auth_path(profile)
+        revision = self.profile_auth_revision(profile)
         with tempfile.TemporaryDirectory(prefix=f"provision-app-server-{profile}-") as temp:
             codex_home = Path(temp)
             if include_history:
@@ -12121,7 +12261,9 @@ class ProvisionServer(ThreadingHTTPServer):
             env["CODEX_HOME"] = str(codex_home)
             with CodexAppServerClient(env=env) as client:
                 result = callback(client)
-            if auth_target.exists():
+            if self.profile_auth_revision(profile) != revision:
+                raise StoreError("profile credentials changed during app-server request; retry")
+            if auth_target.exists() and auth_revision(auth_target) != revision:
                 self.store.import_auth_file(profile, auth_target, overwrite=True, set_active=False)
             return result
 
@@ -12169,6 +12311,7 @@ class ProvisionServer(ThreadingHTTPServer):
         return snapshot
 
     def refresh_profile_model_catalog(self, profile: str) -> None:
+        revision = self.profile_auth_revision(profile)
         try:
             result = self.run_app_server_for_profile(profile, lambda client: client.list_models())
             catalog = normalize_codex_model_catalog(result)
@@ -12176,6 +12319,8 @@ class ProvisionServer(ThreadingHTTPServer):
                 raise CodexAppServerError("model/list returned no visible models")
         except (StoreError, CodexAppServerError, OSError, json.JSONDecodeError) as exc:
             with self.app_server_model_catalog_lock:
+                if self.profile_auth_revision(profile) != revision:
+                    return
                 entry = self.app_server_model_catalog_cache.setdefault(profile, {})
                 entry["in_flight"] = False
                 entry["failed_monotonic"] = time.monotonic()
@@ -12184,6 +12329,8 @@ class ProvisionServer(ThreadingHTTPServer):
             self.mark_ui_dirty("profile_model_catalog")
             return
         with self.app_server_model_catalog_lock:
+            if self.profile_auth_revision(profile) != revision:
+                return
             entry = self.app_server_model_catalog_cache.setdefault(profile, {})
             entry.update(
                 {
@@ -12533,10 +12680,13 @@ class ProvisionServer(ThreadingHTTPServer):
         return True
 
     def refresh_app_server_rate_limit_payload(self, profile: str) -> dict[str, Any] | None:
+        revision = self.profile_auth_revision(profile)
         try:
             payload = self.read_app_server_rate_limit_payload_for_profile(profile)
         except Exception as exc:
             with self.app_server_rate_limit_lock:
+                if self.profile_auth_revision(profile) != revision:
+                    return None
                 entry = self.app_server_rate_limit_cache.setdefault(profile, {})
                 entry["in_flight"] = False
                 entry["failed_monotonic"] = time.monotonic()
@@ -12544,6 +12694,8 @@ class ProvisionServer(ThreadingHTTPServer):
             self.log_message("app-server rate-limit read for profile %s failed: %s", profile, exc)
             return None
         with self.app_server_rate_limit_lock:
+            if self.profile_auth_revision(profile) != revision:
+                return None
             entry = self.app_server_rate_limit_cache.setdefault(profile, {})
             entry["in_flight"] = False
             entry["checked_monotonic"] = time.monotonic()
@@ -12555,7 +12707,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 entry["fetched_at"] = datetime.now().astimezone()
         if isinstance(payload, dict) and not self.reset_credit_awaiting_usage_confirmation(profile):
             self.update_usage_cache_from_observation(
-                profile, payload, source="app_server_rate_limits"
+                profile, payload, source="app_server_rate_limits", auth_owner=revision
             )
             return payload
         if isinstance(payload, dict):
@@ -14516,7 +14668,9 @@ class Handler(BaseHTTPRequestHandler):
         profile = self.server.profile_for_session(session_key)
         if session and session_key and session.get("cwd"):
             with self.server.active_lock:
-                self.server.observe_session_locked(str(session_key), str(session["cwd"]), profile)
+                self.server.observe_session_locked(
+                    str(session_key), str(session["cwd"]), profile, runtime_cwd=True
+                )
         service_tier = None
         model_setting = self.server.profile_model_setting(profile)
         model = str(model_setting.get("model") or "")
@@ -14539,6 +14693,12 @@ class Handler(BaseHTTPRequestHandler):
                 body,
                 model=model,
                 reasoning_effort=reasoning_effort,
+                context=self.server.model_rewrite_context(
+                    profile,
+                    session_key,
+                    request_thread_id(body, self.headers.get(X_CODEX_TURN_METADATA_HEADER, "")),
+                ),
+                compact=parsed.path == "/v1/responses/compact",
             )
             if model_changed:
                 self.log_message(
@@ -14653,7 +14813,7 @@ class Handler(BaseHTTPRequestHandler):
                 ):
                     self.server.clear_profile_billing_required(profile)
                 if self.server.update_usage_cache_from_rate_limit_headers(
-                    profile, response.headers
+                    profile, response.headers, auth_owner=auth_payload_revision(auth)
                 ):
                     self.log_message(
                         "quota cache for profile %s updated from response headers",
@@ -14676,7 +14836,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 bytes_out = 0
                 while True:
-                    chunk = response.read(65536)
+                    chunk = response.read1(65536)
                     if not chunk:
                         break
                     bytes_out += len(chunk)
@@ -14701,7 +14861,9 @@ class Handler(BaseHTTPRequestHandler):
                     profile=profile,
                 )
             self.send_response(exc.code)
-            if self.server.update_usage_cache_from_rate_limit_headers(profile, exc.headers):
+            if self.server.update_usage_cache_from_rate_limit_headers(
+                profile, exc.headers, auth_owner=auth_payload_revision(auth)
+            ):
                 self.log_message(
                     "quota cache for profile %s updated from error response headers",
                     profile,
@@ -14772,7 +14934,9 @@ class Handler(BaseHTTPRequestHandler):
             self.server.attach_websocket_upstream(tunnel_id, upstream)
             self.server.clear_profile_billing_required(profile)
             self.log_message("websocket tunnel established for profile %s", profile)
-            self.relay_websocket(upstream, tunnel_id, profile)
+            self.relay_websocket(
+                upstream, tunnel_id, profile, auth_owner=auth_payload_revision(auth)
+            )
         except WebSocketHandshakeRejected as exc:
             self.log_message(
                 "websocket handshake rejected for profile %s: %s",
@@ -14980,6 +15144,7 @@ class Handler(BaseHTTPRequestHandler):
         if profile and self.server.update_usage_cache_from_rate_limit_headers(
             profile,
             raw_http_response_headers(response),
+            auth_owner=auth_payload_revision(auth),
         ):
             self.log_message(
                 "quota cache for profile %s updated from websocket handshake headers",
@@ -15033,7 +15198,14 @@ class Handler(BaseHTTPRequestHandler):
             raise OSError("upstream websocket handshake returned no response")
         return bytes(response)
 
-    def relay_websocket(self, upstream: socket.socket, tunnel_id: int, profile: str) -> None:
+    def relay_websocket(
+        self,
+        upstream: socket.socket,
+        tunnel_id: int,
+        profile: str,
+        *,
+        auth_owner: str | None = None,
+    ) -> None:
         downstream = self.connection
         upstream.settimeout(None)
         downstream.settimeout(None)
@@ -15081,12 +15253,31 @@ class Handler(BaseHTTPRequestHandler):
                             current_reasoning = str(
                                 current_model_setting.get("reasoning_effort") or ""
                             )
+                            with self.server.active_lock:
+                                tunnel = self.server.active_websockets.get(tunnel_id, {})
+                                rewrite_session_key = tunnel.get("session_key")
+                                rewrite_thread_id = websocket_message_thread_id(
+                                    opcode, payload
+                                ) or tunnel.get("thread_id")
+                            if not rewrite_session_key:
+                                metadata_session = response_create_payload_session(
+                                    websocket_message_json(opcode, payload)
+                                )
+                                rewrite_session_key = (
+                                    metadata_session.get("key") if metadata_session else None
+                                )
+                            context = self.server.model_rewrite_context(
+                                profile,
+                                rewrite_session_key,
+                                rewrite_thread_id,
+                            )
                             rewritten, _model, _reasoning, model_changed = (
                                 rewrite_model_websocket_message(
                                     opcode,
                                     rewritten,
                                     model=current_model,
                                     reasoning_effort=current_reasoning,
+                                    context=context,
                                 )
                             )
                             if model_changed:
@@ -15143,6 +15334,7 @@ class Handler(BaseHTTPRequestHandler):
                                 opcode,
                                 payload,
                                 service_tier=self.server.websocket_service_tier(tunnel_id),
+                                auth_owner=auth_owner,
                             ):
                                 self.log_message(
                                     "quota cache for profile %s updated from websocket event",
@@ -15234,9 +15426,25 @@ class Handler(BaseHTTPRequestHandler):
             self.headers.get("openai-project", ""),
             self.server.proxy_token,
         )
-        if from_header and from_header.get("key"):
-            return from_header
         from_body = request_body_session(body)
+        runtime_header = self.headers.get(X_CODEX_TURN_METADATA_HEADER, "")
+        if runtime_header:
+            from_body = (
+                response_create_payload_session(
+                    {
+                        "type": "response.create",
+                        "client_metadata": {X_CODEX_TURN_METADATA_HEADER: runtime_header},
+                    }
+                )
+                or from_body
+            )
+        if from_header and from_header.get("key"):
+            if from_body and from_body.get("cwd"):
+                return {"key": from_header["key"], "cwd": from_body["cwd"]}
+            with self.server.active_lock:
+                observed = self.server.observed_sessions.get(from_header["key"], {})
+                cwd = observed.get("runtime_cwd") or from_header["cwd"]
+            return {"key": from_header["key"], "cwd": str(cwd)}
         if from_body and from_body.get("key"):
             return from_body
         if (
@@ -15641,6 +15849,10 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(profile_catalog, list) and profile_catalog
             else model_catalog()
         )
+        if not any(isinstance(item, dict) and item.get("id") == current_model for item in catalog):
+            items.append(
+                '<div class="login-menu-note">The saved model is absent from the current catalog. Choose an available model below.</div>'
+            )
         for item in catalog:
             if not isinstance(item, dict):
                 continue

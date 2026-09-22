@@ -7725,6 +7725,7 @@ class StoreTests(unittest.TestCase):
 
     def test_usage_cache_reuses_recent_payload(self) -> None:
         server = ProvisionServer.__new__(ProvisionServer)
+        server.profile_auth_revision = lambda _profile: "test-owner"
         server.usage_cache = {}
         server.usage_cache_lock = threading.Lock()
         server.usage_refresh_lock = threading.Lock()

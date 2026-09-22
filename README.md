@@ -40,7 +40,7 @@ Provision is not currently published on PyPI. Install the current release from
 the versioned GitHub source with `pipx` (recommended for an isolated CLI):
 
 ```bash
-pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.153.4"
+pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.155.1"
 provision-codex doctor
 ```
 
@@ -89,12 +89,12 @@ its command, exit status, duration, and output:
 
 - Codex CLI `0.144.0` or newer is required for Codex's full dashboard,
   model picker, quota, and compatibility-reporting path.
-- Provision `0.153.4` has been reviewed against Codex CLI
-  `0.153.4`. Older Codex CLI versions remain supported through the documented
+- Provision `0.155.1` has been reviewed against Codex CLI
+  `0.155.1`. Older Codex CLI versions remain supported through the documented
   fallback paths where their capability surface is smaller.
 - Claude Code and Grok Build are optional local clients. Provision detects
   them on `PATH`; they retain their vendor-native login and network behavior.
-- With Codex CLI `0.153.4`, the bundled catalog includes GPT-6-Astra alongside
+- With Codex CLI `0.155.1`, the bundled catalog includes GPT-6-Astra alongside
   GPT-5.6-Sol, GPT-5.6-Terra, and GPT-5.6-Luna.
 - Python 3.11+ is recommended.
 - The richest quota display depends on Codex CLI and the ChatGPT backend
@@ -110,7 +110,7 @@ exact version, making the compatibility target clear in `provision --version`,
 package metadata, and the dashboard header.
 
 If a Provision-only maintenance release is needed for the same Codex target,
-it uses a PEP 440 post-release suffix such as `0.153.4.post1`. A newly reviewed
+it uses a PEP 440 post-release suffix such as `0.155.1.post1`. A newly reviewed
 Codex release advances the base Provision version. This convention identifies
 the reviewed target; it does not require every user to upgrade their local
 Codex CLI immediately.
@@ -201,6 +201,24 @@ provision --help
 provision help
 provision login --help
 ```
+
+## What’s New In 0.155.1
+
+- Keeps profile reasoning selections effective with Astra's in-history
+  configuration updates, including observed incremental HTTP/WebSocket turns.
+- Shows explicit included-usage denial or unknown availability even when quota
+  percentages look healthy, and keeps reserve aliases separate from normal quotas.
+- Follows native worktree moves while preserving the session's profile pin,
+  terminal controls, history, and resume choices through launcher heartbeats.
+- Invalidates account caches when credentials change and discards delayed reads
+  from the previous credentials. Temporary app-server credentials cannot replace
+  a newer profile login detected during the request.
+- Forwards HTTP stream events promptly, including streamed compaction progress.
+- Refreshes the fallback model picker and explains saved selections absent from
+  the current catalog. Updates Coverage to `7.16.1` and Ruff to `0.16.7`.
+
+See [the compatibility review](docs/codex-0.155.1-compatibility.md) for protocol
+scope, validation, and limitations.
 
 ## What’s New In 0.153.4
 

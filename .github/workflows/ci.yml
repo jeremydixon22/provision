@@ -37,6 +37,7 @@ jobs:
       - name: Type-check extracted boundaries
         run: >-
           mypy
+          src/provision/codex_compat.py
           src/provision/paths.py
           src/provision/daemon_host.py
           src/provision/daemon_logging.py

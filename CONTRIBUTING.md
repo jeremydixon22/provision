@@ -12,7 +12,7 @@ python3 -m venv .venv
 python -m pip install -e ".[dev]"
 ruff check src tests tools
 ruff format --check src tests tools
-mypy src/provision/paths.py src/provision/daemon_host.py \
+mypy src/provision/codex_compat.py src/provision/paths.py src/provision/daemon_host.py \
   src/provision/daemon_logging.py src/provision/providers.py \
   src/provision/proxy_policy.py \
   src/provision/permissions.py \

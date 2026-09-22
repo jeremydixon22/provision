@@ -3939,9 +3939,6 @@
 		        { id: "gpt-5.6-terra", display: "GPT-5.6-Terra", reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"] },
 		        { id: "gpt-5.6-luna", display: "GPT-5.6-Luna", reasoning: ["low", "medium", "high", "xhigh", "max"] },
 		        { id: "gpt-5.5", display: "GPT-5.5", reasoning: ["low", "medium", "high", "xhigh"] },
-		        { id: "gpt-5.4", display: "GPT-5.4", reasoning: ["low", "medium", "high", "xhigh"] },
-		        { id: "gpt-5.4-mini", display: "GPT-5.4-Mini", reasoning: ["low", "medium", "high", "xhigh"] },
-	        { id: "gpt-5.2", display: "GPT-5.2", reasoning: ["low", "medium", "high", "xhigh"] }
 	      ]);
 	    }
 
@@ -4119,7 +4116,9 @@
 		      const currentModel = String(setting.model || "gpt-6-astra");
 		      const currentReasoning = String(setting.reasoning_effort || (["gpt-6-astra", "gpt-5.6-sol"].includes(currentModel) ? "low" : "medium"));
 			      const label = `${currentModel.toLowerCase()} ${reasoningDisplay(currentReasoning)}`;
-	      const items = modelCatalog(profile).map((item) => {
+	      const catalog = modelCatalog(profile);
+	      const notice = catalog.some((item) => item.id === currentModel) ? "" : '<div class="login-menu-note">The saved model is absent from the current catalog. Choose an available model below.</div>';
+	      const items = catalog.map((item) => {
 	        const model = String(item.id || "");
 	        if (!model) return "";
 	        const display = String(item.display || model);
@@ -4154,7 +4153,7 @@
 	          <summary class="model-pill" title="Select model and reasoning effort">
 	            <span>${escapeHtml(label)}</span>
 	          </summary>
-	          <div class="model-menu-panel">${items}</div>
+	          <div class="model-menu-panel">${notice}${items}</div>
 	        </details>
 	      `;
 	    }

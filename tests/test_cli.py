@@ -19,7 +19,7 @@ class CliUsabilityTests(unittest.TestCase):
     def test_release_version_matches_the_reviewed_codex_target(self) -> None:
         release_base = re.sub(r"(?:\.post\d+|\.dev\d+|rc\d+)$", "", __version__)
         self.assertEqual(release_base, SUPPORTED_CODEX_CLI_VERSION)
-        self.assertEqual(SUPPORTED_CODEX_CLI_VERSION, "0.153.4")
+        self.assertEqual(SUPPORTED_CODEX_CLI_VERSION, "0.155.1")
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
         metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))
         self.assertEqual(metadata["project"]["version"], __version__)
