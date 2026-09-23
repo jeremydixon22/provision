@@ -4,6 +4,7 @@ import base64
 import http.client
 import json
 import os
+import re
 import select
 import shlex
 import shutil
@@ -35,6 +36,7 @@ from .daemon import (
     DEFAULT_DAEMON_HOST,
     PROTOCOL_VERSION,
     bridge_codex_history_into_app_home,
+    codex_cli_version_probe,
     daemon_host_is_loopback,
     daemon_running,
     daemon_url_host,
@@ -47,6 +49,7 @@ from .daemon_logging import (
     DAEMON_LOG_MAX_BYTES,
     rotate_daemon_log,
 )
+from .local_tls import codex_trust_bundle
 from .paths import Paths, default_codex_home, launcher_path, source_root
 from .permissions import PERMISSION_CONTROL_MAX_BYTES, PERMISSION_HOOK_SOCKET_ENV
 from .providers import ProviderError, provider_environment, provider_spec
@@ -128,9 +131,21 @@ def openai_base_url_override(port: int, host: str | None = None) -> str:
     return f"openai_base_url={toml_string(f'http://{daemon_url_host(host)}:{port}/v1')}"
 
 
-def chatgpt_base_url_override(port: int, proxy_token: str, host: str | None = None) -> str:
-    base_url = f"http://{daemon_url_host(host)}:{port}/backend-api/provision"
+def chatgpt_base_url_override(
+    port: int, proxy_token: str, host: str | None = None, *, secure: bool = True
+) -> str:
+    # Codex 0.156 validates this as an HTTPS workspace backend origin.
+    # The companion listener is always loopback, even when the ordinary daemon
+    # interface is explicitly bound beyond loopback.
+    scheme = "https" if secure else "http"
+    address = "127.0.0.1" if secure else daemon_url_host(host)
+    base_url = f"{scheme}://{address}:{port}/backend-api/provision"
     return f"chatgpt_base_url={toml_string(base_url)}"
+
+
+def codex_requires_https_workspace_backend(version: str | None) -> bool:
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", version or "") if isinstance(version, str) else None
+    return not match or tuple(map(int, match.groups())) >= (0, 156, 0)
 
 
 def provision_command() -> str:
@@ -788,6 +803,12 @@ def launch_codex(codex_args: list[str]) -> int:
     active_profile = store.active_profile()
     status = ensure_daemon(paths, configured_daemon_port(), configured_daemon_host())
     port = int(status["port"])
+    secure_backend = codex_requires_https_workspace_backend(
+        codex_cli_version_probe().get("version")
+    )
+    local_tls_port = status.get("local_tls_port") if secure_backend else port
+    if secure_backend and (not isinstance(local_tls_port, int) or local_tls_port <= 0):
+        raise RuntimeError("Provision's local HTTPS backend is unavailable; check the daemon log")
     host = str(status.get("host") or DEFAULT_DAEMON_HOST)
     proxy_token = store.proxy_token()
     cwd = os.getcwd()
@@ -797,7 +818,7 @@ def launch_codex(codex_args: list[str]) -> int:
         "-c",
         openai_base_url_override(port, host),
         "-c",
-        chatgpt_base_url_override(port, proxy_token, host),
+        chatgpt_base_url_override(int(local_tls_port), proxy_token, host, secure=secure_backend),
         "-c",
         f"model_provider={toml_string('openai')}",
     ]
@@ -809,6 +830,8 @@ def launch_codex(codex_args: list[str]) -> int:
         argv = ["codex", *provider_args, *codex_args]
     env = os.environ.copy()
     env["OPENAI_PROJECT"] = project_session_sentinel(proxy_token, cwd, session_key=session_key)
+    if secure_backend:
+        env["CODEX_CA_CERTIFICATE"] = str(codex_trust_bundle(paths, env))
     if should_use_pty(codex_args, bypass_commands=tuple(CODEX_PTY_BYPASS_COMMANDS)):
         return run_codex_pty(
             argv,

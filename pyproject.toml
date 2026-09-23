@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "provision"
-version = "0.155.1"
+version = "0.156.1"
 description = "Linux-native, local-first control plane and session dashboard for Codex CLI, Claude Code, and Grok Build"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,6 +37,8 @@ keywords = [
   "gpt-5.6-terra",
   "gpt-6",
   "gpt-6-astra",
+  "gpt-6-sol",
+  "gpt-6-luna",
   "grok",
   "grok-build",
   "linux",

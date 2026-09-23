@@ -13,7 +13,7 @@ python -m pip install -e ".[dev]"
 ruff check src tests tools
 ruff format --check src tests tools
 mypy src/provision/codex_compat.py src/provision/paths.py src/provision/daemon_host.py \
-  src/provision/daemon_logging.py src/provision/providers.py \
+  src/provision/daemon_logging.py src/provision/local_tls.py src/provision/providers.py \
   src/provision/proxy_policy.py \
   src/provision/permissions.py \
   src/provision/provider_sessions.py src/provision/ui_assets.py \
@@ -35,6 +35,7 @@ coverage report
 | Dashboard HTML, CSS, and JavaScript | `src/provision/ui/` |
 | Packaged dashboard assets | `src/provision/ui_assets.py` |
 | Host/bind policy and log rotation | `src/provision/daemon_host.py`, `src/provision/daemon_logging.py` |
+| Codex workspace backend HTTPS listener | `src/provision/local_tls.py` |
 | Bounded provider permission hook payloads | `src/provision/permissions.py` |
 | Proxy header, URL, and token-redaction policy | `src/provision/proxy_policy.py` |
 | Generic Connector ABI and dormant remote primitives | `src/provision/connector.py`, `src/provision/remote.py` |

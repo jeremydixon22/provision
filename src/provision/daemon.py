@@ -40,6 +40,7 @@ from .auth import (
     AuthError,
     ensure_fresh_chatgpt_auth,
     force_refresh_chatgpt_auth,
+    profile_auth_lock,
     upstream_auth_headers,
     upstream_base_url,
     upstream_chatgpt_backend_base_url,
@@ -47,8 +48,11 @@ from .auth import (
 from .codex_compat import (
     AccountScopedCache,
     ModelRewriteContext,
+    auth_material_fingerprint,
     auth_payload_revision,
     auth_revision,
+    read_json_object,
+    same_account_credential_update,
 )
 from .connector import (
     CONNECTOR_ABI_VERSION,
@@ -63,6 +67,7 @@ from .daemon_host import (
     normalize_daemon_host,
 )
 from .daemon_logging import configure_daemon_log_rotation
+from .local_tls import LoopbackTLSListener, ensure_loopback_certificate
 from .paths import Paths, default_codex_home, launcher_path
 from .permissions import (
     PERMISSION_CONTROL_MAX_BYTES,
@@ -116,12 +121,13 @@ CODEX_API_POST_PROXY_PATHS = frozenset(
     }
 )
 
-PROTOCOL_VERSION = 29
+PROTOCOL_VERSION = 30
 DEFAULT_DAEMON_PORT = 4888
 UI_SESSION_COOKIE = "provision_ui_session"
 CHATGPT_USAGE_PATH = "/wham/usage"
 CHATGPT_ANALYTICS_EVENTS_PATH = "/codex/analytics-events/events"
 USAGE_CACHE_MIN_INTERVAL_SECONDS = 1.0
+USAGE_CACHE_TTL_SECONDS = 300.0
 USAGE_CACHE_WAIT_SECONDS = 5.0
 USAGE_AUTO_REFRESH_SECONDS = 3600.0
 USAGE_AUTO_REFRESH_POLL_SECONDS = 30.0
@@ -406,6 +412,40 @@ DEFAULT_MODEL_CATALOG = [
                 "id": "priority",
                 "name": "Fast",
                 "description": "2x speed, increased usage",
+            },
+        ],
+        "additional_speed_tiers": ["fast"],
+    },
+    {
+        "id": "gpt-6-sol",
+        "display": "GPT-6-Sol",
+        "reasoning": list(FRONTIER_REASONING_LEVELS),
+        "default_reasoning": "medium",
+        "note": "Workhorse model for coding and everyday work. Requires Codex CLI 0.156.0 or newer.",
+        "minimal_client_version": "0.156.0",
+        "priority": 2,
+        "service_tiers": [
+            {
+                "id": "priority",
+                "name": "Fast",
+                "description": "1.5x speed, increased usage",
+            },
+        ],
+        "additional_speed_tiers": ["fast"],
+    },
+    {
+        "id": "gpt-6-luna",
+        "display": "GPT-6-Luna",
+        "reasoning": list(GPT_56_LUNA_REASONING_LEVELS),
+        "default_reasoning": "medium",
+        "note": "Fast and affordable model for easier tasks. Requires Codex CLI 0.156.0 or newer.",
+        "minimal_client_version": "0.156.0",
+        "priority": 3,
+        "service_tiers": [
+            {
+                "id": "priority",
+                "name": "Fast",
+                "description": "1.5x speed, increased usage",
             },
         ],
         "additional_speed_tiers": ["fast"],
@@ -6248,12 +6288,15 @@ def usage_refresh_due_at(
         return now
     fetched_at = fetched_at.astimezone()
 
-    due_times = [fetched_at + timedelta(seconds=USAGE_AUTO_REFRESH_SECONDS)]
+    # Passive observations and permission checks must not postpone the full
+    # usage read indefinitely.
+    usage_fetched_at = usage_entry_datetime(entry, "usage_fetched_at") or fetched_at
+    due_times = [usage_fetched_at + timedelta(seconds=USAGE_AUTO_REFRESH_SECONDS)]
     payload = entry.get("payload")
     if isinstance(payload, dict):
         for reset_at in usage_payload_reset_datetimes(payload, fetched_at):
             due_at = reset_at + timedelta(seconds=USAGE_RESET_REFRESH_DELAY_SECONDS)
-            if fetched_at < due_at:
+            if usage_fetched_at < due_at:
                 due_times.append(due_at)
     return min(due_times)
 
@@ -7186,6 +7229,8 @@ class ProvisionServer(ThreadingHTTPServer):
         self.paths = paths
         self.store = Store(paths)
         self.proxy_token = self.store.proxy_token()
+        self.local_tls_listener: LoopbackTLSListener | None = None
+        self.local_tls_error = ""
         # Browser controls use an ephemeral, process-local session. The durable
         # proxy capability remains available to the launcher and CLI, but is
         # never rendered into dashboard HTML or JavaScript.
@@ -7559,6 +7604,9 @@ class ProvisionServer(ThreadingHTTPServer):
         return self.connector_status()
 
     def server_close(self) -> None:
+        if self.local_tls_listener is not None:
+            self.local_tls_listener.close()
+            self.local_tls_listener = None
         self.release_permission_requests()
         self.stop_connector_hub()
         self.stop_remote_agent_api()
@@ -12029,13 +12077,24 @@ class ProvisionServer(ThreadingHTTPServer):
         with self.usage_cache_lock:
             entry = self.usage_cache.setdefault(profile, {})
             payload = entry.get("payload")
-            fetched_monotonic = entry.get("fetched_monotonic")
+            fetched_monotonic = entry.get("usage_fetched_monotonic", entry.get("fetched_monotonic"))
+            cache_seconds = USAGE_CACHE_MIN_INTERVAL_SECONDS if force else USAGE_CACHE_TTL_SECONDS
             if (
                 isinstance(payload, dict)
                 and isinstance(fetched_monotonic, (float, int))
-                and now - fetched_monotonic < USAGE_CACHE_MIN_INTERVAL_SECONDS
+                and now - fetched_monotonic < cache_seconds
             ):
                 return payload, entry.get("fetched_at"), "cached"
+            failed = entry.get("error_monotonic")
+            backoff = (
+                USAGE_AUTO_REFRESH_BILLING_BACKOFF_SECONDS
+                if entry.get("billing_required")
+                else USAGE_AUTO_REFRESH_ERROR_BACKOFF_SECONDS
+            )
+            if not force and isinstance(failed, (int, float)) and now - failed < backoff:
+                if isinstance(payload, dict):
+                    return payload, entry.get("fetched_at"), "stale"
+                raise AuthError(str(entry.get("error") or "usage refresh failed; retry later"))
             event = entry.get("event")
             if isinstance(event, threading.Event):
                 fetch_event = event
@@ -12084,6 +12143,7 @@ class ProvisionServer(ThreadingHTTPServer):
                 entry = self.usage_cache.setdefault(profile, {})
                 entry["error"] = str(exc)
                 entry["error_at"] = error_at
+                entry["error_monotonic"] = time.monotonic()
                 entry["billing_required"] = error_requires_billing(exc)
                 entry["event"] = None
                 stale_payload = entry.get("payload")
@@ -12112,8 +12172,11 @@ class ProvisionServer(ThreadingHTTPServer):
             entry["payload"] = payload
             entry["fetched_at"] = fetched_at
             entry["fetched_monotonic"] = time.monotonic()
+            entry["usage_fetched_at"] = fetched_at
+            entry["usage_fetched_monotonic"] = entry["fetched_monotonic"]
             entry["error"] = None
             entry.pop("error_at", None)
+            entry.pop("error_monotonic", None)
             entry.pop("billing_required", None)
             entry["event"] = None
             fetch_event.set()
@@ -12153,8 +12216,11 @@ class ProvisionServer(ThreadingHTTPServer):
             entry["payload"] = merge_usage_payload(entry.get("payload"), payload_update)
             entry["fetched_at"] = fetched_at
             entry["fetched_monotonic"] = time.monotonic()
+            if "ordinary_usage_allowed" in payload_update:
+                entry["ordinary_usage_checked_monotonic"] = entry["fetched_monotonic"]
             entry["error"] = None
             entry.pop("error_at", None)
+            entry.pop("error_monotonic", None)
             entry.pop("billing_required", None)
             entry["source"] = source
             current_payload = entry.get("payload")
@@ -12222,7 +12288,23 @@ class ProvisionServer(ThreadingHTTPServer):
     def usage_cache_snapshot(self, profile: str) -> dict[str, Any] | None:
         with self.usage_cache_lock:
             entry = self.usage_cache.get(profile)
-            return dict(entry) if entry else None
+            if not entry:
+                return None
+            snapshot = dict(entry)
+            checked = entry.get("ordinary_usage_checked_monotonic")
+            payload = entry.get("payload")
+            if (
+                isinstance(payload, dict)
+                and "ordinary_usage_allowed" in payload
+                and (
+                    not isinstance(checked, (int, float))
+                    or time.monotonic() - checked >= APP_SERVER_RATE_LIMIT_CACHE_SECONDS
+                )
+            ):
+                # Retain the last known answer internally, but do not present an
+                # expired permission as a current denial (or current approval).
+                snapshot["payload"] = {**payload, "ordinary_usage_allowed": None}
+            return snapshot
 
     def usage_payload_for_profile(
         self,
@@ -12254,6 +12336,7 @@ class ProvisionServer(ThreadingHTTPServer):
             auth_target = codex_home / "auth.json"
             shutil.copy2(auth_source, auth_target)
             auth_target.chmod(0o600)
+            starting_material = auth_material_fingerprint(read_json_object(auth_target))
             config = codex_home / "config.toml"
             config.write_text('cli_auth_credentials_store = "file"\n', encoding="utf-8")
             config.chmod(0o600)
@@ -12263,8 +12346,26 @@ class ProvisionServer(ThreadingHTTPServer):
                 result = callback(client)
             if self.profile_auth_revision(profile) != revision:
                 raise StoreError("profile credentials changed during app-server request; retry")
-            if auth_target.exists() and auth_revision(auth_target) != revision:
-                self.store.import_auth_file(profile, auth_target, overwrite=True, set_active=False)
+            refreshed_auth = read_json_object(auth_target)
+            refreshed_revision = (
+                auth_payload_revision(refreshed_auth) if isinstance(refreshed_auth, dict) else None
+            )
+            if refreshed_revision is not None and refreshed_revision != revision:
+                raise StoreError("profile credentials changed during app-server request; retry")
+            with profile_auth_lock(auth_source):
+                current_auth = read_json_object(auth_source)
+                if auth_payload_revision(current_auth) != revision:
+                    raise StoreError("profile credentials changed during app-server request; retry")
+                # Another refresh may have advanced the same account while this
+                # isolated client was running. Never roll those credentials back.
+                if auth_material_fingerprint(
+                    current_auth
+                ) == starting_material and same_account_credential_update(
+                    current_auth, refreshed_auth
+                ):
+                    self.store.import_auth_file(
+                        profile, auth_target, overwrite=True, set_active=False
+                    )
             return result
 
     def profile_model_catalog_snapshot(self, profile: str) -> dict[str, Any]:
@@ -12320,6 +12421,7 @@ class ProvisionServer(ThreadingHTTPServer):
         except (StoreError, CodexAppServerError, OSError, json.JSONDecodeError) as exc:
             with self.app_server_model_catalog_lock:
                 if self.profile_auth_revision(profile) != revision:
+                    self.app_server_model_catalog_cache.discard_stale(profile)
                     return
                 entry = self.app_server_model_catalog_cache.setdefault(profile, {})
                 entry["in_flight"] = False
@@ -12330,6 +12432,7 @@ class ProvisionServer(ThreadingHTTPServer):
             return
         with self.app_server_model_catalog_lock:
             if self.profile_auth_revision(profile) != revision:
+                self.app_server_model_catalog_cache.discard_stale(profile)
                 return
             entry = self.app_server_model_catalog_cache.setdefault(profile, {})
             entry.update(
@@ -12686,6 +12789,7 @@ class ProvisionServer(ThreadingHTTPServer):
         except Exception as exc:
             with self.app_server_rate_limit_lock:
                 if self.profile_auth_revision(profile) != revision:
+                    self.app_server_rate_limit_cache.discard_stale(profile)
                     return None
                 entry = self.app_server_rate_limit_cache.setdefault(profile, {})
                 entry["in_flight"] = False
@@ -12695,6 +12799,7 @@ class ProvisionServer(ThreadingHTTPServer):
             return None
         with self.app_server_rate_limit_lock:
             if self.profile_auth_revision(profile) != revision:
+                self.app_server_rate_limit_cache.discard_stale(profile)
                 return None
             entry = self.app_server_rate_limit_cache.setdefault(profile, {})
             entry["in_flight"] = False
@@ -13176,6 +13281,7 @@ class ProvisionServer(ThreadingHTTPServer):
             with self.usage_cache_lock:
                 entry = self.usage_cache.setdefault(profile, {})
                 entry.pop("fetched_monotonic", None)
+                entry.pop("usage_fetched_monotonic", None)
                 entry.pop("error", None)
             try:
                 self.usage_payload_for_profile(profile, force=True)
@@ -13367,6 +13473,20 @@ class ProvisionServer(ThreadingHTTPServer):
                 self.usage_payload_for_profile(profile, force=True)
             except Exception as exc:
                 self.log_message("usage auto-refresh for profile %s failed: %s", profile, exc)
+        # Permission has its own five-minute lifetime. Numeric observations can
+        # arrive continuously, so they cannot be the trigger for this read.
+        for profile in self.store.profile_names():
+            if self.usage_auto_refresh_stop.is_set():
+                return
+            entry = self.usage_cache_snapshot(profile)
+            if (
+                entry
+                and isinstance(entry.get("payload"), dict)
+                and not entry.get("billing_required")
+                and not self.profile_billing_required(profile).get("required")
+                and not self.profile_login_required(profile).get("required")
+            ):
+                self.schedule_app_server_rate_limit_refresh(profile)
 
     def usage_auto_refresh_loop(self) -> None:
         while not self.usage_auto_refresh_stop.is_set():
@@ -15504,6 +15624,12 @@ class Handler(BaseHTTPRequestHandler):
             "host": self.server.server_address[0],
             "port": self.server.server_address[1],
             "provision_protocol": PROTOCOL_VERSION,
+            "local_tls_port": (
+                listener.port
+                if (listener := getattr(self.server, "local_tls_listener", None))
+                else None
+            ),
+            "local_tls_error": getattr(self.server, "local_tls_error", ""),
             "codex": codex_compatibility_payload(),
             "default_provider": self.server.store.default_provider(),
             "active_profile": self.server.store.active_profile(required=False),
@@ -16294,14 +16420,19 @@ def serve(
             raise
         sys.stderr.write(f"default port {DEFAULT_DAEMON_PORT} unavailable; using a dynamic port\n")
         server = ProvisionServer((bind_host, 0), paths)
+    try:
+        _ca, cert, key = ensure_loopback_certificate(paths)
+        server.local_tls_listener = LoopbackTLSListener(server, cert, key, paths)
+    except (OSError, RuntimeError, ssl.SSLError) as exc:
+        server.local_tls_error = str(exc)
+        sys.stderr.write(f"local HTTPS backend unavailable: {exc}\n")
     write_state(paths, bind_host, server.server_address[1])
     server.start_usage_auto_refresh()
     try:
         server.serve_forever()
     finally:
         server.stop_usage_auto_refresh()
-        server.stop_connector_hub()
-        server.stop_remote_agent_api()
+        server.server_close()
 
 
 def read_state(paths: Paths) -> dict[str, Any] | None:

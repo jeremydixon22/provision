@@ -53,6 +53,7 @@ class Paths:
         self.state = self.home / "daemon.json"
         self.proxy_token = self.home / "proxy-token"
         self.log = self.home / "daemon.log"
+        self.local_tls = self.home / "loopback-tls"
 
     def ensure_base(self) -> None:
         for path in (

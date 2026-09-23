@@ -60,7 +60,8 @@ _refresh_locks: dict[Path, Lock] = {}
 _refresh_locks_guard = Lock()
 
 
-def _profile_lock(path: Path) -> Lock:
+def profile_auth_lock(path: Path) -> Lock:
+    """Serialize refreshes and conditional credential imports within this process."""
     resolved = path.resolve()
     with _refresh_locks_guard:
         lock = _refresh_locks.get(resolved)
@@ -330,7 +331,7 @@ def refresh_chatgpt_tokens(auth_path: Path, auth: dict[str, Any]) -> dict[str, A
 
 
 def ensure_fresh_chatgpt_auth(auth_path: Path) -> dict[str, Any]:
-    lock = _profile_lock(auth_path)
+    lock = profile_auth_lock(auth_path)
     with lock:
         auth = load_json(auth_path)
         if access_token_expired(auth):
@@ -339,7 +340,7 @@ def ensure_fresh_chatgpt_auth(auth_path: Path) -> dict[str, Any]:
 
 
 def force_refresh_chatgpt_auth(auth_path: Path) -> dict[str, Any]:
-    lock = _profile_lock(auth_path)
+    lock = profile_auth_lock(auth_path)
     with lock:
         return refresh_chatgpt_tokens(auth_path, load_json(auth_path))
 

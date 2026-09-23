@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import socket
 import tempfile
 import threading
+import time
 import unittest
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
 from provision import daemon
-from provision.codex_compat import ModelRewriteContext
+from provision.codex_compat import (
+    ModelRewriteContext,
+    auth_material_fingerprint,
+    auth_payload_revision,
+)
 from provision.paths import Paths
 from provision.store import Store, StoreError
 
@@ -119,6 +126,71 @@ class ReasoningCompatibilityTests(unittest.TestCase):
             self.assertEqual(result, message)
 
 
+class AccountRevisionTests(unittest.TestCase):
+    def test_same_account_token_rotation_keeps_revision_and_changes_fingerprint(self) -> None:
+        current = {
+            "last_refresh": "2026-09-21T00:00:00Z",
+            "tokens": {
+                "account_id": "acct_123",
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "id_token": "old-id",
+            },
+        }
+        refreshed = {
+            "last_refresh": "2026-09-22T00:00:00Z",
+            "tokens": {
+                "account_id": "acct_123",
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "id_token": "new-id",
+            },
+        }
+        self.assertEqual(auth_payload_revision(current), auth_payload_revision(refreshed))
+        self.assertNotEqual(
+            auth_material_fingerprint(current), auth_material_fingerprint(refreshed)
+        )
+        switched = {
+            "tokens": {
+                "account_id": "acct_other",
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+            }
+        }
+        self.assertNotEqual(auth_payload_revision(current), auth_payload_revision(switched))
+
+    def test_account_id_inside_the_id_token_survives_rotation(self) -> None:
+        def identity_token(account_id: str) -> str:
+            payload = json.dumps(
+                {"https://api.openai.com/auth": {"chatgpt_account_id": account_id}}
+            ).encode()
+            encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+            return f"header.{encoded}.sig"
+
+        current = {"tokens": {"id_token": identity_token("acct_jwt"), "access_token": "old"}}
+        refreshed = {"tokens": {"id_token": identity_token("acct_jwt"), "access_token": "new"}}
+        self.assertEqual(auth_payload_revision(current), auth_payload_revision(refreshed))
+        other = {"tokens": {"id_token": identity_token("acct_other"), "access_token": "new"}}
+        self.assertNotEqual(auth_payload_revision(current), auth_payload_revision(other))
+
+    def test_same_workspace_different_user_does_not_share_account_revision(self) -> None:
+        def auth(subject: str, expires: int) -> dict:
+            encoded = (
+                base64.urlsafe_b64encode(json.dumps({"sub": subject, "exp": expires}).encode())
+                .decode()
+                .rstrip("=")
+            )
+            return {"tokens": {"account_id": "shared-workspace", "id_token": f"h.{encoded}.s"}}
+
+        current = auth("first-user", 1000)
+        self.assertEqual(
+            auth_payload_revision(current), auth_payload_revision(auth("first-user", 2000))
+        )
+        self.assertNotEqual(
+            auth_payload_revision(current), auth_payload_revision(auth("second-user", 2000))
+        )
+
+
 class QuotaCompatibilityTests(unittest.TestCase):
     def test_permission_overrides_percentages_and_reset_in_every_presentation(self) -> None:
         for allowed, label in [(False, "Included usage blocked"), (None, "Availability unknown")]:
@@ -192,6 +264,30 @@ class ServerCompatibilityTests(unittest.TestCase):
     def replace_auth(self, owner: str, profile: str = "default") -> None:
         self.source.write_text(json.dumps({"OPENAI_API_KEY": "fake-" + owner}))
         self.store.import_auth_file(profile, self.source, overwrite=True)
+
+    def install_chatgpt(self, account_id: str, *, refresh: str = "refresh") -> None:
+        self.source.write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "account_id": account_id,
+                        "access_token": "access-" + refresh,
+                        "refresh_token": refresh,
+                        "id_token": "id-" + refresh,
+                    },
+                }
+            )
+        )
+        self.store.import_auth_file("default", self.source, overwrite=True)
+
+    def rotate_chatgpt_tokens(self) -> None:
+        path = self.store.auth_path("default")
+        auth = json.loads(path.read_text())
+        auth["tokens"]["access_token"] = "rotated-access"
+        auth["tokens"]["refresh_token"] = "rotated-refresh"
+        auth["last_refresh"] = "2026-09-22T12:00:00Z"
+        path.write_text(json.dumps(auth))
 
     def test_worktree_keeps_launcher_identity_pin_and_control_across_heartbeats(self) -> None:
         server = self.server
@@ -379,6 +475,298 @@ class ServerCompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(StoreError, "credentials changed"):
             self.server.cached_usage_payload("default", fetch)
         self.assertFalse(self.server.profile_login_required("default")["required"])
+
+    def test_same_account_token_rotation_does_not_reschedule_quota_reads(self) -> None:
+        self.install_chatgpt("acct_123")
+        revision = self.server.profile_auth_revision("default")
+        fetched_at = datetime.now().astimezone()
+        self.server.usage_cache["default"] = {
+            "payload": {"rate_limit": {"primary_window": {"used_percent": 10}}},
+            "fetched_at": fetched_at,
+            "fetched_monotonic": time.monotonic(),
+        }
+
+        class Client:
+            def __init__(self, *, env):
+                self.home = Path(env["CODEX_HOME"])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def callback(client):
+            auth_path = client.home / "auth.json"
+            auth = json.loads(auth_path.read_text())
+            auth["tokens"]["access_token"] = "rotated-access"
+            auth["tokens"]["refresh_token"] = "rotated-refresh"
+            auth["last_refresh"] = "2026-09-22T12:00:00Z"
+            auth_path.write_text(json.dumps(auth))
+            return {"ok": True}
+
+        with patch.object(daemon, "CodexAppServerClient", Client):
+            self.assertEqual(
+                self.server.run_app_server_for_profile("default", callback), {"ok": True}
+            )
+
+        stored = json.loads(self.store.auth_path("default").read_text())
+        self.assertEqual(stored["tokens"]["refresh_token"], "rotated-refresh")
+        self.assertEqual(self.server.profile_auth_revision("default"), revision)
+        snapshot = self.server.usage_cache_snapshot("default")
+        assert snapshot is not None
+        self.assertEqual(snapshot["payload"]["rate_limit"]["primary_window"]["used_percent"], 10)
+        self.assertNotIn("default", self.server.usage_auto_refresh_due_profiles())
+
+    def test_usage_fetch_keeps_same_account_refresh_instead_of_retrying(self) -> None:
+        self.install_chatgpt("acct_123")
+
+        def fetch():
+            self.rotate_chatgpt_tokens()
+            return {"rate_limit": {"primary_window": {"used_percent": 5}}}
+
+        with patch.object(self.server, "schedule_app_server_rate_limit_refresh"):
+            payload, _, state = self.server.cached_usage_payload("default", fetch)
+        self.assertEqual(state, "fresh")
+        self.assertEqual(payload["rate_limit"]["primary_window"]["used_percent"], 5)
+        self.assertNotIn("default", self.server.usage_auto_refresh_due_profiles())
+
+    def test_workspace_switch_still_discards_the_usage_fetch(self) -> None:
+        self.install_chatgpt("acct_a")
+
+        def fetch():
+            self.install_chatgpt("acct_b")
+            return {"ordinary_usage_allowed": True}
+
+        with self.assertRaisesRegex(StoreError, "credentials changed"):
+            self.server.cached_usage_payload("default", fetch)
+        self.assertIsNone(self.server.usage_cache_snapshot("default"))
+
+    def test_rate_limit_refresh_publishes_after_same_account_rotation(self) -> None:
+        self.install_chatgpt("acct_123")
+        self.server.usage_cache["default"] = {
+            "payload": {"rate_limit": {"primary_window": {"used_percent": 1}}},
+            "fetched_at": datetime.now().astimezone(),
+            "fetched_monotonic": time.monotonic(),
+        }
+
+        def read(_profile: str):
+            self.rotate_chatgpt_tokens()
+            return {
+                "ordinary_usage_allowed": False,
+                "rate_limit": {"primary_window": {"used_percent": 1}},
+            }
+
+        with patch.object(
+            self.server, "read_app_server_rate_limit_payload_for_profile", side_effect=read
+        ):
+            payload = self.server.refresh_app_server_rate_limit_payload("default")
+        assert payload is not None
+        self.assertIs(payload["ordinary_usage_allowed"], False)
+        cached = self.server.app_server_rate_limit_cache.get("default")
+        assert cached is not None
+        self.assertIs(cached["payload"]["ordinary_usage_allowed"], False)
+        self.assertFalse(cached.get("in_flight"))
+        self.assertFalse(self.server.app_server_rate_limit_refresh_due_locked("default"))
+        self.assertNotIn("default", self.server.usage_auto_refresh_due_profiles())
+
+    def test_app_server_does_not_import_a_different_account(self) -> None:
+        self.install_chatgpt("acct_123", refresh="original")
+
+        class Client:
+            def __init__(self, *, env):
+                self.home = Path(env["CODEX_HOME"])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def callback(client):
+            (client.home / "auth.json").write_text(json.dumps({"OPENAI_API_KEY": "other-account"}))
+            return {"models": []}
+
+        with (
+            patch.object(daemon, "CodexAppServerClient", Client),
+            self.assertRaisesRegex(StoreError, "credentials changed"),
+        ):
+            self.server.run_app_server_for_profile("default", callback)
+        stored = json.loads(self.store.auth_path("default").read_text())
+        self.assertEqual(stored["tokens"]["account_id"], "acct_123")
+        self.assertEqual(stored["tokens"]["refresh_token"], "original")
+
+    def test_temporary_credentials_cannot_roll_back_a_same_account_refresh(self) -> None:
+        class Client:
+            def __init__(self, *, env):
+                self.home = Path(env["CODEX_HOME"])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        for temp_refreshed in (False, True):
+            with self.subTest(temp_refreshed=temp_refreshed):
+                self.install_chatgpt("acct_123", refresh="original")
+
+                def callback(client):
+                    self.rotate_chatgpt_tokens()
+                    if temp_refreshed:
+                        path = client.home / "auth.json"
+                        auth = json.loads(path.read_text())
+                        auth["tokens"]["refresh_token"] = "older-temporary-refresh"
+                        path.write_text(json.dumps(auth))
+                    return {"ok": True}
+
+                with patch.object(daemon, "CodexAppServerClient", Client):
+                    self.assertEqual(
+                        self.server.run_app_server_for_profile("default", callback), {"ok": True}
+                    )
+                stored = json.loads(self.store.auth_path("default").read_text())
+                self.assertEqual(stored["tokens"]["refresh_token"], "rotated-refresh")
+
+    def test_repeated_native_usage_polls_share_a_five_minute_read(self) -> None:
+        with (
+            patch.object(daemon.time, "monotonic", return_value=1000) as clock,
+            patch.object(self.server, "wait_for_usage_refresh_slot"),
+            patch.object(self.server, "schedule_app_server_rate_limit_refresh"),
+            patch.object(
+                self.server, "fetch_usage_payload_uncached", return_value={"rate_limit": {}}
+            ) as fetch,
+        ):
+            self.assertEqual(self.server.usage_payload_for_profile("default")[2], "fresh")
+            for elapsed in range(5, 300, 5):
+                clock.return_value = 1000 + elapsed
+                self.assertEqual(self.server.usage_payload_for_profile("default")[2], "cached")
+            fetch.assert_called_once_with("default")
+            clock.return_value = 1300
+            self.assertEqual(self.server.usage_payload_for_profile("default")[2], "fresh")
+            self.assertEqual(fetch.call_count, 2)
+            clock.return_value = 1305
+            self.assertEqual(
+                self.server.usage_payload_for_profile("default", force=True)[2], "fresh"
+            )
+            self.assertEqual(fetch.call_count, 3)
+            self.assertEqual(
+                self.server.usage_payload_for_profile("default", force=True)[2], "cached"
+            )
+
+    def test_native_usage_polls_back_off_after_errors_but_manual_refresh_can_retry(self) -> None:
+        for stale in (False, True):
+            with self.subTest(stale=stale):
+                self.server.usage_cache.clear()
+                if stale:
+                    self.server.usage_cache["default"] = {"payload": {"rate_limit": {}}}
+                with (
+                    patch.object(daemon.time, "monotonic", return_value=1000) as clock,
+                    patch.object(self.server, "wait_for_usage_refresh_slot"),
+                    patch.object(self.server, "schedule_app_server_rate_limit_refresh"),
+                    patch.object(
+                        self.server,
+                        "fetch_usage_payload_uncached",
+                        side_effect=daemon.AuthError("temporary quota failure"),
+                    ) as fetch,
+                ):
+                    for when in (1000, 1006, 1012, 1299):
+                        clock.return_value = when
+                        if stale:
+                            self.assertEqual(
+                                self.server.usage_payload_for_profile("default")[2], "stale"
+                            )
+                        else:
+                            with self.assertRaisesRegex(daemon.AuthError, "temporary quota"):
+                                self.server.usage_payload_for_profile("default")
+                    self.assertEqual(fetch.call_count, 1)
+                    fetch.side_effect = None
+                    fetch.return_value = {"rate_limit": {"allowed": True}}
+                    self.assertEqual(
+                        self.server.usage_payload_for_profile("default", force=True)[2], "fresh"
+                    )
+                    self.assertEqual(fetch.call_count, 2)
+
+    def test_percentage_updates_cannot_renew_permission_freshness(self) -> None:
+        for allowed in (False, True):
+            with (
+                self.subTest(allowed=allowed),
+                patch.object(daemon.time, "monotonic", return_value=1000) as clock,
+                patch.object(self.server, "wait_for_usage_refresh_slot"),
+                patch.object(self.server, "schedule_app_server_rate_limit_refresh"),
+            ):
+                self.server.update_usage_cache_from_observation(
+                    "default", {"ordinary_usage_allowed": allowed}, source="app_server_rate_limits"
+                )
+                clock.return_value = 1299
+                self.server.update_usage_cache_from_observation(
+                    "default",
+                    {"rate_limit": {"primary_window": {"used_percent": 1}}},
+                    source="websocket_event",
+                )
+                self.assertIs(
+                    self.server.usage_cache_snapshot("default")["payload"][
+                        "ordinary_usage_allowed"
+                    ],
+                    allowed,
+                )
+                clock.return_value = 1301
+                self.server.cached_usage_payload(
+                    "default", lambda: {"rate_limit": {"allowed": True}}, force=True
+                )
+                snapshot = self.server.usage_cache_snapshot("default")
+                self.assertIsNone(snapshot["payload"]["ordinary_usage_allowed"])
+                self.assertIn("Availability unknown", daemon.usage_cache_summary(snapshot))
+                self.assertIs(
+                    self.server.usage_cache["default"]["payload"]["ordinary_usage_allowed"], allowed
+                )
+                self.server.update_usage_cache_from_observation(
+                    "default", {"ordinary_usage_allowed": True}, source="app_server_rate_limits"
+                )
+                self.assertIs(
+                    self.server.usage_cache_snapshot("default")["payload"][
+                        "ordinary_usage_allowed"
+                    ],
+                    True,
+                )
+
+    def test_background_permission_refresh_does_not_wait_for_hourly_usage_read(self) -> None:
+        self.server.usage_cache["default"] = {
+            "payload": {"ordinary_usage_allowed": False},
+            "fetched_at": datetime.now().astimezone(),
+        }
+        with (
+            patch.object(self.server, "usage_payload_for_profile") as fetch,
+            patch.object(self.server, "schedule_app_server_rate_limit_refresh") as schedule,
+        ):
+            self.server.refresh_due_usage_profiles()
+            fetch.assert_not_called()
+            schedule.assert_called_once_with("default")
+
+    def test_permission_scheduler_preserves_success_and_failure_backoff(self) -> None:
+        with (
+            patch.object(daemon.time, "monotonic", return_value=1000) as clock,
+            patch.object(daemon.threading, "Thread") as worker,
+        ):
+            self.server.app_server_rate_limit_cache["default"] = {"fetched_monotonic": 1000}
+            self.assertFalse(self.server.schedule_app_server_rate_limit_refresh("default"))
+            clock.return_value = 1301
+            self.assertTrue(self.server.schedule_app_server_rate_limit_refresh("default"))
+            self.assertFalse(self.server.schedule_app_server_rate_limit_refresh("default"))
+            worker.assert_called_once()
+            self.server.app_server_rate_limit_cache["default"] = {"failed_monotonic": 1301}
+            clock.return_value = 1602
+            self.assertFalse(self.server.schedule_app_server_rate_limit_refresh("default"))
+            clock.return_value = 2202
+            self.assertTrue(self.server.schedule_app_server_rate_limit_refresh("default"))
+
+    def test_permission_observations_do_not_postpone_full_usage_refresh(self) -> None:
+        now = datetime.now().astimezone()
+        entry = {
+            "usage_fetched_at": now - timedelta(minutes=61),
+            "fetched_at": now,
+            "payload": {"ordinary_usage_allowed": True},
+        }
+        self.assertLessEqual(daemon.usage_refresh_due_at(entry, now), now)
 
     def test_percentage_fetch_does_not_clear_backend_denial(self) -> None:
         self.server.usage_cache["default"] = {

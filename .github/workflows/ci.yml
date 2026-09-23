@@ -41,6 +41,7 @@ jobs:
           src/provision/paths.py
           src/provision/daemon_host.py
           src/provision/daemon_logging.py
+          src/provision/local_tls.py
           src/provision/proxy_policy.py
           src/provision/providers.py
           src/provision/provider_sessions.py

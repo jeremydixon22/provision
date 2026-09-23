@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import threading
@@ -9,25 +10,119 @@ from collections.abc import Callable, Iterator, MutableMapping
 from pathlib import Path
 from typing import Any
 
+_REFRESH_BOOKKEEPING = frozenset({"last_refresh", "last_refresh_failed_at", "last_refresh_error"})
+_ROTATING_TOKEN_FIELDS = frozenset({"access_token", "refresh_token", "id_token"})
+_AUTH_CLAIMS_KEY = "https://api.openai.com/auth"
 
-def auth_revision(path: Path) -> str:
-    """Opaque credential generation, including replacement of the same account."""
+
+def read_json_object(path: Path) -> Any:
     try:
         value = json.loads(path.read_bytes())
     except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def auth_revision(path: Path) -> str:
+    """Account generation. A token refresh for that same account stays stable."""
+    value = read_json_object(path)
+    if value is None:
         return "unavailable"
     return auth_payload_revision(value)
 
 
 def auth_payload_revision(value: Any) -> str:
-    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+    """Identity of the account, ignoring rotated tokens and refresh timestamps."""
+    return _auth_digest(auth_account_identity(value))
+
+
+def auth_material_fingerprint(value: Any) -> str:
+    """Full credential fingerprint, including rotated tokens."""
+    return _auth_digest(value)
+
+
+def auth_account_identity(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    identity = {
+        key: item
+        for key, item in value.items()
+        if key not in _REFRESH_BOOKKEEPING and key != "tokens"
+    }
+    tokens = value.get("tokens")
+    if not isinstance(tokens, dict):
+        return identity
+    account_id = _token_account_id(tokens)
+    if not account_id:
+        identity["tokens"] = tokens
+        return identity
+    stable = {key: item for key, item in tokens.items() if key not in _ROTATING_TOKEN_FIELDS}
+    stable["account_id"] = account_id
+    # A workspace can contain multiple users. Keep their caches separate even
+    # when tokens.account_id names the same workspace.
+    for key in ("id_token", "access_token"):
+        subject = _jwt_claims(tokens.get(key)).get("sub")
+        if isinstance(subject, str) and subject:
+            stable["subject"] = subject
+            break
+    identity["tokens"] = stable
+    return identity
+
+
+def same_account_credential_update(current: Any, refreshed: Any) -> bool:
+    """True when refreshed tokens belong to the same account and differ."""
+    if not isinstance(current, dict) or not isinstance(refreshed, dict):
+        return False
+    if auth_payload_revision(refreshed) != auth_payload_revision(current):
+        return False
+    return auth_material_fingerprint(refreshed) != auth_material_fingerprint(current)
+
+
+def _auth_digest(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _token_account_id(tokens: dict[str, Any]) -> str | None:
+    account_id = tokens.get("account_id")
+    if isinstance(account_id, str) and account_id:
+        return account_id
+    for key in ("id_token", "access_token"):
+        found = _jwt_claim_account_id(tokens.get(key))
+        if found:
+            return found
+    return None
+
+
+def _jwt_claims(token: Any) -> dict[str, Any]:
+    if not isinstance(token, str) or token.count(".") < 2:
+        return {}
+    try:
+        segment = token.split(".", 2)[1]
+        padded = segment + "=" * (-len(segment) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except (ValueError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def _jwt_claim_account_id(token: Any) -> str | None:
+    nested = _jwt_claims(token).get(_AUTH_CLAIMS_KEY)
+    if not isinstance(nested, dict):
+        return None
+    for key in ("chatgpt_account_id", "account_id"):
+        found = nested.get(key)
+        if isinstance(found, str) and found:
+            return found
+    return None
 
 
 class AccountScopedCache(MutableMapping[str, dict[str, Any]]):
-    """Invalidate profile entries when credentials change; callers own locking.
+    """Invalidate profile entries when the account changes; callers own locking.
 
-    Ownership stays outside entries so it cannot leak into dashboard snapshots.
-    Workers must also compare their captured revision before publishing results.
+    Token refresh for the same account keeps the entry. Ownership stays outside
+    entries so it cannot leak into dashboard snapshots. Workers must also compare
+    their captured revision before publishing results.
     """
 
     def __init__(self, revision: Callable[[str], str]) -> None:
@@ -35,10 +130,14 @@ class AccountScopedCache(MutableMapping[str, dict[str, Any]]):
         self._entries: dict[str, dict[str, Any]] = {}
         self._owners: dict[str, str] = {}
 
-    def __getitem__(self, key: str) -> dict[str, Any]:
+    def discard_stale(self, key: str) -> None:
+        """Remove a profile entry after its account changes."""
         if self._owners.get(key) != self._revision(key):
             self._entries.pop(key, None)
             self._owners.pop(key, None)
+
+    def __getitem__(self, key: str) -> dict[str, Any]:
+        self.discard_stale(key)
         return self._entries[key]
 
     def __setitem__(self, key: str, value: dict[str, Any]) -> None:

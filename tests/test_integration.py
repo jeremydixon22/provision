@@ -95,6 +95,7 @@ from provision.daemon_host import daemon_bind_address
 from provision.daemon_logging import RotatingDaemonLog
 from provision.launcher import (
     chatgpt_base_url_override,
+    codex_requires_https_workspace_backend,
     configured_daemon_host,
     configured_daemon_port,
     openai_base_url_override,
@@ -1207,11 +1208,20 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             backend_upstream_path("/backend-api/provision-wrong/wham/usage", "tok_123")
 
-    def test_chatgpt_base_url_override_uses_local_backend_path(self) -> None:
+    def test_chatgpt_base_url_override_uses_local_https_backend_path(self) -> None:
         self.assertEqual(
             chatgpt_base_url_override(12345, "tok_123"),
+            'chatgpt_base_url="https://127.0.0.1:12345/backend-api/provision"',
+        )
+        self.assertEqual(
+            chatgpt_base_url_override(12345, "tok_123", secure=False),
             'chatgpt_base_url="http://127.0.0.1:12345/backend-api/provision"',
         )
+
+    def test_codex_https_backend_is_required_from_01560(self) -> None:
+        self.assertFalse(codex_requires_https_workspace_backend("0.155.1"))
+        self.assertTrue(codex_requires_https_workspace_backend("0.156.0"))
+        self.assertTrue(codex_requires_https_workspace_backend("0.156.1"))
 
     def test_daemon_url_host_rewrites_wildcard_bind_for_local_clients(self) -> None:
         self.assertEqual(daemon_url_host("0.0.0.0"), "127.0.0.1")
@@ -2080,7 +2090,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(catalog[0]["default_reasoning"], "future")
         self.assertEqual(catalog[0]["reasoning"], ["future", "max"])
 
-    def test_default_model_catalog_tracks_codex_cli_01534_models(self) -> None:
+    def test_default_model_catalog_tracks_codex_cli_01561_models(self) -> None:
         fallback = {item["id"]: item for item in daemon_module.DEFAULT_MODEL_CATALOG}
 
         self.assertEqual(daemon_module.DEFAULT_MODEL_ID, "gpt-6-astra")
@@ -2090,6 +2100,16 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(
             fallback["gpt-6-astra"]["service_tiers"][0]["description"],
             "2x speed, increased usage",
+        )
+        self.assertEqual(fallback["gpt-6-sol"]["default_reasoning"], "medium")
+        self.assertIn("ultra", fallback["gpt-6-sol"]["reasoning"])
+        self.assertEqual(fallback["gpt-6-sol"]["minimal_client_version"], "0.156.0")
+        self.assertEqual(fallback["gpt-6-luna"]["default_reasoning"], "medium")
+        self.assertIn("max", fallback["gpt-6-luna"]["reasoning"])
+        self.assertNotIn("ultra", fallback["gpt-6-luna"]["reasoning"])
+        self.assertEqual(
+            fallback["gpt-6-luna"]["service_tiers"][0]["description"],
+            "1.5x speed, increased usage",
         )
         self.assertEqual(fallback["gpt-5.6-sol"]["default_reasoning"], "low")
         self.assertIn("max", fallback["gpt-5.6-sol"]["reasoning"])

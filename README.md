@@ -40,7 +40,7 @@ Provision is not currently published on PyPI. Install the current release from
 the versioned GitHub source with `pipx` (recommended for an isolated CLI):
 
 ```bash
-pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.155.1"
+pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.156.1"
 provision-codex doctor
 ```
 
@@ -89,14 +89,21 @@ its command, exit status, duration, and output:
 
 - Codex CLI `0.144.0` or newer is required for Codex's full dashboard,
   model picker, quota, and compatibility-reporting path.
-- Provision `0.155.1` has been reviewed against Codex CLI
-  `0.155.1`. Older Codex CLI versions remain supported through the documented
+- Provision `0.156.1` has been reviewed against Codex CLI
+  `0.156.1`. Older Codex CLI versions remain supported through the documented
   fallback paths where their capability surface is smaller.
 - Claude Code and Grok Build are optional local clients. Provision detects
   them on `PATH`; they retain their vendor-native login and network behavior.
-- With Codex CLI `0.155.1`, the bundled catalog includes GPT-6-Astra alongside
-  GPT-5.6-Sol, GPT-5.6-Terra, and GPT-5.6-Luna.
+- With Codex CLI `0.156.1`, the bundled catalog includes GPT-6-Astra,
+  GPT-6-Sol, and GPT-6-Luna alongside the GPT-5.6 models. Provision's
+  degraded-mode picker also includes the new models.
 - Python 3.11+ is recommended.
+- OpenSSL is needed to create Provision's private loopback HTTPS certificate
+  for Codex CLI 0.156.0 and newer. Provision adds that CA only to the Codex
+  processes it launches; system trust settings are unchanged. The server
+  certificate lasts ten years and renews under the same private CA when fewer
+  than 120 days remain. The daemon checks hourly and at startup, so each daemon
+  start has more than three months of certificate validity.
 - The richest quota display depends on Codex CLI and the ChatGPT backend
   reporting multi-bucket usage data. Older Codex CLI versions may still route
   model traffic through Provision through fallback behavior, but model metadata,
@@ -201,6 +208,24 @@ provision --help
 provision help
 provision login --help
 ```
+
+## What’s New In 0.156.1
+
+- Reduces native quota polling with a five-minute ordinary usage cache and
+  backs off after failed reads. Manual refresh remains available.
+- Refreshes included-usage permission independently from percentages and shows
+  unknown availability when a permission check is older than five minutes.
+- Keeps account caches through same-account token rotation and protects newer
+  credentials from older temporary app-server refreshes.
+- Adds GPT-6-Sol and GPT-6-Luna to the fallback model picker; live Codex catalog
+  discovery remains authoritative for availability.
+- Serves Codex's workspace backend through a private HTTPS listener on
+  `127.0.0.1`. This restores TUI bootstrap under Codex 0.156.1 while preserving
+  Provision's per-profile account routing.
+
+See [the 0.156.1 compatibility and quota review](docs/codex-0.156.1-quota-review.md)
+for validation and remaining protocol limits. Restart the Provision daemon after
+upgrading to load the new polling behavior.
 
 ## What’s New In 0.155.1
 
