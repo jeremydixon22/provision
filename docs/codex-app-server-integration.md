@@ -2,9 +2,9 @@
 
 Provision currently uses Codex CLI's normal TUI/exec surfaces and observes the
 traffic that Codex CLI sends through Provision's local proxy. The reviewed Codex
-CLI `0.156.1` schema exposes all 34 app-server capability methods Provision
+CLI `0.159.2` schema exposes all 34 app-server capability methods Provision
 probes. Its bundled model catalog supplements Provision's traffic parsing.
-See the [0.156.1 compatibility and quota review](codex-0.156.1-quota-review.md)
+See the [0.159.2 compatibility review](codex-0.159.2-compatibility-review.md)
 for the latest changes and implemented safeguards.
 
 The optional standalone `RateLimitResetCreditsSummary` schema is absent from

@@ -40,7 +40,7 @@ Provision is not currently published on PyPI. Install the current release from
 the versioned GitHub source with `pipx` (recommended for an isolated CLI):
 
 ```bash
-pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.156.1"
+pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.159.2"
 provision-codex doctor
 ```
 
@@ -89,14 +89,14 @@ its command, exit status, duration, and output:
 
 - Codex CLI `0.144.0` or newer is required for Codex's full dashboard,
   model picker, quota, and compatibility-reporting path.
-- Provision `0.156.1` has been reviewed against Codex CLI
-  `0.156.1`. Older Codex CLI versions remain supported through the documented
+- Provision `0.159.2` has been reviewed against Codex CLI
+  `0.159.2`. Older Codex CLI versions remain supported through the documented
   fallback paths where their capability surface is smaller.
 - Claude Code and Grok Build are optional local clients. Provision detects
   them on `PATH`; they retain their vendor-native login and network behavior.
-- With Codex CLI `0.156.1`, the bundled catalog includes GPT-6-Astra,
-  GPT-6-Sol, and GPT-6-Luna alongside the GPT-5.6 models. Provision's
-  degraded-mode picker also includes the new models.
+- With Codex CLI `0.159.2`, the bundled catalog includes GPT-6.1-Sol,
+  GPT-6-Astra, GPT-6-Sol, and GPT-6-Luna alongside the GPT-5.6 models.
+  Provision's degraded-mode picker includes them too.
 - Python 3.11+ is recommended.
 - OpenSSL is needed to create Provision's private loopback HTTPS certificate
   for Codex CLI 0.156.0 and newer. Provision adds that CA only to the Codex
@@ -208,6 +208,29 @@ provision --help
 provision help
 provision login --help
 ```
+
+## What’s New In 0.159.2
+
+- The dashboard wordmark uses a 166 × 33 px topbar footprint, including on
+  narrow screens.
+- Codex 0.157+ can attach interactive sessions to a shared app-server whose
+  startup environment is unrelated to a Provision launch. Provision-managed
+  TUI, resume, and fork sessions now use Codex's `--no-daemon` mode so their
+  HTTPS trust bundle and session routing stay scoped to that launch.
+- The fallback model picker includes GPT-6.1 Sol with its low default effort
+  and Fast-tier metadata from Codex 0.159.2. Profiles without a saved model or
+  explicit stock Codex model now follow the bundled catalog's top priority,
+  matching Codex's new GPT-6.1 Sol default. An unavailable catalog retains
+  Provision's existing Astra fallback.
+- Codex TUI quota requests, including `/status`, use a one-second minimum cache
+  interval so an explicit check can show current usage. Provision's own full
+  usage refresh keeps its hourly schedule, with reset verification as needed.
+  Codex's periodic requests use the same endpoint and may still cause frequent
+  upstream reads near quota exhaustion.
+
+See [the 0.159.2 compatibility review](docs/codex-0.159.2-compatibility-review.md)
+for validation and remaining protocol limits. Restart the Provision daemon
+after upgrading to load the new behavior.
 
 ## What’s New In 0.156.1
 

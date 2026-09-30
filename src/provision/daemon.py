@@ -400,13 +400,30 @@ APP_SERVER_RATE_LIMIT_CACHE_SECONDS = 300.0
 APP_SERVER_RATE_LIMIT_FAILURE_BACKOFF_SECONDS = 900.0
 DEFAULT_MODEL_CATALOG = [
     {
+        "id": "gpt-6.1-sol",
+        "display": "GPT-6.1-Sol",
+        "reasoning": list(FRONTIER_REASONING_LEVELS),
+        "default_reasoning": "low",
+        "note": "Latest workhorse model for coding and everyday work. Requires Codex CLI 0.159.1 or newer.",
+        "minimal_client_version": "0.159.1",
+        "priority": 1,
+        "service_tiers": [
+            {
+                "id": "priority",
+                "name": "Fast",
+                "description": "2x speed, increased usage",
+            },
+        ],
+        "additional_speed_tiers": ["fast"],
+    },
+    {
         "id": "gpt-6-astra",
         "display": "GPT-6-Astra",
         "reasoning": list(FRONTIER_REASONING_LEVELS),
         "default_reasoning": "low",
         "note": "Latest frontier agentic coding model. Requires Codex CLI 0.153.1 or newer.",
         "minimal_client_version": "0.153.1",
-        "priority": 1,
+        "priority": 2,
         "service_tiers": [
             {
                 "id": "priority",
@@ -423,7 +440,7 @@ DEFAULT_MODEL_CATALOG = [
         "default_reasoning": "medium",
         "note": "Workhorse model for coding and everyday work. Requires Codex CLI 0.156.0 or newer.",
         "minimal_client_version": "0.156.0",
-        "priority": 2,
+        "priority": 3,
         "service_tiers": [
             {
                 "id": "priority",
@@ -440,7 +457,7 @@ DEFAULT_MODEL_CATALOG = [
         "default_reasoning": "medium",
         "note": "Fast and affordable model for easier tasks. Requires Codex CLI 0.156.0 or newer.",
         "minimal_client_version": "0.156.0",
-        "priority": 3,
+        "priority": 4,
         "service_tiers": [
             {
                 "id": "priority",
@@ -2157,7 +2174,15 @@ def model_catalog_entry(model: str | None) -> dict[str, Any] | None:
 
 
 def default_model_from_catalog() -> str:
-    for item in load_codex_model_catalog():
+    # Codex's bundled JSON is not ordered by its model picker priority. Use
+    # that priority for a profile without an explicit model in stock config.
+    if not codex_model_catalog_probe().get("available"):
+        return DEFAULT_MODEL_ID
+    catalog = sorted(
+        load_codex_model_catalog(),
+        key=lambda item: item.get("priority") if isinstance(item.get("priority"), int) else 9999,
+    )
+    for item in catalog:
         if not isinstance(item, dict):
             continue
         model = sanitize_model_id(item.get("id"))
@@ -14892,7 +14917,12 @@ class Handler(BaseHTTPRequestHandler):
         self.monitor_analytics_events(route, method, upstream_path, body)
         if self.should_label_usage_request(route, method, upstream_path):
             try:
-                payload, updated_at, cache_state = self.usage_payload_for_profile(profile)
+                # Codex uses this same request for /status and its background
+                # poller. The request has no origin marker, so a long cache here
+                # would make an explicit /status read stale.
+                payload, updated_at, cache_state = self.usage_payload_for_profile(
+                    profile, force=True
+                )
                 labeled = self.label_usage_payload_for_profile(payload, profile, updated_at)
             except (
                 AuthError,

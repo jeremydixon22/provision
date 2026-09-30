@@ -2090,10 +2090,17 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(catalog[0]["default_reasoning"], "future")
         self.assertEqual(catalog[0]["reasoning"], ["future", "max"])
 
-    def test_default_model_catalog_tracks_codex_cli_01561_models(self) -> None:
+    def test_default_model_catalog_tracks_codex_cli_models(self) -> None:
         fallback = {item["id"]: item for item in daemon_module.DEFAULT_MODEL_CATALOG}
 
         self.assertEqual(daemon_module.DEFAULT_MODEL_ID, "gpt-6-astra")
+        self.assertEqual(fallback["gpt-6.1-sol"]["default_reasoning"], "low")
+        self.assertIn("ultra", fallback["gpt-6.1-sol"]["reasoning"])
+        self.assertEqual(fallback["gpt-6.1-sol"]["minimal_client_version"], "0.159.1")
+        self.assertEqual(
+            fallback["gpt-6.1-sol"]["service_tiers"][0]["description"],
+            "2x speed, increased usage",
+        )
         self.assertEqual(fallback["gpt-6-astra"]["default_reasoning"], "low")
         self.assertIn("ultra", fallback["gpt-6-astra"]["reasoning"])
         self.assertEqual(fallback["gpt-6-astra"]["minimal_client_version"], "0.153.1")
@@ -2118,6 +2125,24 @@ class StoreTests(unittest.TestCase):
         self.assertIn("max", fallback["gpt-5.6-luna"]["reasoning"])
         self.assertNotIn("ultra", fallback["gpt-5.6-luna"]["reasoning"])
         self.assertEqual(fallback["gpt-5.6-sol"]["minimal_client_version"], "0.144.0")
+
+    def test_stock_model_follows_codex_catalog_priority(self) -> None:
+        catalog = (
+            {"id": "gpt-6-astra", "priority": 2},
+            {"id": "gpt-6.1-sol", "priority": 1},
+        )
+        with patch.object(
+            daemon_module,
+            "codex_model_catalog_probe",
+            return_value={"available": True, "catalog": catalog},
+        ):
+            self.assertEqual(daemon_module.default_model_from_catalog(), "gpt-6.1-sol")
+        with patch.object(
+            daemon_module,
+            "codex_model_catalog_probe",
+            return_value={"available": False, "catalog": catalog},
+        ):
+            self.assertEqual(daemon_module.default_model_from_catalog(), "gpt-6-astra")
 
     def test_codex_restart_requirement_detects_cli_change_after_daemon_start(
         self,
@@ -8513,6 +8538,37 @@ class StoreTests(unittest.TestCase):
         self.assertIn("delete", launcher_module.CODEX_PASSTHROUGH_COMMANDS)
         self.assertIn("unarchive", launcher_module.CODEX_PASSTHROUGH_COMMANDS)
         self.assertIn("exec-server", launcher_module.CODEX_PASSTHROUGH_COMMANDS)
+
+    def test_launcher_keeps_interactive_codex_off_shared_daemon(self) -> None:
+        provider_args = ["-c", 'chatgpt_base_url="https://127.0.0.1:4567/backend-api/provision"']
+        self.assertEqual(
+            launcher_module.codex_launch_argv([], provider_args, supports_no_daemon=True),
+            ["codex", "--no-daemon", *provider_args],
+        )
+        for command in ("resume", "fork"):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    launcher_module.codex_launch_argv(
+                        [command, "--last"], provider_args, supports_no_daemon=True
+                    ),
+                    ["codex", "--no-daemon", command, *provider_args, "--last"],
+                )
+        self.assertEqual(
+            launcher_module.codex_launch_argv(
+                ["exec", "prompt"], provider_args, supports_no_daemon=True
+            ),
+            ["codex", "exec", *provider_args, "prompt"],
+        )
+        self.assertEqual(
+            launcher_module.codex_launch_argv(
+                ["app-server", "--help"], provider_args, supports_no_daemon=True
+            ),
+            ["codex", "app-server", "--help"],
+        )
+        self.assertEqual(
+            launcher_module.codex_launch_argv([], provider_args, supports_no_daemon=False),
+            ["codex", *provider_args],
+        )
 
     def test_managed_pty_registration_identifies_non_codex_provider_and_profile(
         self,

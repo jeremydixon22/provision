@@ -57,6 +57,7 @@ from .store import Store
 
 PROVIDER_ID = "provision"
 CODEX_MODEL_COMMANDS = {"debug", "e", "exec", "fork", "resume", "review"}
+CODEX_INTERACTIVE_COMMANDS = {"fork", "resume"}
 CODEX_PASSTHROUGH_COMMANDS = {
     "app-server",
     "apply",
@@ -796,6 +797,24 @@ def run_codex_pty(
     )
 
 
+def codex_launch_argv(
+    codex_args: list[str], provider_args: list[str], *, supports_no_daemon: bool
+) -> list[str]:
+    """Keep Provision's per-session proxy environment in an embedded TUI server."""
+    if codex_args and codex_args[0] in CODEX_MODEL_COMMANDS:
+        command = codex_args[0]
+        prefix = (
+            ["codex", "--no-daemon"]
+            if supports_no_daemon and command in CODEX_INTERACTIVE_COMMANDS
+            else ["codex"]
+        )
+        return [*prefix, command, *provider_args, *codex_args[1:]]
+    if codex_args and codex_args[0] in CODEX_PASSTHROUGH_COMMANDS:
+        return ["codex", *codex_args]
+    prefix = ["codex", "--no-daemon"] if supports_no_daemon else ["codex"]
+    return [*prefix, *provider_args, *codex_args]
+
+
 def launch_codex(codex_args: list[str]) -> int:
     paths = Paths()
     store = Store(paths)
@@ -822,12 +841,9 @@ def launch_codex(codex_args: list[str]) -> int:
         "-c",
         f"model_provider={toml_string('openai')}",
     ]
-    if codex_args and codex_args[0] in CODEX_MODEL_COMMANDS:
-        argv = ["codex", codex_args[0], *provider_args, *codex_args[1:]]
-    elif codex_args and codex_args[0] in CODEX_PASSTHROUGH_COMMANDS:
-        argv = ["codex", *codex_args]
-    else:
-        argv = ["codex", *provider_args, *codex_args]
+    # Codex added --no-daemon in the same release that required an HTTPS
+    # workspace backend. Earlier CLIs neither auto-attach nor accept the flag.
+    argv = codex_launch_argv(codex_args, provider_args, supports_no_daemon=secure_backend)
     env = os.environ.copy()
     env["OPENAI_PROJECT"] = project_session_sentinel(proxy_token, cwd, session_key=session_key)
     if secure_backend:

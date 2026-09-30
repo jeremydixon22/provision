@@ -187,8 +187,8 @@
 	      border-radius: 8px;
 	    }
 		    .logo {
-		      width: 218px;
-		      height: 44px;
+		      width: 166px;
+		      height: 33px;
 		      object-fit: contain;
 		      border-radius: 6px;
 		      flex: 0 0 auto;
@@ -2936,7 +2936,6 @@
 	        flex: 1 1 auto;
 	      }
 		      .topbar { align-items: flex-start; }
-		      .logo { width: 180px; height: 36px; }
 		      .top-actions { margin-left: 0; align-items: flex-start; }
       table, thead, tbody, tr, th, td { display: block; width: 100%; }
       thead { display: none; }

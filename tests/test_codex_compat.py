@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -627,7 +628,7 @@ class ServerCompatibilityTests(unittest.TestCase):
                 stored = json.loads(self.store.auth_path("default").read_text())
                 self.assertEqual(stored["tokens"]["refresh_token"], "rotated-refresh")
 
-    def test_repeated_native_usage_polls_share_a_five_minute_read(self) -> None:
+    def test_five_minute_cache_does_not_delay_on_demand_usage_reads(self) -> None:
         with (
             patch.object(daemon.time, "monotonic", return_value=1000) as clock,
             patch.object(self.server, "wait_for_usage_refresh_slot"),
@@ -637,21 +638,67 @@ class ServerCompatibilityTests(unittest.TestCase):
             ) as fetch,
         ):
             self.assertEqual(self.server.usage_payload_for_profile("default")[2], "fresh")
-            for elapsed in range(5, 300, 5):
-                clock.return_value = 1000 + elapsed
-                self.assertEqual(self.server.usage_payload_for_profile("default")[2], "cached")
+            clock.return_value = 1005
+            self.assertEqual(self.server.usage_payload_for_profile("default")[2], "cached")
             fetch.assert_called_once_with("default")
-            clock.return_value = 1300
-            self.assertEqual(self.server.usage_payload_for_profile("default")[2], "fresh")
-            self.assertEqual(fetch.call_count, 2)
-            clock.return_value = 1305
             self.assertEqual(
                 self.server.usage_payload_for_profile("default", force=True)[2], "fresh"
             )
+            self.assertEqual(fetch.call_count, 2)
+            clock.return_value = 1005.5
+            self.assertEqual(
+                self.server.usage_payload_for_profile("default", force=True)[2], "cached"
+            )
+            clock.return_value = 1010
+            self.assertEqual(self.server.usage_payload_for_profile("default")[2], "cached")
+            clock.return_value = 1305
+            self.assertEqual(self.server.usage_payload_for_profile("default")[2], "fresh")
             self.assertEqual(fetch.call_count, 3)
             self.assertEqual(
                 self.server.usage_payload_for_profile("default", force=True)[2], "cached"
             )
+
+    def test_native_usage_proxy_uses_on_demand_cache_policy(self) -> None:
+        handler = daemon.Handler.__new__(daemon.Handler)
+        handler.server = self.server
+        payload = {"rate_limit": {"allowed": True}}
+        with (
+            patch.object(handler, "monitor_analytics_events"),
+            patch.object(
+                handler, "usage_payload_for_profile", return_value=(payload, None, "fresh")
+            ) as read,
+            patch.object(handler, "label_usage_payload_for_profile", return_value=payload),
+            patch.object(handler, "send_json") as send,
+            patch.object(handler, "log_message"),
+        ):
+            status, _size = handler._proxy_to_upstream_once(
+                "GET",
+                urllib.parse.urlparse("/backend-api/provision/wham/usage"),
+                body=None,
+                retry_on_401=True,
+                route=daemon.UpstreamRoute.CHATGPT_BACKEND,
+                profile="default",
+            )
+        self.assertEqual(status, 200)
+        read.assert_called_once_with("default", force=True)
+        send.assert_called_once_with(payload)
+
+    def test_on_demand_usage_read_does_not_accelerate_background_refresh(self) -> None:
+        now = datetime.now().astimezone()
+        self.server.usage_cache["default"] = {
+            "payload": {"rate_limit": {"allowed": True}},
+            "fetched_at": now,
+            "usage_fetched_at": now,
+        }
+        self.assertEqual(
+            self.server.usage_auto_refresh_due_profiles(now + timedelta(seconds=5)), []
+        )
+        self.assertEqual(
+            self.server.usage_auto_refresh_due_profiles(now + timedelta(minutes=59)), []
+        )
+        self.assertEqual(
+            self.server.usage_auto_refresh_due_profiles(now + timedelta(hours=1)), ["default"]
+        )
 
     def test_native_usage_polls_back_off_after_errors_but_manual_refresh_can_retry(self) -> None:
         for stale in (False, True):

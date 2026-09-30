@@ -3934,6 +3934,7 @@
 	    function modelCatalog(profile) {
 	      const profileCatalog = profile && Array.isArray(profile.model_catalog) ? profile.model_catalog : [];
 	      return profileCatalog.length ? profileCatalog : (latestModelCatalog.length ? latestModelCatalog : [
+	        { id: "gpt-6.1-sol", display: "GPT-6.1-Sol", reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"] },
 	        { id: "gpt-6-astra", display: "GPT-6-Astra", reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"] },
 	        { id: "gpt-5.6-sol", display: "GPT-5.6-Sol", reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"] },
 		        { id: "gpt-5.6-terra", display: "GPT-5.6-Terra", reasoning: ["low", "medium", "high", "xhigh", "max", "ultra"] },
@@ -4114,7 +4115,7 @@
 	    function renderModelMenu(profile, name) {
 		      const setting = profile.model_setting && typeof profile.model_setting === "object" ? profile.model_setting : {};
 		      const currentModel = String(setting.model || "gpt-6-astra");
-		      const currentReasoning = String(setting.reasoning_effort || (["gpt-6-astra", "gpt-5.6-sol"].includes(currentModel) ? "low" : "medium"));
+	      const currentReasoning = String(setting.reasoning_effort || (["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-sol"].includes(currentModel) ? "low" : "medium"));
 			      const label = `${currentModel.toLowerCase()} ${reasoningDisplay(currentReasoning)}`;
 	      const catalog = modelCatalog(profile);
 	      const notice = catalog.some((item) => item.id === currentModel) ? "" : '<div class="login-menu-note">The saved model is absent from the current catalog. Choose an available model below.</div>';
