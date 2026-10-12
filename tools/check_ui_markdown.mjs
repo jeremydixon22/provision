@@ -79,6 +79,73 @@ function excludes(actual, expected, label) {
   assert.ok(!actual.includes(expected), `${label}\nUnexpected: ${expected}\nActual: ${actual}`);
 }
 
+const discussionRequests = [];
+const discussionContext = vm.createContext({
+  latestControlPlane: { sessions: [{ key: "live", discussion: { revision: "1:1" } }] },
+  selectedControlSessionKey: "live",
+  controlSessionDetails: {},
+  controlSessionDetailRequests: {},
+  observedTurnRequests: {},
+  historyTurnRequests: {},
+  historyIndexRequests: {},
+  resumeCandidateRequests: {},
+  terminalSnapshotRequests: {},
+  clearTerminalSnapshotRefresh() {},
+  renderControlModal() {},
+  showUiMessage(message) { throw new Error(message); },
+  WebSocket: { OPEN: 1 },
+  socket: { readyState: 1, send(packet) { discussionRequests.push(JSON.parse(packet)); } }
+});
+vm.runInContext(
+  `${sourceRange("function controlPlane", "function sessionTitle")}
+   ${sourceRange("function selectedControlSession()", "function controlCapabilityText")}
+   ${sourceRange("function handleControlSessionPacket", "function handleTerminalSnapshotPacket")}
+   ${sourceRange("function clearPendingSessionLookups", "function connect()")}
+   globalThis.discussionApi = {
+     selectedControlSession, requestControlSessionDetail, handleControlSessionPacket,
+     clearPendingSessionLookups
+   };`,
+  discussionContext
+);
+const discussionApi = discussionContext.discussionApi;
+equal(discussionApi.requestControlSessionDetail(discussionApi.selectedControlSession()), true,
+  "the selected discussion loads on demand");
+equal(discussionApi.requestControlSessionDetail(discussionApi.selectedControlSession()), false,
+  "an in-flight discussion request is not duplicated");
+function deliverDiscussion(revision, text) {
+  discussionApi.handleControlSessionPacket({
+    type: "control_session", ok: true, session_key: "live",
+    payload: {
+      discussion: { revision }, transcript: [{ role: "assistant", text }],
+      turns: [{ key: "turn-one" }]
+    }
+  });
+}
+deliverDiscussion("1:1", "Starting the answer");
+equal(discussionApi.requestControlSessionDetail(discussionApi.selectedControlSession()), false,
+  "a current discussion does not refetch");
+discussionContext.latestControlPlane.sessions[0].discussion.revision = "2:1";
+equal(discussionApi.requestControlSessionDetail(discussionApi.selectedControlSession()), true,
+  "a streamed edit refreshes loaded detail even when its transcript length is unchanged");
+equal(discussionApi.selectedControlSession().transcript[0].text, "Starting the answer",
+  "the previous discussion stays visible while its update loads");
+deliverDiscussion("2:1", "The answer advanced");
+equal(discussionApi.selectedControlSession().transcript[0].text, "The answer advanced",
+  "the loaded update replaces the stale transcript");
+discussionContext.latestControlPlane.sessions[0].discussion.revision = "3:1";
+equal(discussionApi.requestControlSessionDetail(discussionApi.selectedControlSession()), true,
+  "subsequent discussion revisions keep requesting updates");
+discussionApi.clearPendingSessionLookups();
+equal(discussionApi.requestControlSessionDetail(discussionApi.selectedControlSession()), true,
+  "a reconnect retries discussion requests lost with the old socket");
+equal(discussionRequests.length, 4, "only initial, changed, and retried discussions are requested");
+discussionContext.latestControlPlane.sessions.push({
+  key: "demo", transcript: [], turns: [], discussion: { revision: "0" }
+});
+discussionContext.selectedControlSessionKey = "demo";
+equal(discussionApi.requestControlSessionDetail(discussionApi.selectedControlSession()), false,
+  "complete inline demo discussions do not request daemon detail");
+
 equal(
   renderMarkdown("The API\nremains stable."),
   "<p>The API remains stable.</p>",

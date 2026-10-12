@@ -3859,6 +3859,25 @@ class StoreTests(unittest.TestCase):
         assert rewritten is not None
         self.assertNotIn("service_tier", json.loads(rewritten.decode("utf-8")))
 
+    def test_service_tier_rewrite_preserves_native_ultrafast(self) -> None:
+        body = b'{"model":"gpt-6.1-sol","service_tier":"ultrafast"}'
+        message = b'{"type":"response.create","service_tier":"ultrafast"}'
+        for fast_enabled in (False, True):
+            with self.subTest(fast_enabled=fast_enabled, transport="http"):
+                rewritten, service_tier, changed = rewrite_service_tier_body(
+                    body, fast_enabled=fast_enabled
+                )
+                self.assertFalse(changed)
+                self.assertEqual(rewritten, body)
+                self.assertEqual(service_tier, "ultrafast")
+            with self.subTest(fast_enabled=fast_enabled, transport="websocket"):
+                rewritten, service_tier, changed = rewrite_service_tier_websocket_message(
+                    0x1, message, fast_enabled=fast_enabled
+                )
+                self.assertFalse(changed)
+                self.assertEqual(rewritten, message)
+                self.assertEqual(service_tier, "ultrafast")
+
     def test_websocket_service_tier_rewrite_only_touches_response_create(self) -> None:
         rewritten, service_tier, changed = rewrite_service_tier_websocket_message(
             0x1,
@@ -7003,6 +7022,63 @@ class StoreTests(unittest.TestCase):
         self.assertIn("Query:\nCodex 0.146.0", structured_entry["text"])
         self.assertIn("Results:", structured_entry["text"])
         self.assertIn("Codex release notes", structured_entry["text"])
+
+    def test_app_server_partial_answer_is_visible_without_becoming_completion_fallback(
+        self,
+    ) -> None:
+        for phase in ("partialAnswer", "partial_answer"):
+            item = {
+                "id": "partial-162",
+                "type": "agentMessage",
+                "phase": phase,
+                "text": "An answer while work continues.",
+            }
+            with self.subTest(phase=phase):
+                entries = daemon_module.app_server_transcript_entries_from_message(
+                    {
+                        "method": "item/completed",
+                        "params": {"turnId": "turn-162", "item": item},
+                    }
+                )
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0]["role"], "assistant")
+                self.assertEqual(entries[0]["text"], item["text"])
+                self.assertEqual(entries[0]["source_item_id"], item["id"])
+                self.assertTrue(entries[0]["authoritative"])
+                self.assertEqual(
+                    daemon_module.app_server_transcript_entries_from_message(
+                        {
+                            "method": "turn/completed",
+                            "params": {"turn": {"id": "turn-162", "items": [item]}},
+                        }
+                    ),
+                    [],
+                )
+
+    def test_app_server_command_execution_uses_consolidated_output(self) -> None:
+        for output_key in ("aggregatedOutput", "aggregated_output"):
+            with self.subTest(output_key=output_key):
+                entries = daemon_module.app_server_transcript_entries_from_message(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-162",
+                            "item": {
+                                "id": "command-162",
+                                "type": "commandExecution",
+                                "command": "python3 --version",
+                                "status": "completed",
+                                "exitCode": 0,
+                                output_key: "Python 3.12.3\n",
+                            },
+                        },
+                    }
+                )
+                self.assertEqual(len(entries), 1)
+                self.assertEqual(entries[0]["role"], "tool")
+                self.assertIn("exit 0", entries[0]["text"])
+                self.assertIn("Output:\nPython 3.12.3", entries[0]["text"])
+                self.assertEqual(entries[0]["call_id"], "command-162")
 
     def test_app_server_turn_completion_repairs_and_deduplicates_final_message(self) -> None:
         server = ProvisionServer.__new__(ProvisionServer)

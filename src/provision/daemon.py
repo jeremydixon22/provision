@@ -4735,7 +4735,9 @@ def rewrite_service_tier_value(value: Any, *, fast_enabled: bool) -> tuple[Any, 
     current = rewritten.get("service_tier")
     changed = False
     if fast_enabled:
-        if current != FAST_SERVICE_TIER:
+        # Codex controls Ultrafast independently of ordinary Fast mode.
+        # Preserve an explicit native selection rather than downgrading it.
+        if current != FAST_SERVICE_TIER and current != "ultrafast":
             rewritten["service_tier"] = FAST_SERVICE_TIER
             changed = True
     elif current in FAST_SERVICE_TIER_VALUES:

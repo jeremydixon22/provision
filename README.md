@@ -40,7 +40,7 @@ Provision is not currently published on PyPI. Install the current release from
 the versioned GitHub source with `pipx` (recommended for an isolated CLI):
 
 ```bash
-pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.159.2"
+pipx install "git+https://github.com/jeremydixon22/provision.git@Provision-v0.162.1"
 provision-codex doctor
 ```
 
@@ -89,12 +89,12 @@ its command, exit status, duration, and output:
 
 - Codex CLI `0.144.0` or newer is required for Codex's full dashboard,
   model picker, quota, and compatibility-reporting path.
-- Provision `0.159.2` has been reviewed against Codex CLI
-  `0.159.2`. Older Codex CLI versions remain supported through the documented
+- Provision `0.162.1` has been reviewed against Codex CLI
+  `0.162.1`. Older Codex CLI versions remain supported through the documented
   fallback paths where their capability surface is smaller.
 - Claude Code and Grok Build are optional local clients. Provision detects
   them on `PATH`; they retain their vendor-native login and network behavior.
-- With Codex CLI `0.159.2`, the bundled catalog includes GPT-6.1-Sol,
+- With Codex CLI `0.162.1`, the bundled catalog includes GPT-6.1-Sol,
   GPT-6-Astra, GPT-6-Sol, and GPT-6-Luna alongside the GPT-5.6 models.
   Provision's degraded-mode picker includes them too.
 - Python 3.11+ is recommended.
@@ -208,6 +208,23 @@ provision --help
 provision help
 provision login --help
 ```
+
+## What’s New In 0.162.1
+
+- Discussions fetch new content as their revision advances, including streaming
+  edits and subsequent turns. Interrupted detail requests can retry after a
+  WebSocket reconnect.
+- Provision's Fast toggle preserves an explicit native Codex Ultrafast
+  selection on both HTTP and WebSocket requests.
+- Reviewed Codex 0.160.0 through 0.162.1, including shared-server defaults,
+  partial answers, consolidated command output, model metadata, and quota
+  behavior. All 34 probed app-server methods remain available.
+- Updates the development coverage, mypy, and Ruff requirements from the
+  reviewed dependency PRs.
+
+See [the 0.162.1 compatibility review](docs/codex-0.162.1-compatibility-review.md)
+for validation and remaining protocol limits. Restart the Provision daemon
+after upgrading to load the new behavior.
 
 ## What’s New In 0.159.2
 

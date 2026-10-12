@@ -860,13 +860,13 @@
 	    function controlSessionDetailNeedsLoad(session) {
 	      const key = String(session && session.key || selectedControlSessionKey || "");
 	      if (!key) return false;
+	      const detail = controlSessionDetails[key];
 	      // Static demos and compatible read-only integrations can embed one
-	      // complete discussion directly in their bootstrap state.  A live
-	      // daemon sends summaries only, so it still takes the on-demand path.
-	      if (Array.isArray(session && session.transcript) && Array.isArray(session && session.turns)) {
+	      // complete discussion directly in their bootstrap state. Cached live
+	      // detail also has these arrays, but must follow the summary revision.
+	      if (!detail && Array.isArray(session && session.transcript) && Array.isArray(session && session.turns)) {
 	        return false;
 	      }
-	      const detail = controlSessionDetails[key];
 	      return !detail || String(detail.revision || "") !== controlDiscussionRevision(session);
 	    }
 
@@ -4552,6 +4552,7 @@
 	    }
 
 	    function clearPendingSessionLookups() {
+	      for (const key of Object.keys(controlSessionDetailRequests)) delete controlSessionDetailRequests[key];
 	      for (const key of Object.keys(observedTurnRequests)) delete observedTurnRequests[key];
 	      for (const key of Object.keys(historyTurnRequests)) delete historyTurnRequests[key];
 	      for (const key of Object.keys(historyIndexRequests)) delete historyIndexRequests[key];
